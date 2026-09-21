@@ -4,7 +4,7 @@ import { Hono } from "hono";
 import { SQL } from "bun";
 import { createHmac, randomBytes, timingSafeEqual, createCipheriv, createDecipheriv, createHash } from "node:crypto";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
 const ISS = "creator-os-runtime";
 const POLICY_VERSION = "p1";
 
@@ -415,6 +415,54 @@ async function memoryForget(tenant: string, id: string) {
   if (!r.length) throw new HttpError(404, "memory_not_found");
   await outboxPush("memory.sync", syncOut(r[0])); return memOut(r[0]);
 }
+
+const SIGNAL_TYPES = new Set([
+  "market.demand",
+  "commons.looking_for",
+  "devdesk.intent",
+  "capability.proof.changed",
+  "queue.warning",
+  "worker.plan.accepted",
+  "editor.correction",
+  "operator.note",
+  "usage.cost_observed",
+]);
+const FORBIDDEN_SIGNAL_RE = /\b(deploy\.execute|deploy\.restart|deploy\.delete|ledger|stripe|payment|payout|wallet|mesh\.receipt|grant\.issued|runtime\.paused|runtime\.resumed)\b/i;
+function normalizeSignal(b: any) {
+  const type = String(b?.type || "").trim().slice(0, 80);
+  if (!SIGNAL_TYPES.has(type) || FORBIDDEN_SIGNAL_RE.test(type)) throw new HttpError(400, "unsupported_signal", { allowed: [...SIGNAL_TYPES] });
+  const tenant = String(b?.tenant || "system").trim().slice(0, 80) || "system";
+  const subject = String(b?.subject || type).trim().slice(0, 160) || type;
+  const data = b?.data && typeof b.data === "object" && !Array.isArray(b.data) ? b.data : {};
+  const content = String(b?.content || `${type}: ${subject}`).trim().slice(0, 4000);
+  const tags = Array.isArray(b?.tags) ? b.tags.slice(0, 12).map((x: any) => String(x).slice(0, 40)).filter(Boolean) : [];
+  return { type, tenant, subject, data, content, tags: ["signal", type, ...tags] };
+}
+async function recordSignal(input: any, actor = "admin") {
+  const s = normalizeSignal(input);
+  const key = `${s.type}:${sha(`${s.subject}:${JSON.stringify(s.data)}`).slice(0, 16)}`;
+  await emit(`signal.${s.type}`, { subject: s.subject, data: s.data, tags: s.tags.filter((t) => t !== "signal") }, s.tenant, actor);
+  const memory = await memoryWrite(s.tenant, `signal:${s.type.split(".")[0]}`, key, s.content, s.tags, actor);
+  return { signal: { type: s.type, tenant: s.tenant, subject: s.subject, key, tags: s.tags }, memory };
+}
+async function compoundingReadout(limit = 20) {
+  const lim = Math.min(50, Math.max(5, Math.floor(limit || 20)));
+  const [signals, memoryParts, dryRuns, outbox, recent] = await Promise.all([
+    db`SELECT type, count(*)::int n, max(ts) last_seen FROM events WHERE type LIKE 'signal.%' GROUP BY type ORDER BY n DESC, last_seen DESC LIMIT ${lim}`,
+    db`SELECT tenant, partition, count(*)::int n, max(updated_at) last_seen FROM memories WHERE partition LIKE 'signal:%' AND deleted = false GROUP BY tenant, partition ORDER BY last_seen DESC LIMIT ${lim}`,
+    db`SELECT status, executed, count(*)::int n FROM deploys GROUP BY status, executed ORDER BY n DESC`,
+    db`SELECT kind, done, count(*)::int n, max(last_error) last_error FROM outbox GROUP BY kind, done ORDER BY n DESC`,
+    db`SELECT id, ts, tenant, type, actor, data FROM events WHERE type LIKE 'signal.%' ORDER BY id DESC LIMIT ${lim}`,
+  ]);
+  const blocked = dryRuns.filter((r: any) => r.status === "dry_run" && !r.executed).reduce((n: number, r: any) => n + Number(r.n || 0), 0);
+  const moves = [
+    blocked ? `${blocked} worker dry-runs are demand, not execution; keep them as plan backlog until Railway is intentionally armed.` : null,
+    !ARMED().brainOut ? "Brain event fan-out is unarmed; signals are stored locally but not yet teaching the wider brain." : null,
+    !ARMED().cognitiveBridge ? "Cognitive bridge is unarmed; memory sync is local-only until bridge credentials are attached." : null,
+    signals.length ? "Repeated signal types are now the prioritization surface for DevDesk and MeshMarket follow-through." : "No signal history yet; start by recording market demand, DevDesk intents, proof changes, and queue warnings.",
+  ].filter(Boolean);
+  return { loop: { sense: signals, react: moves, adjust: "human/editor approval remains the gate before deploy, publish, ACL, or money movement", feed: memoryParts }, queues: { deploys: dryRuns, outbox }, recent };
+}
 // LWW merge of records from a sync peer (bridge / cognitive-memory). partition is "<tenant>/<partition>"; newer version wins; tombstones honored.
 async function memoryApply(recs: any[]) {
   let applied = 0, skipped = 0;
@@ -778,6 +826,8 @@ app.get("/api/admin/deploys", adminOnly, async (c) => c.json({ deploys: await db
 app.get("/api/admin/ledger", adminOnly, async (c) => c.json({ ledger: await db`SELECT * FROM ledger ORDER BY id DESC LIMIT 300` }));
 app.get("/api/admin/webhooks", adminOnly, async (c) => c.json({ webhooks: await db`SELECT id, source, event_id, type, received_at, handled, result FROM webhook_events ORDER BY id DESC LIMIT 200` }));
 app.get("/api/admin/events", adminOnly, async (c) => c.json({ events: await db`SELECT * FROM events ORDER BY id DESC LIMIT 300` }));
+app.post("/api/admin/signals", adminOnly, async (c) => c.json(await recordSignal(await body(c)), 201));
+app.get("/api/admin/compounding", adminOnly, async (c) => c.json(await compoundingReadout(+(c.req.query("limit") || 20))));
 
 // grant-bearing: grants
 app.get("/api/grants/verify", withGrant(null), (c) => { const a: Auth = c.get("auth"); return c.json({ id: a.row.id, tenant: a.tenant.id, tier: a.tenant.tier, sub: a.row.sub, depth: a.row.depth, caps: J(a.row.caps), scope: J(a.row.scope), constraints: J(a.row.constraints), budget: J(a.row.budget), remaining: remaining(a.row), exp: Number(a.row.exp) }); });
@@ -1007,6 +1057,16 @@ app.get("/selftest", async (c) => {
   t("stripe signature verifies", () => { const raw = '{"id":"evt_1"}', ts = nowSec(); const sig = `t=${ts},v1=${hmac("whsec_test", `${ts}.${raw}`)}`; return verifyStripeSig(raw, sig, "whsec_test") && !verifyStripeSig(raw + " ", sig, "whsec_test") && !verifyStripeSig(raw, `t=${ts - 1000},v1=${hmac("whsec_test", `${ts - 1000}.${raw}`)}`, "whsec_test"); });
   t("vault seal/open roundtrip (when armed)", () => { if (!vaultKey()) return "skipped:unarmed"; const s = vaultSeal("secret"); return vaultOpen(s) === "secret"; });
   t("route inventory derives from app (≥45 routes, all tagged)", () => { const inv = routeInventory(); return (inv.length >= 45 && inv.every((r) => !!r.auth)) || { count: inv.length }; });
+  t("compounding signal allows non-money demand", () => normalizeSignal({ type: "market.demand", subject: "shop grade library" }).tenant === "system");
+  t("compounding signal rejects execution and money rails", () => {
+    try { normalizeSignal({ type: "ledger.release", subject: "pay" }); return false; } catch (e: any) { return e instanceof HttpError && e.code === "unsupported_signal"; }
+  });
+  t("compounding routes stay admin-only", () => {
+    const inv = routeInventory();
+    const post = inv.find((r) => r.method === "POST" && r.path === "/api/admin/signals");
+    const get = inv.find((r) => r.method === "GET" && r.path === "/api/admin/compounding");
+    return (post?.auth === "admin" && get?.auth === "admin") || { post, get };
+  });
   t("memory scope widening rejected", () => attenuationViolations({ ...fake, scope: { ...fake.scope, memory: { partitions: ["worker:a"] } } }, { ...okChild, scope: { ...okChild.scope, memory: { partitions: ["worker:"] } } }, "starter").includes("scope_memory_widened") && attenuationViolations({ ...fake, scope: { ...fake.scope, memory: { partitions: ["worker:a"] } } }, { ...okChild, scope: { ...okChild.scope, memory: { partitions: ["worker:a-1"] } } }, "starter").length === 0);
   const pass = results.every((r) => r.pass || String(r.info || "").startsWith("skipped"));
   return c.json({ pass, count: results.length, results }, pass ? 200 : 500);

@@ -49,3 +49,19 @@ failure `build-the-deploy-path-first` names: **the repo is the unit of delivery*
 This rescue restores the bytes and their lineage. It does not yet restore the
 *path* — there is no deploy script, no guard and no ratchet here. Those are the
 next steps if this service is to be kept.
+
+## Source delta after rescue
+
+- **v0.1.2 source-side, not yet deployed:** added an admin-only non-money
+  compounding-loop surface:
+  - `POST /api/admin/signals` records approved demand/proof/queue/correction
+    signals as events plus partitioned memory.
+  - `GET /api/admin/compounding` summarizes the SENSE -> REACT -> ADJUST -> FEED
+    readout from signal events, signal memories, dry-run deploy backlog and
+    outbox state.
+  - The signal intake explicitly rejects money/deploy/control-rail signal types;
+    execution, ledger movement, publishing, ACL changes and deploy operations
+    remain outside this loop.
+
+The live Railway function remains whatever `/health.version` reports until the
+deploy path is restored and run.
