@@ -23,3 +23,12 @@ export class HttpError extends Error {
 }
 export var sha256Base64Url = (e) => createHash("sha256").update(e).digest("base64url");
 export var escapeHtml = (e) => String(e).replace(/[&<>"']/g, (t) => `&#${t.charCodeAt(0)};`);
+// A query string can carry a shared secret (e.g. POST /webhooks/railway?token=...,
+// the only auth channel Railway project webhooks can use -- they send no custom
+// headers). Any request URL logged anywhere in this runtime goes through this
+// first, so that secret never reaches a log line (2026-09-25 fix).
+export var redactUrl = (e) => {
+  let t = String(e ?? ""),
+    a = t.indexOf("?");
+  return a === -1 ? t : t.slice(0, a);
+};

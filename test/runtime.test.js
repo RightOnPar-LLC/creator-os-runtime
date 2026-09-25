@@ -477,17 +477,53 @@ describe("6. webhooks", () => {
 
     const rw = { type: "DEPLOY", timestamp: "2026-01-01", resource: { service: { id: "svc-none" } } };
     expect((await req("POST", "/webhooks/railway", { body: rw, headers: { "x-runtime-token": "wrong" } })).status).toBe(401);
-    // 2026-09-25: the shared secret is header-only now — a URL query string
-    // lands in access/proxy logs. The correct token in ?token= alone (no
-    // header) is no longer honored.
-    const queryOnly = await req("POST", "/webhooks/railway?token=" + RAILWAY_TOKEN, { body: rw });
-    expect(queryOnly.status).toBe(401);
+    // 2026-09-25: Railway project webhooks send no custom headers and are not
+    // cryptographically signed -- Railway's own docs say to put the secret in
+    // the URL (docs.railway.com/observability/webhooks#verifying-the-sender).
+    // Header-only auth (the earlier same-day change this reverts, for this
+    // route alone) would make every Railway project webhook unauthenticatable,
+    // so the query fallback is back. A different payload than `rw`, or this
+    // would collide with `ro` below on the idempotency key and come back a
+    // replay instead of a fresh result.
+    const rwQuery = { type: "DEPLOY", timestamp: "2026-01-02", resource: { service: { id: "svc-query" } } };
+    const queryOnly = await req("POST", "/webhooks/railway?token=" + RAILWAY_TOKEN, { body: rwQuery });
+    expect(queryOnly.json).toEqual({ received: true, result: { matched: 0, status: "deploy" } });
+    const wrongQuery = await req("POST", "/webhooks/railway?token=nope", { body: rw });
+    expect(wrongQuery.status).toBe(401);
+    expect(wrongQuery.json.error).toBe("bad_token");
     const ro = await req("POST", "/webhooks/railway", { body: rw, headers: { "x-runtime-token": RAILWAY_TOKEN } });
     expect(ro.json).toEqual({ received: true, result: { matched: 0, status: "deploy" } });
 
     const s = await req("POST", "/webhooks/stripe", { raw: "{}" });
     expect(s.status).toBe(503);
     expect(s.json.detail).toEqual({ needs: "STRIPE_WEBHOOK_SECRET" });
+  });
+
+  // 2026-09-25: the query token exists ONLY because Railway can't carry a
+  // header. It must never end up somewhere it could leak the same way a URL
+  // fallback already does (access/proxy/Railway request logs) -- this app's
+  // OWN logs, on a request that errors, must not carry it either.
+  test("the railway webhook token in ?token= never reaches a log line, even when the request errors", async () => {
+    const logged = [];
+    const originalError = console.error;
+    console.error = (...a) => logged.push(a.map(String).join(" "));
+    let r;
+    try {
+      // A non-string service id: handleRailwayEvent binds it straight into
+      // `WHERE railway_service_id = $1` against a TEXT column with no
+      // String(...) in between -- a genuine 500 from the database, not a
+      // crafted one, so the error handler's log line is the real path.
+      const bad = { type: "DEPLOY", timestamp: "2026-09-25T00:00:00Z", resource: { service: { id: 424242 } } };
+      r = await req("POST", "/webhooks/railway?token=" + RAILWAY_TOKEN, { body: bad });
+    } finally {
+      console.error = originalError;
+    }
+    expect(r.status).toBe(500);
+    expect(logged.length).toBeGreaterThan(0);
+    for (const line of logged) {
+      expect(line).not.toContain(RAILWAY_TOKEN);
+      expect(line.toLowerCase()).not.toContain("token=");
+    }
   });
 });
 
@@ -514,15 +550,22 @@ describe("7. rate limit", () => {
   // JSON-RPC method is known, then again for the tool's specific capability).
   // Both calls used to count against the budget, so one MCP tool call cost
   // TWICE what the same action costs over REST.
+  //
+  // "runtime_health" does NOT exercise this: src/routes/mcp.js answers it at
+  // line ~101, before the "unknown_tool" capability map (line ~115) and the
+  // second verifyGrant call (line ~140) are ever reached -- so a test that
+  // calls it only ever exercises the first, pre-check verifyGrant, pass or
+  // fail, on both the buggy and the fixed line. "grant_verify" routes through
+  // both calls, so it actually proves the fix.
   test(`a single MCP tools/call spends exactly one rate-limit unit, matching REST`, async () => {
     const t = await newTenant("mcp-rate-tenant");
     let last;
     for (let i = 0; i < RATE_LIMIT; i++) {
-      last = await mcp(t.token, "tools/call", { name: "runtime_health" }, i);
+      last = await mcp(t.token, "tools/call", { name: "grant_verify" }, i);
       expect(last.status).toBe(200);
       expect(last.json.result.isError).toBeUndefined();
     }
-    last = await mcp(t.token, "tools/call", { name: "runtime_health" }, RATE_LIMIT);
+    last = await mcp(t.token, "tools/call", { name: "grant_verify" }, RATE_LIMIT);
     expect(last.status).toBe(429);
     expect(last.json.error).toBe("rate_limited");
   });

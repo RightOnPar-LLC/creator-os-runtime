@@ -40,11 +40,20 @@ app.post("/webhooks/railway", async (e) => {
     throw new HttpError(503, "unarmed", {
       needs: "RAILWAY_WEBHOOK_TOKEN",
     });
-  // Header only: a query string lands in access/proxy logs and Railway's own
-  // request logs, so a ?token= shared secret leaks anywhere those are kept or
-  // forwarded. No query fallback (2026-09-25 fix; re-point the Railway webhook
-  // at the x-runtime-token header, never a URL, when arming it).
-  let t = e.req.header("x-runtime-token") || "";
+  // Header preferred (never logged, anywhere) -- but Railway project webhooks
+  // (Project Settings -> Webhooks) send no custom headers and are NOT
+  // cryptographically signed: "include a secret in the webhook URL you
+  // configure -- for example a hard-to-guess path segment or query parameter"
+  // is Railway's own documented pattern (docs.railway.com/observability/webhooks
+  // #verifying-the-sender, checked 2026-09-25). Dropping the query fallback
+  // here (like the earlier same-day change above) would make every Railway
+  // project webhook unauthenticatable, so THIS route alone keeps it -- every
+  // other webhook in this file is provider-signed (HMAC) and stays
+  // header/signature-only, no exception. Compare constant-time either way, and
+  // never let the token reach a log line: redactUrl() strips the query string
+  // before core.js's error handler logs a request line (test: "the railway
+  // token never reaches a log line").
+  let t = e.req.header("x-runtime-token") || new URL(e.req.url).searchParams.get("token") || "";
   if (!safeEqual(t, env.RAILWAY_WEBHOOK_TOKEN)) throw new HttpError(401, "bad_token");
   let a = await readJsonBody(e),
     n = `${a.resource?.deployment?.id || a.resource?.service?.id || "na"}:${a.type}:${a.timestamp || ""}`,

@@ -7,7 +7,7 @@ import {
   SERVICE_NAME,
   VERSION,
 } from "../config.js";
-import { HttpError, sha256Hex } from "../util.js";
+import { HttpError, redactUrl, sha256Hex } from "../util.js";
 import { isKillSwitchOn, sql } from "../db.js";
 import { CAPS, TIERS } from "../policy.js";
 import { TEMPLATES } from "../railway.js";
@@ -24,7 +24,9 @@ app.onError((e, t) => {
     );
   let a = e?.status && Number.isInteger(e.status) ? e.status : 500,
     n = e?.message && a < 500 ? e.message : "internal_error";
-  if (a >= 500) console.error("ERR", e?.stack || e);
+  // redactUrl(): a query string can carry a shared secret (POST
+  // /webhooks/railway?token=...); never let one reach this log line (2026-09-25 fix).
+  if (a >= 500) console.error("ERR", t.req.method, redactUrl(t.req.url), e?.stack || e);
   return t.json(
     {
       error: n,
