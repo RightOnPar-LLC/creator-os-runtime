@@ -1,7 +1,7 @@
 // Service identity, env (secrets trimmed at load), armed-integration flags, secret fingerprints.
 import { createHash } from "crypto";
 
-export var VERSION = "0.3.0";
+export var VERSION = "0.3.1";
 export var SERVICE_NAME = "creator-os-runtime";
 export var POLICY_VERSION = "p1";
 export var env = Bun.env;

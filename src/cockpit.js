@@ -50,7 +50,21 @@ async function probeUrl(e) {
     };
   }
 }
-export async function buildStatusReport() {
+// /status and /status.json are public and each report makes up to 4 outbound
+// probes, so anyone could turn requests into outbound traffic. One report is
+// shared for STATUS_TTL_MS, and concurrent callers share the one in flight
+// (2026-09-25 fix).
+var STATUS_TTL_MS = 60_000;
+var statusCache = null;
+export function buildStatusReport(now = Date.now()) {
+  if (!statusCache || now - statusCache.at >= STATUS_TTL_MS) {
+    const p = computeStatusReport();
+    statusCache = { at: now, p };
+    p.catch(() => { if (statusCache?.p === p) statusCache = null; });
+  }
+  return statusCache.p;
+}
+async function computeStatusReport() {
   let e = !1,
     t = [];
   try {

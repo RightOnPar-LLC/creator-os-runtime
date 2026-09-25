@@ -41,6 +41,12 @@ var PROFILE_BY_HOST = {
   "devdesk.meshtool.ai": "devdesk",
   "market.meshtool.ai": "meshtool",
 };
+// The profile a grant was APPROVED under, read back from the grant itself.
+// Refresh must reuse exactly this — never re-derive from the client's
+// registration, which can name several redirects (2026-09-25 fix: refresh used
+// the client's FIRST redirect, so a client approved on devdesk could refresh
+// into OPERATOR caps). Unknown sub → null → the caller fails closed.
+export var profileForGrant = (g) => Object.values(OAUTH_PROFILES).find((p) => p.sub === g?.sub) || null;
 export var profileForRedirect = (e) => {
   try {
     return OAUTH_PROFILES[PROFILE_BY_HOST[new URL(e).hostname]] || OPERATOR_PROFILE;
@@ -84,10 +90,6 @@ export async function ensureRootGrant(e) {
       await sql`SELECT * FROM grants WHERE tenant = ${e.id} AND depth = 0 AND status = 'active' AND exp > ${nowSec() + 3600} ORDER BY exp DESC LIMIT 1`
     )[0] || (await mintRootGrant(e)).row
   );
-}
-export async function profileForClient(e) {
-  let t = (await sql`SELECT redirect_uris FROM oauth_clients WHERE id = ${e}`)[0];
-  return profileForRedirect(t ? parseJson(t.redirect_uris)[0] : "");
 }
 export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
   let n = await getGrant(e),

@@ -1,16 +1,16 @@
 {
   "name": "creator-os-runtime",
-  "version": "0.1.1",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun index.ts",
+    "start": "bun dist/runtime.js",
     "test": "node test/run.mjs",
     "build": "node tools/build.mjs",
     "test:dist": "node tools/build.mjs && node test/run.mjs dist",
     "verify:split": "node tools/rebuild/verify.mjs"
   },
   "dependencies": {
-    "hono": "^4.6.14"
+    "hono": "4.13.9"
   }
 }
