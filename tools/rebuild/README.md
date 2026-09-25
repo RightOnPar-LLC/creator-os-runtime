@@ -16,11 +16,14 @@ A negative control is part of the method: a map that renames a binding to `fetch
 ## Reproduce
 
 ```
-cd tools/rebuild && npm install
-node format-and-prove.mjs ../../live/runtime-0.3.0.bundle.js /tmp/formatted.js
-node rename-and-prove.mjs /tmp/formatted.js rename-map.json /tmp/readable.js
-# /tmp/readable.js == ../../src/runtime.js
+cd tools/rebuild && npm ci && npm run verify
 ```
+
+`verify.mjs` runs both passes into a temp folder and **byte-compares** the result with
+`src/runtime.js`; it exits 1 on any drift. Tool versions are pinned exactly (with a
+lockfile), because a different Prettier or Babel could format or rename differently.
+A new name that matches any identifier already in the program (a global like `fetch`,
+or any existing binding) is refused before renaming.
 
 ## What this does NOT prove
 

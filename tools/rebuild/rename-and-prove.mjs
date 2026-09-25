@@ -56,6 +56,22 @@ const surface = (s) => {
   return out.join("\n");
 };
 
+// Explicit capture guard (review on PR #3): a new name may not equal ANY
+// identifier already in the program — a global it reads (fetch, Bun, URL…),
+// or a binding in any scope — so a rename can never capture or shadow one.
+// The round-trip below would also catch most of these; this makes it a rule.
+{
+  const ast = parse(src, { sourceType: "module" });
+  const taken = new Set();
+  traverse(ast, {
+    Program(path) { for (const g of Object.keys(path.scope.globals)) taken.add(g); },
+    Scope(path) { for (const b of Object.keys(path.scope.bindings)) taken.add(b); },
+  });
+  const oldNames = new Set(Object.keys(map));
+  const clashes = Object.entries(map).filter(([from, to]) => to !== from && taken.has(to) && !oldNames.has(to));
+  if (clashes.length) { console.error(`CAPTURE RISK: new names already used in the program: ${clashes.map(([a, b]) => `${a}→${b}`).join(", ")}`); process.exit(1); }
+}
+
 const renamed = await prettier.format(renameAll(src, map), { parser: "babel", printWidth: 110 });
 const inverse = Object.fromEntries(Object.entries(map).map(([a, b]) => [b, a]));
 if (Object.keys(inverse).length !== Object.keys(map).length) throw new Error("rename map is not one-to-one");
