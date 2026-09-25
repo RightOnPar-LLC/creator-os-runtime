@@ -72,3 +72,38 @@ exit 0 in sync, 1 drift, 2 could not check. Run it before any redeploy.
 Still open: `index.ts` is 0.1.1 — do NOT deploy it (it would roll the runtime back
 two versions and drop the connect surface). The readable 0.3.0 source is the thing
 to recover; until then the bundle is the source of truth.
+
+> Superseded 2026-09-25: the readable source was rebuilt and proven identical to
+> this bundle (#3), then split into `src/` (#4). `src/` is now the source of truth.
+> `index.ts` is still 0.1.1 and nothing deploys it — still do not.
+
+## 0.3.1 — deployed from the repo (2026-09-25)
+
+0.3.1 (#5, `4a470c6`) is the first version that went from git to Railway rather
+than the other way round. Its security fixes: an OAuth refresh can no longer
+escalate to operator caps; github webhook dedupe keys on the signed body; `/health`
+no longer publishes secret fingerprints; `/status` is cached.
+
+It runs on **two** services in project `creator-os-runtime`, the same bytes on both:
+
+| service | kind | URL | deployment |
+|---|---|---|---|
+| `runtime-svc` · `06be2b2e…` | Dockerfile (`deploy/Dockerfile`, builds `src/` in the image) | https://runtime.meshtool.ai | `20867a03…` 2026-09-25T10:01Z |
+| `runtime` · `9d9ea993…` | Railway Function (the original) | https://runtime-production-9d95.up.railway.app | `4559858e…` 2026-09-25T12:24Z |
+
+- **File:** `live/runtime-0.3.1.bundle.js` — 86,019 bytes, sha256 `04789a9b85432f14647142c7dcd115a75f072670a695312aeccf98b6be7cadfa`.
+  It is `npm run build` of `4a470c6`, and both URLs report this hash at `/health`.
+- **Why the old Function was patched, not retired:** it still carries live traffic
+  (claude.ai connector calls to `/mcp`, the admin console). Retiring it means moving
+  those clients to `runtime.meshtool.ai` first; deleting the service is a signed step.
+- **How the Function was deployed:** a Function's code is its start command,
+  `./run.sh <base64 of the file>`. `railway functions push` refuses anything over
+  96kb of base64 (~72KB of code), a CLI-only limit — Railway already held the
+  113,629-char 0.3.0 command. So it was set with the same API calls the CLI makes
+  (`serviceInstanceUpdate` startCommand, then `serviceInstanceDeployV2`).
+- **Rollback:** deploy `live/runtime-0.3.0.bundle.js` the same way.
+- **Known gap:** the Function generates its own package.json with `hono: latest`;
+  the repo and the Dockerfile service pin 4.13.9. The two can drift on a hono release.
+
+`node live/verify.mjs` checks the Function URL by default; add
+`--url https://runtime.meshtool.ai` for the Dockerfile service.
