@@ -1,7 +1,7 @@
 // Routes: inbound webhooks: stripe, railway, github, brain, mesh. Registration order is significant.
 import { env } from "../config.js";
 import { hmacSha256, HttpError, safeEqual, sha256Hex } from "../util.js";
-import { getSetting, recordEvent } from "../db.js";
+import { getSetting, recordEvent, sql } from "../db.js";
 import {
   handleRailwayEvent,
   handleStripeEvent,
@@ -74,8 +74,21 @@ app.post("/webhooks/github", async (e) => {
     // count as new (2026-09-25 fix). A genuine GitHub redelivery carries the
     // same body, so it is still recognised as a replay.
     r = sha256Hex(t),
-    s = e.req.header("x-github-event") || "unknown",
-    i = await recordWebhookEvent("github", r, s, {
+    s = e.req.header("x-github-event") || "unknown";
+  // Rows written before 0.3.1 are keyed by delivery id, not body hash. Treat a
+  // match on the old key, or (for events that carry one) the same repo + after
+  // sha + type, as a replay too, so a pre-0.3.1 body can't be re-processed
+  // under a fresh delivery id (review on PR #5).
+  let d = e.req.header("x-github-delivery") || "",
+    legacy = await sql`SELECT 1 FROM webhook_events WHERE source = 'github' AND (event_id = ${d}
+      OR (${n.after ? String(n.after) : null}::text IS NOT NULL AND type = ${s}
+          AND payload->>'repo' = ${n.repository?.full_name ?? null} AND payload->>'after' = ${n.after ? String(n.after) : null})) LIMIT 1`;
+  if (legacy.length)
+    return e.json({
+      received: !0,
+      replay: !0,
+    });
+  let i = await recordWebhookEvent("github", r, s, {
       repo: n.repository?.full_name,
       ref: n.ref,
       after: n.after,

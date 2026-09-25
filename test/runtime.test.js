@@ -431,6 +431,23 @@ describe("6. webhooks", () => {
     const forged = await req("POST", "/webhooks/github", { raw: body, headers: { ...hdr, "x-github-delivery": "delivery-FORGED", "x-hub-signature-256": sig } });
     expect(forged.json).toEqual({ received: true, replay: true });
     expect((await admin("GET", "/api/admin/events")).json.events.filter((e) => e.type === "repo.push").length).toBe(1);
+    // A row written by 0.3.0 (keyed by delivery id, not body hash) still blocks a
+    // replay of that body under a new delivery id (review on PR #5).
+    const oldBody = JSON.stringify({ repository: { full_name: "o/legacy" }, ref: "refs/heads/main", after: "legacy-sha" });
+    await dbQuery(
+      "INSERT INTO webhook_events (source, event_id, type, payload) VALUES ('github', 'legacy-delivery-7', 'push', $1::jsonb)",
+      [JSON.stringify({ repo: "o/legacy", ref: "refs/heads/main", after: "legacy-sha" })],
+    );
+    const legacyReplay = await req("POST", "/webhooks/github", {
+      raw: oldBody,
+      headers: { ...hdr, "x-github-delivery": "brand-new-id", "x-hub-signature-256": "sha256=" + hmacHex(GITHUB_SECRET, oldBody) },
+    });
+    expect(legacyReplay.json).toEqual({ received: true, replay: true });
+    const sameId = await req("POST", "/webhooks/github", {
+      raw: JSON.stringify({ zen: "ping" }),
+      headers: { ...hdr, "x-github-event": "ping", "x-github-delivery": "legacy-delivery-7", "x-hub-signature-256": "sha256=" + hmacHex(GITHUB_SECRET, JSON.stringify({ zen: "ping" })) },
+    });
+    expect(sameId.json).toEqual({ received: true, replay: true });
   });
 
   test("brain + mesh HMAC; railway token; stripe unarmed", async () => {
