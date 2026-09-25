@@ -1,0 +1,12 @@
+{
+  "name": "creator-os-runtime-tests",
+  "private": true,
+  "type": "module",
+  "description": "Characterisation tests + build tooling for src/. Not used by production (Railway runs the single bundled file).",
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
+    "@electric-sql/pglite-socket": "0.2.11",
+    "bun": "1.4.2",
+    "hono": "4.13.9"
+  }
+}
