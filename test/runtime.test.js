@@ -2,7 +2,7 @@
 // src/runtime.js (the proven-readable form of the live 0.3.0 bundle) so that any
 // refactor has to keep every behaviour pinned here.
 import { describe, test, expect, afterAll } from "bun:test";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -565,6 +565,79 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     // A real sub-partition (separator right after the prefix) still works.
     const nested = await req("POST", "/api/memory", { token: child.json.token, body: { partition: "worker:a-shard1", content: "nested ok" } });
     expect(nested.status).toBe(201);
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("7c. worker namePrefix scope is a real prefix, not a bare string match", () => {
+  // 2026-09-25: the same bare `.startsWith()` as 7b, on the worker-name axis.
+  // A grant scoped to namePrefix "<tenant>acme" could deploy "<tenant>acmecorp-app",
+  // and could attenuate a child down to "<tenant>acmecorp" — a sibling scope, not a
+  // narrower one. Fixed via policy.js `workerNameCovers` (partitionCovers, with an
+  // empty namePrefix still meaning "no workers", never a wildcard).
+  const scopedChild = async (token, namePrefix, caps, budget = { usd_cents: 30, calls: 3, deploys: 1 }) =>
+    req("POST", "/api/grants", {
+      token,
+      body: {
+        sub: "agent:scoped", caps, ttlSec: 600,
+        budget,
+        scope: { workers: { namePrefix } },
+      },
+    });
+
+  test("deploy: a namePrefix does not reach a same-prefixed but different worker", async () => {
+    const t = await newTenant("worker-prefix-tenant");
+    const p = (await req("GET", "/api/grants/verify", { token: t.token })).json.scope.workers.namePrefix;
+    const child = await scopedChild(t.token, p + "acme", ["deploy.worker"]);
+    expect(child.status).toBe(201);
+    const deploy = (name) => req("POST", "/api/deploys", { token: child.json.token, body: { name, template: "probe" } });
+    // "<p>acmecorp-app" starts with "<p>acme" but is a DIFFERENT worker.
+    const collide = await deploy(p + "acmecorp-app");
+    expect(collide.status).toBe(403);
+    expect(collide.json.error).toBe("out_of_scope");
+    // The exact name and a real sub-name (separator right after the prefix) still work.
+    expect((await deploy(p + "acme")).status).toBe(201);
+    expect((await deploy(p + "acme-app")).status).toBe(201);
+  });
+
+  test("attenuation: a child cannot re-scope to a sibling that merely shares the prefix", async () => {
+    const t = await newTenant("worker-atten-tenant");
+    const p = (await req("GET", "/api/grants/verify", { token: t.token })).json.scope.workers.namePrefix;
+    // Each child reserves its budget from the parent, so the middle grant holds enough for two.
+    const mid = await scopedChild(t.token, p + "acme", ["deploy.worker", "grant.issue"], { usd_cents: 100, calls: 10, deploys: 5 });
+    expect(mid.status).toBe(201);
+    const sibling = await scopedChild(mid.json.token, p + "acmecorp", ["deploy.worker"]);
+    expect(sibling.status).toBe(403);
+    expect(sibling.json).toEqual({ error: "attenuation_violation", detail: ["scope_prefix_widened"] });
+    expect((await scopedChild(mid.json.token, p + "acme-app", ["deploy.worker"])).status).toBe(201);
+    expect((await scopedChild(mid.json.token, p + "acme", ["deploy.worker"])).status).toBe(201);
+  });
+
+  test("attenuation: an empty parent namePrefix (no workers) is not a wildcard", () => {
+    const parent = {
+      status: "active", depth: 0, exp: Math.floor(Date.now() / 1000) + 3600,
+      caps: ["deploy.worker"], scope: { workers: { namePrefix: "" } },
+      budget: { usd_cents: 100, calls: 10, deploys: 2 },
+      constraints: { maxWorkers: 2, maxReplicas: 1, allowDelete: false, requireDryRun: true },
+    };
+    const child = (namePrefix) => ({
+      caps: ["deploy.worker"], scope: { workers: { namePrefix } },
+      budget: { usd_cents: 0, calls: 0, deploys: 0 }, exp: Math.floor(Date.now() / 1000) + 600,
+      constraints: { maxWorkers: 1, maxReplicas: 1, allowDelete: false, requireDryRun: true }, depth: 1,
+    });
+    expect(mod.attenuationViolations(parent, child("t-abc123-"), "starter")).toEqual(["scope_prefix_widened"]);
+    expect(mod.attenuationViolations(parent, child(""), "starter")).toEqual([]);
+  });
+
+  test("source: no bare startsWith() against a worker namePrefix anywhere in src/", () => {
+    const srcDir = resolve(here, "..", "src");
+    const files = readdirSync(srcDir, { recursive: true }).map(String).filter((f) => f.endsWith(".js"));
+    expect(files.length).toBeGreaterThan(20);
+    for (const f of files) {
+      const lines = readFileSync(resolve(srcDir, f), "utf8").split("\n");
+      const bad = lines.filter((l) => !l.trim().startsWith("//") && l.includes("namePrefix") && l.includes(".startsWith("));
+      expect({ file: f, bad }).toEqual({ file: f, bad: [] });
+    }
   });
 });
 

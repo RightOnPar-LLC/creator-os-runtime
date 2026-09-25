@@ -16,6 +16,7 @@ import {
   tenantWorkerPrefix,
   TIERS,
   usageWithin,
+  workerNameCovers,
   zeroUsage,
 } from "./policy.js";
 
@@ -277,7 +278,7 @@ export async function verifyGrant(e, t, a, countRate = !0) {
         throw new HttpError(403, "out_of_scope", {
           environment: a.environment,
         });
-      if (a.workerName && !a.workerName.startsWith(l.workers?.namePrefix || "\x00"))
+      if (a.workerName && !workerNameCovers(l.workers?.namePrefix || "", a.workerName))
         throw new HttpError(403, "out_of_scope", {
           workerName: a.workerName,
         });
