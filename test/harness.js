@@ -27,6 +27,8 @@ export const RATE_LIMIT = 40;
 // ---- 1. throwaway Postgres -------------------------------------------------------
 const pg = await PGlite.create();
 const pgServer = new PGLiteSocketServer({ db: pg, port: 0, host: "127.0.0.1", maxConnections: 8 });
+/** Direct SQL against the throwaway DB, for tests that must set up a state no route can reach. */
+export const dbQuery = (q, params = []) => pg.query(q, params);
 await pgServer.start();
 
 // PGlite is ONE Postgres session shared by every socket. Bun.SQL pools connections

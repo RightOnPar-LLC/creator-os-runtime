@@ -7,7 +7,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   mod, entryPath, BASE, ADMIN_KEY, GITHUB_SECRET, BRAIN_SECRET, MESH_SECRET, RAILWAY_TOKEN, RATE_LIMIT,
-  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown,
+  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown, dbQuery,
 } from "./harness.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -21,7 +21,7 @@ describe("1. /health", () => {
     const h = r.json;
     expect(h.ok).toBe(true);
     expect(h.service).toBe("creator-os-runtime");
-    expect(h.version).toBe("0.3.0");
+    expect(h.version).toBe("0.3.1");
     expect(h.policy).toBe("p1");
     expect(h.db).toBe(true);
     expect(h.killSwitch).toBe(false);
@@ -30,12 +30,20 @@ describe("1. /health", () => {
       railwayWebhook: true, github: true, brain: true, mesh: true, anthropic: false,
       brainOut: false, cognitiveBridge: false, sync: false,
     });
-    expect(Object.keys(h.fingerprints).sort()).toEqual(
+    // 2026-09-25: fingerprints are no longer public.
+    expect(h.fingerprints).toBeUndefined();
+    expect(typeof h.time).toBe("string");
+  });
+
+  test("secret fingerprints are admin-only (GET /api/admin/fingerprints)", async () => {
+    expect((await req("GET", "/api/admin/fingerprints")).status).toBe(401);
+    const r = await admin("GET", "/api/admin/fingerprints");
+    expect(r.status).toBe(200);
+    expect(Object.keys(r.json.fingerprints).sort()).toEqual(
       ["admin", "anthropic", "brain", "cognitiveBridge", "github", "mesh", "railway", "railwayWebhook", "stripe", "sync", "vault"],
     );
-    expect(h.fingerprints.admin).toBe(sha256Hex(ADMIN_KEY).slice(0, 8));
-    expect(h.fingerprints.anthropic).toBeNull();
-    expect(typeof h.time).toBe("string");
+    expect(r.json.fingerprints.admin).toBe(sha256Hex(ADMIN_KEY).slice(0, 8));
+    expect(r.json.fingerprints.anthropic).toBeNull();
   });
 
   test("source hash is the sha256 of the file that was loaded as the entry", async () => {
@@ -47,7 +55,7 @@ describe("1. /health", () => {
   });
 
   test("exports", () => {
-    expect(mod.VERSION).toBe("0.3.0");
+    expect(mod.VERSION).toBe("0.3.1");
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
@@ -86,7 +94,7 @@ describe("2. route table", () => {
   test("/.well-known/creator-os.json", async () => {
     const r = await req("GET", "/.well-known/creator-os.json");
     expect(r.status).toBe(200);
-    expect(r.json.version).toBe("0.3.0");
+    expect(r.json.version).toBe("0.3.1");
     expect(r.json.caps).toEqual(mod.CAPS);
     expect(r.json.templates.probe).toEqual({ desc: "Tiny HTTP responder that proves the deploy path", needs: [], estCents: 25 });
   });
@@ -237,6 +245,38 @@ describe("3. OAuth 2.1 + PKCE client flow", () => {
     expect(again.status).toBe(400);
     expect(again.json.error_description).toBe("refresh token invalid");
   });
+
+  // 2026-09-25: refresh used the client's FIRST registered redirect to pick the
+  // profile. A client registered [claude.ai, devdesk] and approved on devdesk
+  // got OPERATOR caps (grant.issue, cog.plan) once its grant was re-issued.
+  test("refresh never escalates: a client approved on devdesk keeps devdesk caps even if its FIRST redirect is claude.ai", async () => {
+    const mixed = ["https://claude.ai/api/mcp/auth_callback", redirect];
+    const reg = await req("POST", "/oauth/register", { body: { client_name: "mixed", redirect_uris: mixed } });
+    expect(reg.status).toBe(201);
+    const cid = reg.json.client_id;
+    const verifier = "mixed-verifier-" + "y".repeat(40);
+    const ap = await admin("POST", "/oauth/approve", {
+      body: { client_id: cid, redirect_uri: redirect, code_challenge: s256(verifier), state: "m", tenant: tenant.id },
+    });
+    const code = new URL(ap.json.redirect).searchParams.get("code");
+    const tok = await req("POST", "/oauth/token", {
+      body: { grant_type: "authorization_code", code, client_id: cid, redirect_uri: redirect, code_verifier: verifier },
+    });
+    expect(tok.status).toBe(200);
+    const g1 = await req("GET", "/api/grants/verify", { token: tok.json.access_token });
+    expect(g1.json.sub).toBe("product:devdesk");
+    // Force the RE-ISSUE branch (grant within an hour of expiry), which is where
+    // the profile is re-derived.
+    const upd = await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [Math.floor(Date.now() / 1000) + 60, g1.json.id]);
+    expect(upd.affectedRows).toBe(1);
+    const ref = await req("POST", "/oauth/token", { body: { grant_type: "refresh_token", refresh_token: tok.json.refresh_token, client_id: cid } });
+    expect(ref.status).toBe(200);
+    const g2 = await req("GET", "/api/grants/verify", { token: ref.json.access_token });
+    expect(g2.json.sub).toBe("product:devdesk");
+    expect(g2.json.caps).toEqual(["memory.read", "memory.write", "ledger.read", "tenant.read"]);
+    expect(g2.json.caps).not.toContain("grant.issue");
+    expect(ref.json.scope).toBe("memory.read memory.write ledger.read tenant.read");
+  });
 });
 
 // ------------------------------------------------------------------------------------
@@ -254,7 +294,7 @@ describe("4. MCP", () => {
 
   test("initialize + tools/list + ping + unknown method", async () => {
     const i = await mcp(t.token, "initialize", { protocolVersion: "2025-06-18" });
-    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.0" });
+    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.1" });
     expect(i.json.result.protocolVersion).toBe("2025-06-18");
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
@@ -299,7 +339,7 @@ describe("4. MCP", () => {
 
   test("runtime_health + grant_verify tools", async () => {
     const h = await mcp(t.token, "tools/call", { name: "runtime_health" });
-    expect(h.json.result.structuredContent.version).toBe("0.3.0");
+    expect(h.json.result.structuredContent.version).toBe("0.3.1");
     const v = await mcp(t.token, "tools/call", { name: "grant_verify" });
     expect(v.json.result.structuredContent.sub).toBe("tenant:root");
   });
@@ -386,6 +426,11 @@ describe("6. webhooks", () => {
     const hooks = (await admin("GET", "/api/admin/webhooks")).json.webhooks.filter((w) => w.source === "github");
     expect(hooks.length).toBe(1);
     expect(hooks[0].handled).toBe(true);
+    // 2026-09-25: the same signed body with a NEW delivery id is still a replay
+    // (x-github-delivery is not covered by the signature).
+    const forged = await req("POST", "/webhooks/github", { raw: body, headers: { ...hdr, "x-github-delivery": "delivery-FORGED", "x-hub-signature-256": sig } });
+    expect(forged.json).toEqual({ received: true, replay: true });
+    expect((await admin("GET", "/api/admin/events")).json.events.filter((e) => e.type === "repo.push").length).toBe(1);
   });
 
   test("brain + mesh HMAC; railway token; stripe unarmed", async () => {
@@ -489,7 +534,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("status report runs; every outbound call was blocked and is a known probe", async () => {
     const s = await req("GET", "/status.json");
     expect(s.status).toBe(200);
-    expect(s.json.version).toBe("0.3.0");
+    expect(s.json.version).toBe("0.3.1");
     expect(s.json.bodies.map((b) => b.up)).toEqual([false, false, false]);
     const allowed = new Set([
       "https://devdesk.meshtool.ai/health", "https://market.meshtool.ai/api/health",
@@ -497,5 +542,10 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
     ]);
     expect(blockedFetches.length).toBeGreaterThan(0);
     for (const u of blockedFetches) expect(allowed.has(u)).toBe(true);
+    // 2026-09-25: public status is cached — hammering it makes no new probes.
+    const before = blockedFetches.length;
+    await Promise.all(Array.from({ length: 10 }, () => req("GET", "/status.json")));
+    await req("GET", "/status");
+    expect(blockedFetches.length).toBe(before);
   });
 });

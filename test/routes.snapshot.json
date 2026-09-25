@@ -1,7 +1,9 @@
 {
-  "count": 124,
+  "count": 126,
   "appRoutes": [
     "GET /health",
+    "GET /api/admin/fingerprints",
+    "GET /api/admin/fingerprints",
     "GET /.well-known/creator-os.json",
     "POST /api/tenants",
     "POST /api/tenants",
@@ -128,6 +130,7 @@
   ],
   "inventory": [
     "GET /health :: public",
+    "GET /api/admin/fingerprints :: admin",
     "GET /.well-known/creator-os.json :: public",
     "POST /api/tenants :: admin",
     "GET /api/tenants :: admin",

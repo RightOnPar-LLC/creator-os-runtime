@@ -11,7 +11,7 @@ import { HttpError, sha256Hex } from "../util.js";
 import { isKillSwitchOn, sql } from "../db.js";
 import { CAPS, TIERS } from "../policy.js";
 import { TEMPLATES } from "../railway.js";
-import { app, sourceBytes, sourceSha256, sourceText } from "../http.js";
+import { app, requireAdmin, sourceBytes, sourceSha256, sourceText } from "../http.js";
 
 app.onError((e, t) => {
   if (e instanceof HttpError)
@@ -56,7 +56,9 @@ app.get("/health", async (e) => {
       db: t,
       killSwitch: await isKillSwitchOn(),
       armed: armedIntegrations(),
-      fingerprints: secretFingerprints(),
+      // Secret fingerprints moved behind the admin key (GET /api/admin/fingerprints):
+      // 8 hex of sha256 is harmless for a random key but lets anyone test guesses
+      // offline against a weak one (2026-09-25 fix).
       source: {
         sha256: sourceSha256,
         bytes: sourceBytes,
@@ -74,6 +76,7 @@ app.get("/health", async (e) => {
     t ? 200 : 503,
   );
 });
+app.get("/api/admin/fingerprints", requireAdmin, (e) => e.json({ fingerprints: secretFingerprints() }));
 app.get("/.well-known/creator-os.json", (e) =>
   e.json({
     name: SERVICE_NAME,

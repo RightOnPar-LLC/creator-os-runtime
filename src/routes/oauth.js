@@ -11,7 +11,7 @@ import {
   mintRefreshToken,
   oauthError,
   OPERATOR_PROFILE,
-  profileForClient,
+  profileForGrant,
   profileForRedirect,
   protectedResourceMetadata,
   publicBaseUrl,
@@ -145,9 +145,11 @@ app.post("/oauth/token", async (e) => {
       return oauthError(e, "invalid_grant", "refresh token invalid");
     if (Number(a.consent_until) <= nowSec())
       return oauthError(e, "invalid_grant", "consent window ended; approve again");
-    let n = await getGrant(a.grant_id),
-      r = await profileForClient(a.client_id);
+    let n = await getGrant(a.grant_id);
     if (!n || n.status === "revoked") return oauthError(e, "invalid_grant", "operator grant was revoked");
+    // Same profile the grant was approved under, or no refresh at all.
+    let r = profileForGrant(n);
+    if (!r) return oauthError(e, "invalid_grant", "grant profile unknown; approve again");
     let s =
       n.status === "active" && Number(n.exp) - nowSec() > 3600
         ? {

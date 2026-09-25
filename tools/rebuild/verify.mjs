@@ -4,7 +4,7 @@
 // tools/rebuild/runtime.js, then runs pass 3 (split.mjs --check), which regenerates
 // the src/ modules from it and byte-compares them. Exit 0 = identical; 1 = drift.
 //   cd tools/rebuild && npm ci && npm run verify
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -25,5 +25,19 @@ try {
   const have = readFileSync(join(HERE, "runtime.js"), "utf8").split("\r\n").join("\n");
   if (want !== have) { console.error("DRIFT: tools/rebuild/runtime.js is not the proven rebuild output"); process.exit(1); }
   console.log("tools/rebuild/runtime.js is byte-identical to the proven rebuild of live/runtime-0.3.0.bundle.js");
-  run("split.mjs", join(HERE, "runtime.js"), join(ROOT, "src"), "--check");
+  // Pass 3 is checked against src/ AS SPLIT (the baseline commit), not the
+  // working tree: src/ is now edited on purpose (fixes, features). The proof
+  // chain is "live bundle = readable file = src@SPLIT_BASELINE"; everything
+  // after that is ordinary reviewed change, visible as `git diff SPLIT_BASELINE -- src`.
+  const SPLIT_BASELINE = "526ee25e725ffc258c6e2380e1addf4c10bd4fdc";
+  const git = (...a) => spawnSync("git", a, { cwd: ROOT, encoding: "buffer", maxBuffer: 64 << 20 });
+  const base = join(tmp, "src-baseline");
+  for (const f of git("ls-tree", "-r", "--name-only", SPLIT_BASELINE, "src").stdout.toString().split("\n").filter(Boolean)) {
+    const out = join(base, f.slice("src/".length));
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, git("show", `${SPLIT_BASELINE}:${f}`).stdout);
+  }
+  run("split.mjs", join(HERE, "runtime.js"), base, "--check");
+  const changed = git("diff", "--stat", SPLIT_BASELINE, "--", "src").stdout.toString().trim();
+  console.log(changed ? `src/ changed since the proven split (${SPLIT_BASELINE.slice(0, 7)}) — reviewed changes:\n${changed}` : "src/ is exactly the proven split");
 } finally { rmSync(tmp, { recursive: true, force: true }); }

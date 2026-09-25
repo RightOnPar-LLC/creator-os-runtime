@@ -69,7 +69,11 @@ app.post("/webhooks/github", async (e) => {
   if (!safeEqual(a, "sha256=" + hmacSha256(env.GITHUB_WEBHOOK_SECRET, t)))
     throw new HttpError(401, "bad_signature");
   let n = JSON.parse(t || "{}"),
-    r = e.req.header("x-github-delivery") || sha256Hex(t),
+    // Dedupe on the SIGNED body, not x-github-delivery: that header is outside
+    // the HMAC, so a captured body replayed with a fresh delivery id used to
+    // count as new (2026-09-25 fix). A genuine GitHub redelivery carries the
+    // same body, so it is still recognised as a replay.
+    r = sha256Hex(t),
     s = e.req.header("x-github-event") || "unknown",
     i = await recordWebhookEvent("github", r, s, {
       repo: n.repository?.full_name,
