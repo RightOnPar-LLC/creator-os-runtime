@@ -1,0 +1,7 @@
+# Never auto-install packages at runtime: every import must come from the pinned
+# test/node_modules (linked to ../node_modules by run.mjs).
+[install]
+auto = "disable"
+
+[test]
+timeout = 30000
