@@ -169,15 +169,22 @@ export function markdownToHtml(e) {
 `;
       continue;
     }
-    let o = i
-      .replace(/`([^`]+)`/g, (c, E) => `<code>${t(E)}</code>`)
-      .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+    // Escape the RAW line first, then apply the two markdown transforms on the
+    // already-escaped text: `` ` `` and `*` are untouched by t(), so the
+    // patterns still match, and their captured text is already safe. Escaping
+    // used to run only inside fenced code / inline code spans, so a heading,
+    // paragraph, list item or table cell carrying "<script>" rendered as a
+    // live tag on every viewer of /docs/:name (stored XSS, 2026-09-25 fix).
+    let E2 = t(i),
+      o = E2
+        .replace(/`([^`]+)`/g, (c, E) => `<code>${E}</code>`)
+        .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
     if (/^\|/.test(i)) {
       if (/^\|\s*-/.test(i)) continue;
       if (!s) ((n += "<table>"), (s = !0));
       n +=
         "<tr>" +
-        i
+        E2
           .split("|")
           .slice(1, -1)
           .map((c) => `<td>${c.trim()}</td>`)
@@ -187,7 +194,7 @@ export function markdownToHtml(e) {
     } else if (s) ((n += "</table>"), (s = !1));
     let l = i.match(/^(#{1,3})\s+(.*)/);
     if (l) {
-      n += `<h${l[1].length}>${l[2]}</h${l[1].length}>`;
+      n += `<h${l[1].length}>${t(l[2])}</h${l[1].length}>`;
       continue;
     }
     if (/^\s*[-*]\s+/.test(i)) {

@@ -19,8 +19,17 @@ export var bearerToken = (e) => {
   let t = e.req.header("authorization") || "";
   return t.startsWith("Bearer ") ? t.slice(7).trim() : e.req.header("x-grant") || void 0;
 };
+// Admin auth reads ONLY the standard Authorization header. x-grant is the
+// fallback channel for short-lived, revocable grant tokens (MCP clients that
+// can't set Authorization); bearerToken() folds the two together, so the
+// one master key could also authenticate over x-grant — a low-trust header
+// never meant to carry it, and one more place it could be logged (2026-09-25 fix).
+var adminHeaderToken = (e) => {
+  let t = e.req.header("authorization") || "";
+  return t.startsWith("Bearer ") ? t.slice(7).trim() : void 0;
+};
 var isAdminRequest = (e) =>
-  !!env.RUNTIME_ADMIN_KEY && !!bearerToken(e) && safeEqual(bearerToken(e), env.RUNTIME_ADMIN_KEY);
+  !!env.RUNTIME_ADMIN_KEY && !!adminHeaderToken(e) && safeEqual(adminHeaderToken(e), env.RUNTIME_ADMIN_KEY);
 var tagAuth = (e, t) =>
   Object.assign(e, {
     auth: t,
@@ -60,7 +69,7 @@ var ROUTE_AUTH_OVERRIDES = {
   "GET /cockpit/:page": "public(page)+admin(data)",
   "GET /auth/railway/callback": "public(state)",
   "POST /webhooks/stripe": "webhook:stripe-signature",
-  "POST /webhooks/railway": "webhook:?token=",
+  "POST /webhooks/railway": "webhook:x-runtime-token",
   "POST /webhooks/github": "webhook:x-hub-signature-256",
   "POST /webhooks/brain": "webhook:x-brain-signature",
   "POST /webhooks/mesh": "webhook:x-mesh-signature",

@@ -35,7 +35,25 @@ app.post("/mcp", async (e) => {
   try {
     await verifyGrant(t, null);
   } catch (l) {
-    if (l instanceof HttpError && l.status === 401) return a(l.code);
+    if (l instanceof HttpError) {
+      // 401 (missing/bad/expired/revoked grant) carries the OAuth discovery
+      // header. Any other rejection here — rate_limited, tenant_suspended,
+      // runtime_paused — used to fall through silently: this catch only
+      // matched status 401, so the request ran as if verifyGrant had
+      // succeeded. For "tools/call" the SECOND verifyGrant call (below) used
+      // to re-check and catch it; now that call no longer re-checks the rate
+      // limit (it would double-count), so an uncaught rejection here would
+      // go uncaught entirely (2026-09-25 fix, alongside the double-count fix).
+      if (l.status === 401) return a(l.code);
+      return e.json(
+        {
+          error: l.code,
+          detail: l.detail ?? null,
+        },
+        l.status,
+      );
+    }
+    throw l;
   }
   let n = await readJsonBody(e),
     r = n.id ?? null;
@@ -115,7 +133,11 @@ app.post("/mcp", async (e) => {
           message: "unknown_tool",
         }),
       );
-    let c = await verifyGrant(bearerToken(e), l[s]);
+    // Already counted against the rate limit by the pre-check above (line ~36);
+    // don't count this second, cap-specific verification too, or one MCP call
+    // spends two units of budget while the same call over REST spends one
+    // (2026-09-25 fix).
+    let c = await verifyGrant(bearerToken(e), l[s], null, !1);
     switch (s) {
       case "grant_verify":
         return e.json(

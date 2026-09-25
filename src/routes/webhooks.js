@@ -40,7 +40,11 @@ app.post("/webhooks/railway", async (e) => {
     throw new HttpError(503, "unarmed", {
       needs: "RAILWAY_WEBHOOK_TOKEN",
     });
-  let t = e.req.query("token") || e.req.header("x-runtime-token") || "";
+  // Header only: a query string lands in access/proxy logs and Railway's own
+  // request logs, so a ?token= shared secret leaks anywhere those are kept or
+  // forwarded. No query fallback (2026-09-25 fix; re-point the Railway webhook
+  // at the x-runtime-token header, never a URL, when arming it).
+  let t = e.req.header("x-runtime-token") || "";
   if (!safeEqual(t, env.RAILWAY_WEBHOOK_TOKEN)) throw new HttpError(401, "bad_token");
   let a = await readJsonBody(e),
     n = `${a.resource?.deployment?.id || a.resource?.service?.id || "na"}:${a.type}:${a.timestamp || ""}`,

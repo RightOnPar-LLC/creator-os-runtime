@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS outbox (
   done BOOLEAN NOT NULL DEFAULT false, last_error TEXT, created_at TIMESTAMPTZ DEFAULT now());
 CREATE TABLE IF NOT EXISTS breakglass (
   id BIGSERIAL PRIMARY KEY, tenant TEXT NOT NULL, until TIMESTAMPTZ NOT NULL, reason TEXT, created_at TIMESTAMPTZ DEFAULT now());
+CREATE TABLE IF NOT EXISTS rate_limits (
+  grant_id TEXT NOT NULL, window_start BIGINT NOT NULL, count INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (grant_id, window_start));
 `;
 export async function migrateSchema() {
   for (let e of SCHEMA_SQL.split(";")

@@ -3,6 +3,7 @@ import { randomBytes } from "crypto";
 import { escapeHtml, HttpError, newId, nowSec, sha256Base64Url, sha256Hex } from "../util.js";
 import { getGrant, getTenant, recordEvent, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
+import { revokeGrantTree } from "../grants.js";
 import { app, readJsonBody, requireAdmin } from "../http.js";
 import {
   ensureRootGrant,
@@ -138,8 +139,36 @@ app.post("/oauth/token", async (e) => {
     return e.json(tokenResponse(s, await mintRefreshToken(a.client_id, a.tenant, a.root_id, s.row.id, r), n));
   }
   if (t.grant_type === "refresh_token") {
+    let h = sha256Hex(String(t.refresh_token || "")),
+      existing = (await sql`SELECT * FROM oauth_refresh WHERE hash = ${h}`)[0];
+    // Rotate-on-use means a refresh token works exactly once; the row is only
+    // ever marked revoked by that one legitimate exchange. Seeing it again
+    // means the token was captured and is being replayed by someone else —
+    // the WHERE revoked=false used to make that look identical to an unknown
+    // token (just another invalid_grant), so a stolen refresh token and the
+    // legitimate client's NEW one both stayed live. Revoke the grant it was
+    // tied to and say so (2026-09-25 fix).
+    if (existing?.revoked) {
+      // Revoke every grant this CLIENT still has a live (unrotated) refresh
+      // chain for, not just the stale row's own grant_id: the legitimate
+      // rotation may have moved this client onto a NEW child grant (when the
+      // old one was near expiry) rather than reissuing the same one.
+      let live = await sql`UPDATE oauth_refresh SET revoked = true WHERE client_id = ${existing.client_id} AND revoked = false RETURNING grant_id`,
+        ids = [...new Set([existing.grant_id, ...live.map((r) => r.grant_id)])];
+      for (let id of ids) await revokeGrantTree(id, "refresh_token_reuse_detected", "oauth");
+      await recordEvent(
+        "oauth.refresh_reuse_detected",
+        {
+          client: existing.client_id,
+          grants: ids,
+        },
+        existing.tenant,
+        "oauth",
+      );
+      return oauthError(e, "invalid_grant", "refresh token reused; grant revoked");
+    }
     let a = (
-      await sql`UPDATE oauth_refresh SET revoked = true WHERE hash = ${sha256Hex(String(t.refresh_token || ""))} AND revoked = false RETURNING *`
+      await sql`UPDATE oauth_refresh SET revoked = true WHERE hash = ${h} AND revoked = false RETURNING *`
     )[0];
     if (!a || (t.client_id && a.client_id !== t.client_id))
       return oauthError(e, "invalid_grant", "refresh token invalid");

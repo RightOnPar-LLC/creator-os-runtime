@@ -182,7 +182,7 @@
     "GET /auth/railway/start :: grant:tenant.read",
     "GET /auth/railway/callback :: public(state)",
     "POST /webhooks/stripe :: webhook:stripe-signature",
-    "POST /webhooks/railway :: webhook:?token=",
+    "POST /webhooks/railway :: webhook:x-runtime-token",
     "POST /webhooks/github :: webhook:x-hub-signature-256",
     "POST /webhooks/brain :: webhook:x-brain-signature",
     "POST /webhooks/mesh :: webhook:x-mesh-signature",

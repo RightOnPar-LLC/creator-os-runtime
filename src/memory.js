@@ -3,7 +3,7 @@ import { env } from "./config.js";
 import { HttpError, newId, parseJson, sha256Hex } from "./util.js";
 import { getSetting, setSetting, sql } from "./db.js";
 import { cogBridgeUrl, enqueueOutbox } from "./outbox.js";
-import { memoryPartitions } from "./policy.js";
+import { memoryPartitions, partitionCovers } from "./policy.js";
 
 export var serializeMemory = (e) => ({
   id: e.id,
@@ -102,7 +102,7 @@ export async function pullMemoryFromBridge() {
   };
 }
 export var assertMemoryScope = (e, t) => {
-  if (!memoryPartitions(parseJson(e.row.scope)).some((a) => t.startsWith(a)))
+  if (!memoryPartitions(parseJson(e.row.scope)).some((a) => partitionCovers(a, t)))
     throw new HttpError(403, "out_of_scope", {
       partition: t,
     });
