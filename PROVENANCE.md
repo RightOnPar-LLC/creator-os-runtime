@@ -49,3 +49,26 @@ failure `build-the-deploy-path-first` names: **the repo is the unit of delivery*
 This rescue restores the bytes and their lineage. It does not yet restore the
 *path* — there is no deploy script, no guard and no ratchet here. Those are the
 next steps if this service is to be kept.
+
+## Second rescue — v0.3.0 (2026-09-25)
+
+Live had moved on to **0.3.0** and git had not followed: `index.ts` here is 0.1.1,
+`backup/rog-2026-09-22-master` is 0.1.2. 0.3.0 carries the whole **client connect
+surface** — `/oauth/register|authorize|approve|token` and `/.well-known/oauth-*`,
+with profiles for `devdesk.meshtool.ai` and `market.meshtool.ai` — which existed
+nowhere but Railway. A redeploy from this repo would have deleted it.
+
+- **Pulled:** 2026-09-25 via `get-function-source-code`; `code` == `deployedCode`, nothing staged
+- **Deployment:** `39b5f211…` SUCCESS 2026-09-24T23:02:26Z
+- **File:** `live/runtime-0.3.0.bundle.js` — 85,214 bytes, sha256 `755882b616b8dcd786dd6c86643bd0a66037575094568f35739849af5ea0be3c`,
+  identical to the `source.sha256` the service reports at `/health`
+- **What it is:** a Bun **bundle** (minified), not source. Railway stores only what
+  was deployed; the readable 0.3.0 source was not found on either box and was most
+  likely written in a cloud session. The bundle is what runs, so it is what we keep.
+
+`node live/verify.mjs` compares live `/health` against the newest bundle here:
+exit 0 in sync, 1 drift, 2 could not check. Run it before any redeploy.
+
+Still open: `index.ts` is 0.1.1 — do NOT deploy it (it would roll the runtime back
+two versions and drop the connect surface). The readable 0.3.0 source is the thing
+to recover; until then the bundle is the source of truth.
