@@ -1,0 +1,16 @@
+{
+  "name": "creator-os-runtime-rebuild-tools",
+  "private": true,
+  "type": "module",
+  "description": "Reproduce and prove src/runtime.js from live/runtime-0.3.0.bundle.js",
+  "scripts": {
+    "verify": "node verify.mjs"
+  },
+  "devDependencies": {
+    "prettier": "3.9.9",
+    "acorn": "8.18.0",
+    "@babel/parser": "7.29.9",
+    "@babel/traverse": "7.29.8",
+    "@babel/generator": "7.29.8"
+  }
+}
