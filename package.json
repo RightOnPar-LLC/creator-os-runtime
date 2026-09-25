@@ -4,7 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun index.ts"
+    "start": "bun index.ts",
+    "test": "node test/run.mjs",
+    "build": "node tools/build.mjs",
+    "test:dist": "node tools/build.mjs && node test/run.mjs dist",
+    "verify:split": "node tools/rebuild/verify.mjs"
   },
   "dependencies": {
     "hono": "^4.6.14"
