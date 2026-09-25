@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// One command that proves src/runtime.js IS the proven rebuild of the live bundle:
-// runs both passes into a temp dir, then byte-compares the result with the
-// checked-in file. Exit 0 = identical; 1 = a pass failed or the file drifted.
+// One command that proves the chain live bundle -> readable file -> src/ modules:
+// runs passes 1+2 into a temp dir and byte-compares the result with the checked-in
+// tools/rebuild/runtime.js, then runs pass 3 (split.mjs --check), which regenerates
+// the src/ modules from it and byte-compares them. Exit 0 = identical; 1 = drift.
 //   cd tools/rebuild && npm ci && npm run verify
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -21,7 +22,8 @@ try {
   run("format-and-prove.mjs", join(ROOT, "live", "runtime-0.3.0.bundle.js"), join(tmp, "formatted.js"));
   run("rename-and-prove.mjs", join(tmp, "formatted.js"), join(HERE, "rename-map.json"), join(tmp, "readable.js"));
   const want = readFileSync(join(tmp, "readable.js"), "utf8");
-  const have = readFileSync(join(ROOT, "src", "runtime.js"), "utf8").split("\r\n").join("\n");
-  if (want !== have) { console.error("DRIFT: src/runtime.js is not the proven rebuild output"); process.exit(1); }
-  console.log("src/runtime.js is byte-identical to the proven rebuild of live/runtime-0.3.0.bundle.js");
+  const have = readFileSync(join(HERE, "runtime.js"), "utf8").split("\r\n").join("\n");
+  if (want !== have) { console.error("DRIFT: tools/rebuild/runtime.js is not the proven rebuild output"); process.exit(1); }
+  console.log("tools/rebuild/runtime.js is byte-identical to the proven rebuild of live/runtime-0.3.0.bundle.js");
+  run("split.mjs", join(HERE, "runtime.js"), join(ROOT, "src"), "--check");
 } finally { rmSync(tmp, { recursive: true, force: true }); }

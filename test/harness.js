@@ -10,7 +10,7 @@ import { createHash, createHmac } from "node:crypto";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const ENTRY = "../src/runtime.js";
+const ENTRY = "../src/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const entryPath = resolve(here, process.env.RUNTIME_ENTRY || ENTRY);
