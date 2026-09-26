@@ -6,11 +6,24 @@ import { getGrant, getTenant, isOperatorLspCapsEnabled, sql } from "./db.js";
 import { remainingBudget, TIERS } from "./policy.js";
 import { issueChildGrant, mintRootGrant } from "./grants.js";
 
+// deploy.worker + worker.status added 2026-09-26 so Claude (operator) and DevDesk
+// can launch and watch workers. `deploys` is the per-grant deploy ceiling; it is
+// still clamped to what the root has left.
 export var OPERATOR_PROFILE = {
   sub: "agent:claude-operator",
-  caps: ["grant.issue", "grant.read", "cog.plan", "ledger.read", "cog.execute", "lsp.diagnose"],
+  caps: [
+    "grant.issue",
+    "grant.read",
+    "cog.plan",
+    "ledger.read",
+    "deploy.worker",
+    "worker.status",
+    "cog.execute",
+    "lsp.diagnose",
+  ],
   usd: 5000,
   calls: 500,
+  deploys: 20,
   ttl: 604800,
   consent: 604800,
 };
@@ -19,10 +32,11 @@ export var OAUTH_PROFILES = {
   devdesk: {
     sub: "product:devdesk",
     label: "DevDesk",
-    caps: ["memory.read", "memory.write", "ledger.read", "tenant.read"],
+    caps: ["memory.read", "memory.write", "ledger.read", "tenant.read", "deploy.worker", "worker.status"],
     parts: ["agent:", "product:devdesk"],
     usd: 500,
     calls: 20000,
+    deploys: 20,
     ttl: 86400,
     consent: 31536000,
   },
@@ -126,7 +140,7 @@ export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
       budget: {
         usd_cents: Math.min(a.usd, s.usd_cents),
         calls: Math.min(a.calls, s.calls),
-        deploys: 0,
+        deploys: Math.max(0, Math.min(a.deploys || 0, s.deploys)),
       },
       constraints: {
         allowDelete: !1,
