@@ -25,6 +25,7 @@ try {
 await migrateSchema();
 var signingKeySource = await loadGrantSigningKey();
 if (!(await getSetting("kill_switch"))) await setSetting("kill_switch", "off");
+if (!(await getSetting("operator_lsp_caps"))) await setSetting("operator_lsp_caps", "off");
 console.log(
   `[${SERVICE_NAME} v${VERSION}] policy=${POLICY_VERSION} signingKey=${signingKeySource} armed=${JSON.stringify(armedIntegrations())}`,
 );

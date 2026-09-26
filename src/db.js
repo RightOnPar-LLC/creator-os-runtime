@@ -97,6 +97,9 @@ export async function recordEvent(e, t, a = null, n = null) {
 export async function isKillSwitchOn() {
   return (await getSetting("kill_switch")) === "on";
 }
+export async function isOperatorLspCapsEnabled() {
+  return (await getSetting("operator_lsp_caps")) === "on";
+}
 export async function getTenant(e) {
   return (await sql`SELECT * FROM tenants WHERE id = ${e}`)[0] || null;
 }
