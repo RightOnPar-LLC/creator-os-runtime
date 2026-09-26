@@ -21,7 +21,7 @@ describe("1. /health", () => {
     const h = r.json;
     expect(h.ok).toBe(true);
     expect(h.service).toBe("creator-os-runtime");
-    expect(h.version).toBe("0.3.2");
+    expect(h.version).toBe("0.3.3");
     expect(h.policy).toBe("p1");
     expect(h.db).toBe(true);
     expect(h.killSwitch).toBe(false);
@@ -55,7 +55,7 @@ describe("1. /health", () => {
   });
 
   test("exports", () => {
-    expect(mod.VERSION).toBe("0.3.2");
+    expect(mod.VERSION).toBe("0.3.3");
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
@@ -95,7 +95,7 @@ describe("2. route table", () => {
   test("/.well-known/creator-os.json", async () => {
     const r = await req("GET", "/.well-known/creator-os.json");
     expect(r.status).toBe(200);
-    expect(r.json.version).toBe("0.3.2");
+    expect(r.json.version).toBe("0.3.3");
     expect(r.json.caps).toEqual(mod.CAPS);
     expect(r.json.templates.probe).toEqual({ desc: "Tiny HTTP responder that proves the deploy path", needs: [], estCents: 25 });
   });
@@ -304,7 +304,7 @@ describe("4. MCP", () => {
 
   test("initialize + tools/list + ping + unknown method", async () => {
     const i = await mcp(t.token, "initialize", { protocolVersion: "2025-06-18" });
-    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.2" });
+    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.3" });
     expect(i.json.result.protocolVersion).toBe("2025-06-18");
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
@@ -349,7 +349,7 @@ describe("4. MCP", () => {
 
   test("runtime_health + grant_verify tools", async () => {
     const h = await mcp(t.token, "tools/call", { name: "runtime_health" });
-    expect(h.json.result.structuredContent.version).toBe("0.3.2");
+    expect(h.json.result.structuredContent.version).toBe("0.3.3");
     const v = await mcp(t.token, "tools/call", { name: "grant_verify" });
     expect(v.json.result.structuredContent.sub).toBe("tenant:root");
   });
@@ -701,7 +701,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("status report runs; every outbound call was blocked and is a known probe", async () => {
     const s = await req("GET", "/status.json");
     expect(s.status).toBe(200);
-    expect(s.json.version).toBe("0.3.2");
+    expect(s.json.version).toBe("0.3.3");
     expect(s.json.bodies.map((b) => b.up)).toEqual([false, false, false]);
     const allowed = new Set([
       "https://devdesk.meshtool.ai/health", "https://market.meshtool.ai/api/health",
@@ -1091,5 +1091,168 @@ describe("11. diagnostics gate — refute round", () => {
     const all = (await req("GET", "/api/grants", { token: t.token })).json.grants;
     expect(all.filter((g) => g.status === "active").map((g) => g.sub).sort()).toEqual(["agent:tight", "tenant:root"]);
     expect(all.find((g) => g.parent === tight.json.id).status).toBe("revoked");
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("12. operator exec toggle (0.3.3)", () => {
+  const CB = "https://claude.ai/api/mcp/auth_callback";
+  const BASE_CAPS = ["grant.issue", "grant.read", "cog.plan", "ledger.read"];
+  const EXEC = ["cog.execute", "lsp.diagnose"];
+  const EMPTY = { grants: [], deploys: [] };
+  const META = ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-authorization-server"];
+  let t, clientA, baseToken, baseId, opToken, opId, opRefresh, opClient;
+  const setExec = (on) => admin("POST", "/api/admin/operator-exec", { body: { on } });
+  const toolErr = (r) => (r.json.result?.isError ? JSON.parse(r.json.result.content[0].text) : null);
+  const authorizePage = (cid) =>
+    req("GET", "/oauth/authorize?" + new URLSearchParams({ client_id: cid, redirect_uri: CB, response_type: "code", code_challenge: s256("v"), code_challenge_method: "S256" }));
+  // The claude.ai connector's full flow: register -> admin approve -> code + PKCE -> token.
+  async function connect(tenantId, tag) {
+    const reg = await req("POST", "/oauth/register", { body: { client_name: "claude " + tag, redirect_uris: [CB] } });
+    expect(reg.status).toBe(201);
+    const cid = reg.json.client_id;
+    const verifier = `op-${tag}-` + "z".repeat(40);
+    const ap = await admin("POST", "/oauth/approve", {
+      body: { client_id: cid, redirect_uri: CB, code_challenge: s256(verifier), state: tag, tenant: tenantId },
+    });
+    expect(ap.status).toBe(200);
+    const code = new URL(ap.json.redirect).searchParams.get("code");
+    const tok = await req("POST", "/oauth/token", {
+      body: { grant_type: "authorization_code", code, client_id: cid, redirect_uri: CB, code_verifier: verifier },
+    });
+    expect(tok.status).toBe(200);
+    return { ...tok.json, clientId: cid };
+  }
+
+  test("toggle absent = off: the claude.ai connector gets exactly the 4 base caps; cog_execute is missing_cap", async () => {
+    t = await newTenant("op-exec", "pro");
+    expect((await admin("GET", "/api/admin/operator-exec")).json).toEqual({ on: false, caps: EXEC, activeOperatorGrants: 0 });
+    const tok = await connect(t.id, "a");
+    clientA = tok.clientId;
+    expect(tok.scope).toBe(BASE_CAPS.join(" "));
+    const v = await req("GET", "/api/grants/verify", { token: tok.access_token });
+    expect(v.json.sub).toBe("agent:claude-operator");
+    expect(v.json.caps).toEqual(BASE_CAPS);
+    baseToken = tok.access_token;
+    baseId = v.json.id;
+    const x = await mcp(baseToken, "tools/call", { name: "cog_execute", arguments: { proposal: EMPTY } });
+    expect(toolErr(x)).toEqual({ error: "missing_cap", detail: { need: "cog.execute" } });
+    for (const p of META) expect((await req("GET", p)).json.scopes_supported).toEqual(BASE_CAPS);
+    const page = await authorizePage(clientA);
+    expect(page.status).toBe(200);
+    expect(page.text).not.toContain("admin toggle ON");
+  });
+
+  test("toggle on: a new approval carries cog.execute + lsp.diagnose; metadata advertises them; budget/constraints unchanged", async () => {
+    const on = await setExec(true);
+    expect(on.status).toBe(200);
+    expect(on.json).toEqual({ on: true, caps: EXEC });
+    // the consent page names the extra caps (the root is only known once a tenant is picked)
+    const page = await authorizePage(clientA);
+    expect(page.text).toContain("<code>cog.execute, lsp.diagnose</code> (admin toggle ON; lsp.diagnose needs a root grant minted on 0.3.2+)");
+    const tok = await connect(t.id, "b");
+    expect(tok.scope).toBe([...BASE_CAPS, ...EXEC].join(" "));
+    opToken = tok.access_token;
+    opRefresh = tok.refresh_token;
+    opClient = tok.clientId;
+    const g = (await mcp(opToken, "tools/call", { name: "grant_verify" })).json.result.structuredContent;
+    expect(g.sub).toBe("agent:claude-operator");
+    expect(g.caps).toEqual([...BASE_CAPS, ...EXEC]);
+    opId = g.id;
+    const rest = await req("GET", "/api/grants/verify", { token: opToken });
+    expect(rest.json.budget.deploys).toBe(0);
+    expect(rest.json.constraints).toMatchObject({ allowDelete: false, requireDryRun: true });
+    // cog_execute is reachable now (an empty proposal signs nothing)
+    const x = await mcp(opToken, "tools/call", { name: "cog_execute", arguments: { proposal: EMPTY } });
+    expect(x.json.result.isError).toBeUndefined();
+    expect(x.json.result.structuredContent).toEqual({ grants: {}, deploys: [] });
+    for (const p of META) expect((await req("GET", p)).json.scopes_supported).toEqual([...BASE_CAPS, ...EXEC]);
+    // the base-caps grant approved while off keeps its caps (no silent upgrade)
+    expect((await req("GET", "/api/grants/verify", { token: baseToken })).json.caps).toEqual(BASE_CAPS);
+    expect((await admin("GET", "/api/admin/operator-exec")).json).toEqual({ on: true, caps: EXEC, activeOperatorGrants: 1 });
+  });
+
+  test("toggle off: operator grants carrying exec caps are revoked (listed); refresh refused; re-approval gets base caps", async () => {
+    const off = await setExec(false);
+    expect(off.status).toBe(200);
+    expect(off.json.on).toBe(false);
+    expect(off.json.revoked).toContain(opId);
+    expect(off.json.revoked).not.toContain(baseId);
+    const r = await mcp(opToken, "tools/call", { name: "grant_verify" });
+    expect(r.status).toBe(401);
+    expect(r.json.error).toBe("grant_revoked");
+    expect((await req("GET", "/api/grants/verify", { token: baseToken })).status).toBe(200);
+    const ref = await req("POST", "/oauth/token", { body: { grant_type: "refresh_token", refresh_token: opRefresh, client_id: opClient } });
+    expect(ref.status).toBe(400);
+    expect(ref.json.error).toBe("invalid_grant");
+    const again = await connect(t.id, "c");
+    expect(again.scope).toBe(BASE_CAPS.join(" "));
+    for (const p of META) expect((await req("GET", p)).json.scopes_supported).toEqual(BASE_CAPS);
+    expect((await admin("GET", "/api/admin/operator-exec")).json).toEqual({ on: false, caps: EXEC, activeOperatorGrants: 0 });
+    const types = (await admin("GET", "/api/admin/events")).json.events.map((e) => e.type);
+    expect(types).toContain("operator_exec.on");
+    expect(types).toContain("operator_exec.off");
+  });
+
+  test("defense in depth: an operator-sub grant carrying cog.execute is refused while the toggle is off", async () => {
+    const g = await mcp(t.token, "tools/call", {
+      name: "grant_issue",
+      arguments: { sub: "agent:claude-operator", caps: ["grant.issue", "grant.read", "cog.execute", "lsp.diagnose"], ttlSec: 600, budget: { calls: 50 } },
+    });
+    const { id, token } = g.json.result.structuredContent;
+    const x = await mcp(token, "tools/call", { name: "cog_execute", arguments: { proposal: EMPTY } });
+    expect(toolErr(x)).toEqual({ error: "operator_exec_disabled", detail: null });
+    const rest = await req("POST", "/api/cog/execute", { token, body: { proposal: EMPTY } });
+    expect(rest.status).toBe(403);
+    expect(rest.json).toEqual({ error: "operator_exec_disabled", detail: null });
+    // only the exec caps are gated, and only for the operator sub
+    expect((await mcp(token, "tools/call", { name: "grant_list" })).json.result.isError).toBeUndefined();
+    const other = await mcp(t.token, "tools/call", { name: "grant_issue", arguments: { sub: "agent:someone-else", caps: ["grant.issue", "cog.execute"], ttlSec: 600, budget: { calls: 10 } } });
+    const ox = await mcp(other.json.result.structuredContent.token, "tools/call", { name: "cog_execute", arguments: { proposal: EMPTY } });
+    expect(ox.json.result.isError).toBeUndefined();
+    // the check reads the live toggle; switching off again revokes the grant
+    await setExec(true);
+    expect((await mcp(token, "tools/call", { name: "cog_execute", arguments: { proposal: EMPTY } })).json.result.isError).toBeUndefined();
+    const off = await setExec(false);
+    expect(off.json.revoked).toContain(id);
+  });
+
+  test("the toggle API is admin-only and takes a boolean only; the page is a shell with no secrets", async () => {
+    for (const [m, body] of [["GET"], ["POST", { on: true }]]) {
+      expect((await req(m, "/api/admin/operator-exec", { body })).status).toBe(401);
+      expect((await req(m, "/api/admin/operator-exec", { body, token: ADMIN_KEY + "x" })).status).toBe(401);
+      expect((await req(m, "/api/admin/operator-exec", { body, token: t.token })).status).toBe(401);
+    }
+    for (const body of [{}, { on: "true" }, { on: 1 }, { on: null }, []]) {
+      const r = await admin("POST", "/api/admin/operator-exec", { body });
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("bad_request");
+    }
+    const junk = await admin("POST", "/api/admin/operator-exec", { raw: "on", headers: { "content-type": "application/json" } });
+    expect(junk.status).toBe(400);
+    expect((await admin("GET", "/api/admin/operator-exec")).json.on).toBe(false);
+    const page = await req("GET", "/admin/operator");
+    expect(page.status).toBe(200);
+    expect(page.headers.get("content-type")).toContain("text/html");
+    expect(page.text).toContain("/api/admin/operator-exec");
+    expect(page.text).toContain('sessionStorage.getItem("cos_admin")');
+    expect(page.text).not.toContain(ADMIN_KEY);
+  });
+
+  test("a root minted before 0.3.2 (no lsp.*): toggle on issues cog.execute, drops lsp.diagnose, no failure", async () => {
+    const old = await newTenant("op-old-root", "pro");
+    const caps = (await req("GET", "/api/grants/verify", { token: old.token })).json.caps.filter((c) => !c.startsWith("lsp.") && c !== "code.write");
+    const upd = await dbQuery("UPDATE grants SET caps = $1::jsonb WHERE id = $2", [JSON.stringify(caps), old.grantId]);
+    expect(upd.affectedRows).toBe(1);
+    expect((await setExec(true)).status).toBe(200);
+    try {
+      const tok = await connect(old.id, "f");
+      expect(tok.scope).toBe([...BASE_CAPS, "cog.execute"].join(" "));
+      expect((await req("GET", "/api/grants/verify", { token: tok.access_token })).json.caps).toEqual([...BASE_CAPS, "cog.execute"]);
+      const ev = (await admin("GET", "/api/admin/events")).json.events.find((e) => e.type === "operator_exec.caps_dropped" && e.tenant === old.id);
+      expect(typeof ev.data === "string" ? JSON.parse(ev.data) : ev.data).toEqual({ root: old.grantId, dropped: ["lsp.diagnose"] });
+    } finally {
+      expect((await setExec(false)).json.on).toBe(false);
+    }
   });
 });
