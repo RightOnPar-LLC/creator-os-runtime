@@ -1,5 +1,5 @@
 {
-  "count": 128,
+  "count": 133,
   "appRoutes": [
     "GET /health",
     "GET /api/admin/fingerprints",
@@ -128,7 +128,12 @@
     "PUT /api/admin/docs/:name",
     "PUT /api/admin/docs/:name",
     "GET /routes",
-    "GET /selftest"
+    "GET /selftest",
+    "GET /api/admin/connector-exec",
+    "GET /api/admin/connector-exec",
+    "POST /api/admin/connector-exec",
+    "POST /api/admin/connector-exec",
+    "GET /admin/connector"
   ],
   "inventory": [
     "GET /health :: public",
@@ -206,6 +211,9 @@
     "GET /docs/:name :: public",
     "PUT /api/admin/docs/:name :: admin",
     "GET /routes :: public",
-    "GET /selftest :: public"
+    "GET /selftest :: public",
+    "GET /api/admin/connector-exec :: admin",
+    "POST /api/admin/connector-exec :: admin",
+    "GET /admin/connector :: public"
   ]
 }

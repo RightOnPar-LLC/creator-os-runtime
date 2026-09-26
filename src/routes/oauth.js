@@ -12,6 +12,7 @@ import {
   mintRefreshToken,
   oauthError,
   OPERATOR_PROFILE,
+  profileCaps,
   profileForGrant,
   profileForRedirect,
   protectedResourceMetadata,
@@ -74,6 +75,9 @@ app.get("/oauth/authorize", async (e) => {
   let t = e.req.query(),
     a = await validateAuthorizeRequest(t),
     n = profileForRedirect(t.redirect_uri),
+    // 0.3.3: show the caps the grant will actually carry (the operator's move with
+    // the connector exec switch), so the approval screen never under-states them.
+    caps = await profileCaps(n),
     r = JSON.stringify({
       client_id: t.client_id,
       redirect_uri: t.redirect_uri,
@@ -84,7 +88,7 @@ app.get("/oauth/authorize", async (e) => {
     renderPage(
       "Approve connector",
       `<h1>Approve connector</h1><div class="card"><p><b>${escapeHtml(a.name)}</b> wants to act on this runtime as <code>${n.sub}</code>.</p>
-<p>It gets a <b>grant</b> (never the admin key): <code>${n.caps.join(", ")}</code>${n.parts ? `<br>Memory only in <code>${n.parts.join(", ")}</code>` : ""}<br>Budget up to \xA2${n.usd} \xB7 ${n.calls} calls \xB7 0 deploys \xB7 no delete<br>${n === OPERATOR_PROFILE ? "Lifetime \u2264 7 days (capped by tier), then you approve again." : "Stays connected (auto-renews) until you revoke it."} Revoke anytime in Grants.</p>
+<p>It gets a <b>grant</b> (never the admin key): <code>${caps.join(", ")}</code>${n.parts ? `<br>Memory only in <code>${n.parts.join(", ")}</code>` : ""}<br>Budget up to \xA2${n.usd} \xB7 ${n.calls} calls \xB7 0 deploys \xB7 no delete<br>${n === OPERATOR_PROFILE ? "Lifetime ≤ 7 days (capped by tier), then you approve again." : "Stays connected (auto-renews) until you revoke it."} Revoke anytime in Grants.</p>
 <p>Redirects to <code>${escapeHtml(new URL(t.redirect_uri).host)}</code></p></div>
 <div class="card" id="unlock" hidden><p>Unlock with the admin key (stays in this tab).</p><input id="k" type="password" style="width:100%"><button id="u">Unlock</button></div>
 <div class="card" id="go" hidden><label>Tenant <select id="t"></select></label><p><button id="ok">Approve</button> <button id="no">Deny</button></p><p id="msg"></p></div>
