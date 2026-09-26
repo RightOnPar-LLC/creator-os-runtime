@@ -86,6 +86,18 @@ export var remainingBudget = (e) =>
     normalizeUsage(parseJson(e.settled)),
   );
 export var memoryPartitions = (e) => e.memory?.partitions ?? [""];
+// A scope prefix covers a partition only at a real boundary: exact match, the
+// empty prefix (root wildcard), a prefix that already ends in a separator, or
+// a candidate whose next character after the prefix IS a separator. A bare
+// `.startsWith()` let a grant scoped to "worker:a" reach "worker:ab" (and a
+// profile scoped to "product:devdesk" reach "product:devdesktop") — a
+// different tenant/worker/product with no separator between them (2026-09-25 fix).
+export function partitionCovers(prefix, candidate) {
+  if (prefix === "" || candidate === prefix) return !0;
+  if (!candidate.startsWith(prefix)) return !1;
+  if (/[:/-]$/.test(prefix)) return !0;
+  return /^[:/-]/.test(candidate.slice(prefix.length));
+}
 var numberOr = (e, t) => (e === void 0 || e === null || e === "" || Number.isNaN(+e) ? t : +e);
 export var clampConstraints = (e, t) => ({
   maxWorkers: Math.min(t.maxWorkers, Math.max(0, Math.floor(numberOr(e?.maxWorkers, t.maxWorkers)))),
@@ -114,7 +126,7 @@ export function attenuationViolations(e, t, a) {
       n.push("scope_environments_widened");
     let l = i.workers?.namePrefix || "";
     if (!(t.scope.workers?.namePrefix || "").startsWith(l)) n.push("scope_prefix_widened");
-    if (!memoryPartitions(t.scope).every((c) => memoryPartitions(i).some((E) => c.startsWith(E))))
+    if (!memoryPartitions(t.scope).every((c) => memoryPartitions(i).some((E) => partitionCovers(E, c))))
       n.push("scope_memory_widened");
     if (!usageWithin(t.budget, remainingBudget(e))) n.push("budget_exceeds_parent_remaining");
     if (t.constraints.maxWorkers > o.maxWorkers) n.push("maxWorkers_widened");

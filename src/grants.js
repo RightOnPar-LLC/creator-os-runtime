@@ -234,21 +234,19 @@ export async function settleGrantUsage(e, t, a, n) {
       VALUES (${s.tenant}, ${e}, ${s.parent}, 'settle', ${t.usd_cents}, ${t.calls}, ${t.deploys}, ${a}, ${n})`);
   });
 }
-var rateLimitBuckets = new Map();
-function checkRateLimit(e) {
-  let t = Date.now(),
-    a = rateLimitBuckets.get(e);
-  if (!a || t - a.t > 60000)
-    return (
-      rateLimitBuckets.set(e, {
-        n: 1,
-        t,
-      }),
-      !0
-    );
-  return (a.n++, a.n <= RATE_LIMIT_MAX_PER_MIN);
+// Postgres-backed (fixed 60s window keyed by grant id), not a process-local
+// Map: the runtime scales to multiple replicas and a replica-local bucket let
+// each replica give the same grant its own fresh budget (2026-09-25 fix).
+async function checkRateLimit(e) {
+  let t = Math.floor(Date.now() / 60000) * 60000,
+    a = (
+      await sql`INSERT INTO rate_limits (grant_id, window_start, count) VALUES (${e}, ${t}, 1)
+      ON CONFLICT (grant_id, window_start) DO UPDATE SET count = rate_limits.count + 1 RETURNING count`
+    )[0];
+  if (Math.random() < 0.01) await sql`DELETE FROM rate_limits WHERE window_start < ${t - 300000}`;
+  return a.count <= RATE_LIMIT_MAX_PER_MIN;
 }
-export async function verifyGrant(e, t, a) {
+export async function verifyGrant(e, t, a, countRate = !0) {
   try {
     if (!e) throw new HttpError(401, "missing_grant");
     let n = parseGrantToken(e);
@@ -284,7 +282,7 @@ export async function verifyGrant(e, t, a) {
           workerName: a.workerName,
         });
     }
-    if (!checkRateLimit(s.id)) throw new HttpError(429, "rate_limited");
+    if (countRate && !(await checkRateLimit(s.id))) throw new HttpError(429, "rate_limited");
     return {
       row: s,
       tenant: i,

@@ -243,7 +243,16 @@ describe("3. OAuth 2.1 + PKCE client flow", () => {
     expect(v.json.sub).toBe("product:devdesk");
     const again = await req("POST", "/oauth/token", { body: { grant_type: "refresh_token", refresh_token: refresh } });
     expect(again.status).toBe(400);
-    expect(again.json.error_description).toBe("refresh token invalid");
+    // 2026-09-25: a SECOND presentation of an already-rotated refresh token is
+    // reuse (theft), not just "unknown" — and it revokes the grant that
+    // refresh chain was issued for, locking out the rotated (v.access_token)
+    // token too so neither the thief nor the legitimate holder stays trusted.
+    expect(again.json.error_description).toBe("refresh token reused; grant revoked");
+    const revoked = await req("GET", "/api/grants/verify", { token: r.json.access_token });
+    expect(revoked.status).toBe(401);
+    expect(revoked.json.error).toBe("grant_revoked");
+    const events = (await admin("GET", "/api/admin/events")).json.events.filter((e) => e.type === "oauth.refresh_reuse_detected");
+    expect(events.length).toBe(1);
   });
 
   // 2026-09-25: refresh used the client's FIRST registered redirect to pick the
@@ -355,8 +364,12 @@ describe("5. admin fail-closed + kill switch", () => {
       const wrong = await req(m, p, { token: "not-the-key" });
       expect(wrong.status).toBe(401);
     }
-    // the admin key is also accepted via the x-grant header (bearerToken falls back to it)
-    expect((await req("GET", "/api/admin/overview", { headers: { "x-grant": ADMIN_KEY } })).status).toBe(200);
+    // 2026-09-25: admin auth reads ONLY the Authorization header now. x-grant is
+    // the low-trust fallback channel for grant tokens; the admin key must not
+    // also work there (one less place the master key could leak into).
+    const viaXGrant = await req("GET", "/api/admin/overview", { headers: { "x-grant": ADMIN_KEY } });
+    expect(viaXGrant.status).toBe(401);
+    expect(viaXGrant.json.error).toBe("admin_required");
   });
 
   test("with RUNTIME_ADMIN_KEY unset, admin routes 503 unarmed", async () => {
@@ -463,13 +476,54 @@ describe("6. webhooks", () => {
     expect(mo.json.minted).toBe(false);
 
     const rw = { type: "DEPLOY", timestamp: "2026-01-01", resource: { service: { id: "svc-none" } } };
-    expect((await req("POST", "/webhooks/railway?token=wrong", { body: rw })).status).toBe(401);
-    const ro = await req("POST", "/webhooks/railway?token=" + RAILWAY_TOKEN, { body: rw });
+    expect((await req("POST", "/webhooks/railway", { body: rw, headers: { "x-runtime-token": "wrong" } })).status).toBe(401);
+    // 2026-09-25: Railway project webhooks send no custom headers and are not
+    // cryptographically signed -- Railway's own docs say to put the secret in
+    // the URL (docs.railway.com/observability/webhooks#verifying-the-sender).
+    // Header-only auth (the earlier same-day change this reverts, for this
+    // route alone) would make every Railway project webhook unauthenticatable,
+    // so the query fallback is back. A different payload than `rw`, or this
+    // would collide with `ro` below on the idempotency key and come back a
+    // replay instead of a fresh result.
+    const rwQuery = { type: "DEPLOY", timestamp: "2026-01-02", resource: { service: { id: "svc-query" } } };
+    const queryOnly = await req("POST", "/webhooks/railway?token=" + RAILWAY_TOKEN, { body: rwQuery });
+    expect(queryOnly.json).toEqual({ received: true, result: { matched: 0, status: "deploy" } });
+    const wrongQuery = await req("POST", "/webhooks/railway?token=nope", { body: rw });
+    expect(wrongQuery.status).toBe(401);
+    expect(wrongQuery.json.error).toBe("bad_token");
+    const ro = await req("POST", "/webhooks/railway", { body: rw, headers: { "x-runtime-token": RAILWAY_TOKEN } });
     expect(ro.json).toEqual({ received: true, result: { matched: 0, status: "deploy" } });
 
     const s = await req("POST", "/webhooks/stripe", { raw: "{}" });
     expect(s.status).toBe(503);
     expect(s.json.detail).toEqual({ needs: "STRIPE_WEBHOOK_SECRET" });
+  });
+
+  // 2026-09-25: the query token exists ONLY because Railway can't carry a
+  // header. It must never end up somewhere it could leak the same way a URL
+  // fallback already does (access/proxy/Railway request logs) -- this app's
+  // OWN logs, on a request that errors, must not carry it either.
+  test("the railway webhook token in ?token= never reaches a log line, even when the request errors", async () => {
+    const logged = [];
+    const originalError = console.error;
+    console.error = (...a) => logged.push(a.map(String).join(" "));
+    let r;
+    try {
+      // A non-string service id: handleRailwayEvent binds it straight into
+      // `WHERE railway_service_id = $1` against a TEXT column with no
+      // String(...) in between -- a genuine 500 from the database, not a
+      // crafted one, so the error handler's log line is the real path.
+      const bad = { type: "DEPLOY", timestamp: "2026-09-25T00:00:00Z", resource: { service: { id: 424242 } } };
+      r = await req("POST", "/webhooks/railway?token=" + RAILWAY_TOKEN, { body: bad });
+    } finally {
+      console.error = originalError;
+    }
+    expect(r.status).toBe(500);
+    expect(logged.length).toBeGreaterThan(0);
+    for (const line of logged) {
+      expect(line).not.toContain(RAILWAY_TOKEN);
+      expect(line.toLowerCase()).not.toContain("token=");
+    }
   });
 });
 
@@ -490,6 +544,70 @@ describe("7. rate limit", () => {
     expect((await req("GET", "/api/grants/verify", { token: other.token })).status).toBe(200);
     // admin is not grant-rate-limited
     expect((await admin("GET", "/api/admin/policy")).json.rateLimitPerMin).toBe(RATE_LIMIT);
+  });
+
+  // 2026-09-25: /mcp verifies the grant TWICE per call (a pre-check before the
+  // JSON-RPC method is known, then again for the tool's specific capability).
+  // Both calls used to count against the budget, so one MCP tool call cost
+  // TWICE what the same action costs over REST.
+  //
+  // "runtime_health" does NOT exercise this: src/routes/mcp.js answers it at
+  // line ~101, before the "unknown_tool" capability map (line ~115) and the
+  // second verifyGrant call (line ~140) are ever reached -- so a test that
+  // calls it only ever exercises the first, pre-check verifyGrant, pass or
+  // fail, on both the buggy and the fixed line. "grant_verify" routes through
+  // both calls, so it actually proves the fix.
+  test(`a single MCP tools/call spends exactly one rate-limit unit, matching REST`, async () => {
+    const t = await newTenant("mcp-rate-tenant");
+    let last;
+    for (let i = 0; i < RATE_LIMIT; i++) {
+      last = await mcp(t.token, "tools/call", { name: "grant_verify" }, i);
+      expect(last.status).toBe(200);
+      expect(last.json.result.isError).toBeUndefined();
+    }
+    last = await mcp(t.token, "tools/call", { name: "grant_verify" }, RATE_LIMIT);
+    expect(last.status).toBe(429);
+    expect(last.json.error).toBe("rate_limited");
+  });
+
+  // 2026-09-25: the bucket used to be a process-local Map — invisible to, and
+  // reset independently by, every other replica. It now lives in Postgres.
+  test("rate-limit counters are Postgres-backed, not process-local state", async () => {
+    const t = await newTenant("db-rate-tenant");
+    await req("GET", "/api/grants/verify", { token: t.token });
+    await req("GET", "/api/grants/verify", { token: t.token });
+    await req("GET", "/api/grants/verify", { token: t.token });
+    const rows = await dbQuery("SELECT count FROM rate_limits WHERE grant_id = $1", [t.grantId]);
+    expect(rows.rows.length).toBe(1);
+    expect(Number(rows.rows[0].count)).toBe(3);
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("7b. memory partition scope is a real prefix, not a bare string match", () => {
+  // 2026-09-25: `t.startsWith(a)` let a grant scoped to partition "worker:a"
+  // (or an OAuth profile scoped to "product:devdesk") also reach "worker:ab"
+  // / "product:devdesktop" — a different worker/product with no separator
+  // between them. Fixed via policy.js `partitionCovers`.
+  test("a scope prefix does not reach a same-prefixed but different partition", async () => {
+    const t = await newTenant("prefix-tenant");
+    const child = await req("POST", "/api/grants", {
+      token: t.token,
+      body: {
+        sub: "agent:scoped", caps: ["memory.read", "memory.write"], ttlSec: 600,
+        scope: { memory: { partitions: ["worker:a"] } },
+      },
+    });
+    expect(child.status).toBe(201);
+    const inScope = await req("POST", "/api/memory", { token: child.json.token, body: { partition: "worker:a", content: "ok" } });
+    expect(inScope.status).toBe(201);
+    // "worker:ab" starts with "worker:a" but is a DIFFERENT worker's partition.
+    const collide = await req("POST", "/api/memory", { token: child.json.token, body: { partition: "worker:ab", content: "should not be reachable" } });
+    expect(collide.status).toBe(403);
+    expect(collide.json.error).toBe("out_of_scope");
+    // A real sub-partition (separator right after the prefix) still works.
+    const nested = await req("POST", "/api/memory", { token: child.json.token, body: { partition: "worker:a-shard1", content: "nested ok" } });
+    expect(nested.status).toBe(201);
   });
 });
 
@@ -546,6 +664,37 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
     await admin("PUT", "/api/admin/docs/_cockpit", { raw: "<p>cockpit</p>" });
     expect((await req("GET", "/")).text).toBe("<p>cockpit</p>");
     expect((await req("GET", "/docs/_cockpit")).status).toBe(404);
+  });
+
+  // 2026-09-25: markdownToHtml only escaped fenced/inline code content. A
+  // heading, paragraph, list item or table cell carrying raw "<...>" rendered
+  // as a live tag to every unauthenticated viewer of /docs/:name — stored XSS
+  // from an admin-written (or admin-ingested) doc.
+  test("docs: heading/paragraph/list/table text is HTML-escaped, not just code spans", async () => {
+    const src = [
+      "# <script>alert(1)</script>",
+      "",
+      "Hi <img src=x onerror=alert(2)> there **<b>bold</b>** and `<i>code</i>`",
+      "",
+      "- <u>item</u>",
+      "",
+      "| <em>a</em> | b |",
+      "|---|---|",
+      "| 1 | 2 |",
+    ].join("\n");
+    await admin("PUT", "/api/admin/docs/xss", { raw: src });
+    const html = (await req("GET", "/docs/xss")).text;
+    expect(html).not.toContain("<script>");
+    expect(html).not.toContain("<img src=x onerror=alert(2)>");
+    expect(html).not.toContain("<u>item</u>");
+    expect(html).not.toContain("<em>a</em>");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).toContain("&lt;img src=x onerror=alert(2)&gt;");
+    // the two intentional transforms (code spans, **bold**) still work
+    expect(html).toContain("<code>&lt;i&gt;code&lt;/i&gt;</code>");
+    expect(html).toContain("<b>&lt;b&gt;bold&lt;/b&gt;</b>");
+    // raw markdown source (?raw) is untouched either way
+    expect((await req("GET", "/docs/xss?raw")).text).toBe(src);
   });
 
   test("status report runs; every outbound call was blocked and is a known probe", async () => {

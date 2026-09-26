@@ -15,27 +15,27 @@ file → these modules, byte for byte.
 | `index.js` | 45 | Entry point. Imports everything, imports the route modules in order, then boots: source hash, schema migration, signing key, kill-switch default, banner. Holds the exports. |
 | `config.js` | 57 | Service name/version/policy, `env` (secret values trimmed at load), armed-integration flags, secret fingerprints. |
 | `util.js` | 25 | Pure helpers: JSON, time, ids, sha256, HMAC, constant-time compare, HTML escape, `HttpError`. |
-| `db.js` | 102 | Postgres via `Bun.SQL`, schema + migration, settings, events, tenant/grant lookups, kill-switch read. |
+| `db.js` | 105 | Postgres via `Bun.SQL`, schema + migration, settings, events, tenant/grant lookups, kill-switch read. |
 | `outbox.js` | 72 | Durable outbox to the Brain and the cognitive bridge, retry with backoff. |
 | `tokens.js` | 58 | Grant tokens (`cog1.<payload>.<hmac>`) and the AES-256-GCM vault. |
-| `policy.js` | 171 | Caps, tiers, usage arithmetic, attenuation rules, the gatehouse. |
-| `grants.js` | 297 | Mint root, issue child, revoke tree, settle usage, rate limit, `verifyGrant`. |
+| `policy.js` | 183 | Caps, tiers, usage arithmetic, attenuation rules, the gatehouse, memory-partition boundary check. |
+| `grants.js` | 295 | Mint root, issue child, revoke tree, settle usage, Postgres-backed rate limit, `verifyGrant`. |
 | `memory.js` | 110 | Memory write/search/forget, sync records, bridge pull, partition scope check. |
 | `railway.js` | 350 | Worker templates; Railway deploy, status, restart, delete (GraphQL). |
 | `cog.js` | 275 | COG planner (deterministic, optionally LLM-assisted) and executor. |
 | `webhooks.js` | 177 | Signature checks, idempotency records, Stripe and Railway event handlers. |
-| `http.js` | 91 | The Hono `app`, auth middleware (admin / grant / sync token), route inventory, source-hash state. |
+| `http.js` | 100 | The Hono `app`, auth middleware (admin / grant / sync token — admin reads only Authorization, never x-grant), route inventory, source-hash state. |
 | `mcp.js` | 222 | MCP tool catalogue and JSON-RPC response helper. |
 | `oauth.js` | 157 | OAuth client profiles, redirect allow-list, grant issuance for OAuth clients. |
-| `cockpit.js` | 191 | Page shell, status report (product probes), docs store, markdown renderer. |
+| `cockpit.js` | 212 | Page shell, status report (product probes), docs store, markdown renderer (escapes doc text before the code/bold transforms). |
 | `routes/core.js` | 103 | Error handler, 404, `/health`, `/.well-known/creator-os.json`. |
 | `routes/admin.js` | 240 | Tenants, kill/resume, policy, breakglass, admin grant ops, read-only admin tables. |
 | `routes/grants.js` | 173 | Grant-holder API: grants, cog, deploys, ledger, events, tenant. |
 | `routes/memory.js` | 93 | Memory API, `/sync/*`, admin outbox + memory. |
 | `routes/railway-auth.js` | 92 | Railway OAuth connect (stores the token in the vault). |
-| `routes/webhooks.js` | 177 | `/webhooks/{stripe,railway,github,brain,mesh}`. |
-| `routes/mcp.js` | 267 | `/mcp` (GET describe, POST JSON-RPC). |
-| `routes/oauth.js` | 168 | `/.well-known/oauth-*`, `/oauth/{register,authorize,approve,token}`. |
+| `routes/webhooks.js` | 198 | `/webhooks/{stripe,railway,github,brain,mesh}` (Railway checks `x-runtime-token`; no `?token=` query fallback). |
+| `routes/mcp.js` | 289 | `/mcp` (GET describe, POST JSON-RPC; the per-tool grant check doesn't double-count the rate limit). |
+| `routes/oauth.js` | 199 | `/.well-known/oauth-*`, `/oauth/{register,authorize,approve,token}` (refresh-token reuse revokes the grant). |
 | `routes/cockpit.js` | 77 | `/`, `/cockpit/:page`, `/status(.json)`, `/docs`, doc upload. |
 | `routes/meta.js` | 291 | `/routes` inventory and `/selftest`. |
 
