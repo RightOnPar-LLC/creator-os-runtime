@@ -122,3 +122,28 @@ Caps are snapshotted into a grant row at mint time, so **root grants minted befo
 Config: `LSP_MCP_URL` (no secret; lsp-mcp holds none either), `LSP_MCP_TIMEOUT_MS`
 (default 120000, max 240000 — a Rust `cargo check` can take a while; the server's
 `idleTimeout` is 255 s so the socket outlives the wait).
+
+## 0.3.3 — operator exec toggle
+
+An admin on/off switch that lets the claude.ai connector's **operator** OAuth profile
+(`agent:claude-operator`) also carry `cog.execute` and `lsp.diagnose`. **Default off**
+(the `operator_exec` setting absent = off). Nothing else about the profile changes:
+0 deploys, `requireDryRun`, no delete, same budget and lifetime.
+
+- **Flip it:** `/admin/operator` (unlock with the admin key, kept in that tab only), or
+  `POST /api/admin/operator-exec {"on": true|false}` (admin key; anything but a boolean
+  is `400 bad_request`). `GET /api/admin/operator-exec` reports `on`, the caps, and how
+  many active operator grants carry them.
+- **On:** the next approval (or refresh re-issue) of the connector gets base caps plus
+  whichever of the two its tenant's root grant carries. Roots minted before 0.3.2 lack
+  `lsp.*`, so `lsp.diagnose` is dropped there (event `operator_exec.caps_dropped`), never
+  an error. The token response `scope` and the OAuth metadata `scopes_supported` report
+  what is actually issued / on offer; the consent page names the extra caps.
+- **Off:** every active operator grant carrying either cap is revoked (whole subtree,
+  reason `operator_exec_off`; the response lists the ids). Its refresh token then fails,
+  so the connector must re-approve and gets the base caps. As a backstop, `verifyGrant`
+  refuses those two caps to an `agent:claude-operator` grant while the toggle is off
+  (`403 operator_exec_disabled`).
+
+The constants and `isOperatorExecOn()` live in `operator.js` (imports only `db.js`, so
+`grants.js` and `oauth.js` both use it without a cycle).

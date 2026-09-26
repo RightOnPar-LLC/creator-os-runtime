@@ -4,6 +4,7 @@ import { POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN, SERVICE_NAME } from "./config.j
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "./db.js";
 import { parseGrantToken, signGrantToken } from "./tokens.js";
+import { isOperatorExecOn, OPERATOR_EXEC_CAPS, OPERATOR_SUB } from "./operator.js";
 import {
   addUsage,
   attenuationViolations,
@@ -275,6 +276,11 @@ export async function verifyGrant(e, t, a, countRate = !0) {
       throw new HttpError(403, "missing_cap", {
         need: t,
       });
+    // 0.3.3 defense in depth: the operator connector's exec caps only work while the
+    // admin toggle is on. Switching it off also revokes such grants; this catches any
+    // that slipped through (or were minted under that sub some other way).
+    if (t && OPERATOR_EXEC_CAPS.includes(t) && s.sub === OPERATOR_SUB && !(await isOperatorExecOn()))
+      throw new HttpError(403, "operator_exec_disabled");
     if (a) {
       let l = parseJson(s.scope);
       if (a.project && !(l.railway?.projects || []).includes(a.project))

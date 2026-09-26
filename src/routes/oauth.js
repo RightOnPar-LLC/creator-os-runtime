@@ -8,10 +8,13 @@ import { app, readJsonBody, requireAdmin } from "../http.js";
 import {
   ensureRootGrant,
   isAllowedRedirectUri,
+  isOperatorExecOn,
   issueOAuthGrant,
   mintRefreshToken,
   oauthError,
+  OPERATOR_EXEC_CAPS,
   OPERATOR_PROFILE,
+  operatorScopes,
   profileForGrant,
   profileForRedirect,
   protectedResourceMetadata,
@@ -23,7 +26,7 @@ import { renderPage } from "../cockpit.js";
 
 app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
 app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
-app.get("/.well-known/oauth-authorization-server", (e) => {
+app.get("/.well-known/oauth-authorization-server", async (e) => {
   let t = publicBaseUrl(e);
   return e.json({
     issuer: t,
@@ -34,7 +37,7 @@ app.get("/.well-known/oauth-authorization-server", (e) => {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: OPERATOR_PROFILE.caps,
+    scopes_supported: await operatorScopes(),
   });
 });
 app.post("/oauth/register", async (e) => {
@@ -74,6 +77,9 @@ app.get("/oauth/authorize", async (e) => {
   let t = e.req.query(),
     a = await validateAuthorizeRequest(t),
     n = profileForRedirect(t.redirect_uri),
+    // 0.3.3: with the operator exec toggle on, the operator also gets these (the
+    // tenant, and so the root grant, is only picked below, hence the note).
+    x = n === OPERATOR_PROFILE && (await isOperatorExecOn()),
     r = JSON.stringify({
       client_id: t.client_id,
       redirect_uri: t.redirect_uri,
@@ -84,7 +90,7 @@ app.get("/oauth/authorize", async (e) => {
     renderPage(
       "Approve connector",
       `<h1>Approve connector</h1><div class="card"><p><b>${escapeHtml(a.name)}</b> wants to act on this runtime as <code>${n.sub}</code>.</p>
-<p>It gets a <b>grant</b> (never the admin key): <code>${n.caps.join(", ")}</code>${n.parts ? `<br>Memory only in <code>${n.parts.join(", ")}</code>` : ""}<br>Budget up to \xA2${n.usd} \xB7 ${n.calls} calls \xB7 0 deploys \xB7 no delete<br>${n === OPERATOR_PROFILE ? "Lifetime \u2264 7 days (capped by tier), then you approve again." : "Stays connected (auto-renews) until you revoke it."} Revoke anytime in Grants.</p>
+<p>It gets a <b>grant</b> (never the admin key): <code>${n.caps.join(", ")}</code>${x ? `<br>Plus <code>${OPERATOR_EXEC_CAPS.join(", ")}</code> (admin toggle ON; lsp.diagnose needs a root grant minted on 0.3.2+)` : ""}${n.parts ? `<br>Memory only in <code>${n.parts.join(", ")}</code>` : ""}<br>Budget up to \xA2${n.usd} \xB7 ${n.calls} calls \xB7 0 deploys \xB7 no delete<br>${n === OPERATOR_PROFILE ? "Lifetime ≤ 7 days (capped by tier), then you approve again." : "Stays connected (auto-renews) until you revoke it."} Revoke anytime in Grants.</p>
 <p>Redirects to <code>${escapeHtml(new URL(t.redirect_uri).host)}</code></p></div>
 <div class="card" id="unlock" hidden><p>Unlock with the admin key (stays in this tab).</p><input id="k" type="password" style="width:100%"><button id="u">Unlock</button></div>
 <div class="card" id="go" hidden><label>Tenant <select id="t"></select></label><p><button id="ok">Approve</button> <button id="no">Deny</button></p><p id="msg"></p></div>
@@ -136,7 +142,7 @@ app.post("/oauth/token", async (e) => {
     let n = profileForRedirect(a.redirect_uri),
       r = nowSec() + n.consent,
       s = await issueOAuthGrant(a.root_id, r, n);
-    return e.json(tokenResponse(s, await mintRefreshToken(a.client_id, a.tenant, a.root_id, s.row.id, r), n));
+    return e.json(tokenResponse(s, await mintRefreshToken(a.client_id, a.tenant, a.root_id, s.row.id, r)));
   }
   if (t.grant_type === "refresh_token") {
     let h = sha256Hex(String(t.refresh_token || "")),
@@ -191,7 +197,6 @@ app.post("/oauth/token", async (e) => {
       tokenResponse(
         s,
         await mintRefreshToken(a.client_id, a.tenant, a.root_id, s.row.id, Number(a.consent_until)),
-        r,
       ),
     );
   }

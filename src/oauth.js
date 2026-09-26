@@ -2,12 +2,15 @@
 import { randomBytes } from "crypto";
 import { env } from "./config.js";
 import { HttpError, nowSec, parseJson, sha256Hex } from "./util.js";
-import { getGrant, getTenant, sql } from "./db.js";
+import { getGrant, getTenant, recordEvent, sql } from "./db.js";
 import { remainingBudget, TIERS } from "./policy.js";
 import { issueChildGrant, mintRootGrant } from "./grants.js";
+import { isOperatorExecOn, OPERATOR_EXEC_CAPS, OPERATOR_EXEC_SETTING, OPERATOR_SUB } from "./operator.js";
+
+export { isOperatorExecOn, OPERATOR_EXEC_CAPS, OPERATOR_EXEC_SETTING };
 
 export var OPERATOR_PROFILE = {
-  sub: "agent:claude-operator",
+  sub: OPERATOR_SUB,
   caps: ["grant.issue", "grant.read", "cog.plan", "ledger.read"],
   usd: 5000,
   calls: 500,
@@ -91,18 +94,50 @@ export async function ensureRootGrant(e) {
     )[0] || (await mintRootGrant(e)).row
   );
 }
+// 0.3.3: the caps a profile is issued with right now. Only the operator profile
+// varies: with the admin toggle on it also gets OPERATOR_EXEC_CAPS, but only those
+// the root grant it is minted under actually carries (roots minted before 0.3.2 lack
+// lsp.*); the rest are dropped, never an attenuation failure.
+export async function resolveProfileCaps(e, t) {
+  if (e !== OPERATOR_PROFILE || !(await isOperatorExecOn()))
+    return {
+      caps: [...e.caps],
+      dropped: [],
+    };
+  let a = parseJson(t?.caps || []),
+    n = OPERATOR_EXEC_CAPS.filter((r) => !e.caps.includes(r));
+  return {
+    caps: [...e.caps, ...n.filter((r) => a.includes(r))],
+    dropped: n.filter((r) => !a.includes(r)),
+  };
+}
+// The operator caps advertised in OAuth metadata (scopes_supported).
+export async function operatorScopes() {
+  return (await isOperatorExecOn()) ? [...OPERATOR_PROFILE.caps, ...OPERATOR_EXEC_CAPS] : OPERATOR_PROFILE.caps;
+}
 export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
   let n = await getGrant(e),
     r = n && (await getTenant(n.tenant));
   if (!n || n.status !== "active" || Number(n.exp) <= nowSec() || !r)
     throw new HttpError(400, "root_inactive");
   let s = remainingBudget(n),
-    i = Math.min(a.ttl, TIERS[r.tier].maxTtlSec, Number(n.exp) - nowSec(), t - nowSec());
+    i = Math.min(a.ttl, TIERS[r.tier].maxTtlSec, Number(n.exp) - nowSec(), t - nowSec()),
+    o = await resolveProfileCaps(a, n);
+  if (o.dropped.length)
+    await recordEvent(
+      "operator_exec.caps_dropped",
+      {
+        root: n.id,
+        dropped: o.dropped,
+      },
+      r.id,
+      "oauth",
+    );
   return issueChildGrant(
     n,
     {
       sub: a.sub,
-      caps: a.caps,
+      caps: o.caps,
       ...(a.parts
         ? {
             scope: {
@@ -126,12 +161,14 @@ export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
     "oauth",
   );
 }
-export var tokenResponse = (e, t, a = OPERATOR_PROFILE) => ({
+// scope = the caps the issued grant actually carries (0.3.3: may differ from the
+// profile's base caps while the operator exec toggle is on).
+export var tokenResponse = (e, t) => ({
   access_token: e.token,
   token_type: "Bearer",
   expires_in: Math.max(0, Number(e.row.exp) - nowSec()),
   refresh_token: t,
-  scope: a.caps.join(" "),
+  scope: parseJson(e.row.caps).join(" "),
 });
 export async function mintRefreshToken(e, t, a, n, r) {
   let s = randomBytes(32).toString("base64url");
@@ -140,11 +177,11 @@ export async function mintRefreshToken(e, t, a, n, r) {
     s
   );
 }
-export var protectedResourceMetadata = (e) =>
+export var protectedResourceMetadata = async (e) =>
   e.json({
     resource: publicBaseUrl(e) + "/mcp",
     authorization_servers: [publicBaseUrl(e)],
-    scopes_supported: OPERATOR_PROFILE.caps,
+    scopes_supported: await operatorScopes(),
     bearer_methods_supported: ["header"],
   });
 export async function validateAuthorizeRequest(e) {

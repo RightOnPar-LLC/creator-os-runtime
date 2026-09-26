@@ -1,12 +1,14 @@
 // Routes: admin: tenants, kill switch, policy, breakglass, grants, read-only tables. Registration order is significant.
 import { armedIntegrations, POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN } from "../config.js";
-import { HttpError, newId } from "../util.js";
+import { escapeHtml, HttpError, newId, parseJson } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, setSetting, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
 import { mintRootGrant, revokeGrantTree } from "../grants.js";
 import { TEMPLATES } from "../railway.js";
 import { app, readJsonBody, requireAdmin } from "../http.js";
+import { isOperatorExecOn, OPERATOR_EXEC_CAPS, OPERATOR_EXEC_SETTING, OPERATOR_SUB } from "../operator.js";
+import { renderPage } from "../cockpit.js";
 
 app.post("/api/tenants", requireAdmin, async (e) => {
   let t = await readJsonBody(e),
@@ -237,4 +239,62 @@ app.get("/api/admin/events", requireAdmin, async (e) =>
   e.json({
     events: await sql`SELECT * FROM events ORDER BY id DESC LIMIT 300`,
   }),
+);
+// 0.3.3: operator exec toggle. Default off (setting absent). On: the claude.ai
+// connector's operator profile is issued cog.execute + lsp.diagnose on its next
+// approval. Off: every active operator grant carrying either cap is revoked (tree),
+// so the connector must re-approve and gets the base caps again.
+var activeOperatorExecGrants = async () =>
+  (await sql`SELECT id, caps FROM grants WHERE sub = ${OPERATOR_SUB} AND status = 'active'`)
+    .filter((e) => parseJson(e.caps).some((t) => OPERATOR_EXEC_CAPS.includes(t)))
+    .map((e) => e.id);
+app.get("/api/admin/operator-exec", requireAdmin, async (e) =>
+  e.json({
+    on: await isOperatorExecOn(),
+    caps: OPERATOR_EXEC_CAPS,
+    activeOperatorGrants: (await activeOperatorExecGrants()).length,
+  }),
+);
+app.post("/api/admin/operator-exec", requireAdmin, async (e) => {
+  let t = await readJsonBody(e);
+  if (!t || typeof t !== "object" || typeof t.on !== "boolean") throw new HttpError(400, "bad_request");
+  await setSetting(OPERATOR_EXEC_SETTING, t.on ? "on" : "off");
+  if (t.on)
+    return (
+      await recordEvent("operator_exec.on", { caps: OPERATOR_EXEC_CAPS }, null, "admin"),
+      e.json({
+        on: !0,
+        caps: OPERATOR_EXEC_CAPS,
+      })
+    );
+  let a = [];
+  for (let n of await activeOperatorExecGrants())
+    for (let r of await revokeGrantTree(n, "operator_exec_off", "admin")) if (!a.includes(r)) a.push(r);
+  return (
+    await recordEvent("operator_exec.off", { revoked: a }, null, "admin"),
+    e.json({
+      on: !1,
+      revoked: a,
+    })
+  );
+});
+// The page is a static shell (no state rendered server-side); its data comes from the
+// admin API above with the admin key held in this tab's sessionStorage, as on the
+// OAuth approve page.
+app.get("/admin/operator", (e) =>
+  e.html(
+    renderPage(
+      "Operator exec",
+      `<h1>Operator exec</h1><div class="card"><p>Lets the claude.ai connector (<code>${escapeHtml(OPERATOR_SUB)}</code>) also get <code>${escapeHtml(OPERATOR_EXEC_CAPS.join(", "))}</code> on its next approval. Default off. Turning it off revokes every active operator grant carrying them; the connector then re-approves with the base caps.</p></div>
+<div class="card" id="unlock" hidden><p>Unlock with the admin key (stays in this tab).</p><input id="k" type="password" style="width:100%"><button id="u">Unlock</button></div>
+<div class="card" id="go" hidden><p><b id="st"></b></p><p class="dim" id="n"></p><p><button id="tg"></button></p><p id="msg"></p></div>
+<script>const $=i=>document.getElementById(i);let K=sessionStorage.getItem("cos_admin"),S=null;
+async function api(p,o={}){const r=await fetch(p,{...o,headers:{"content-type":"application/json",authorization:"Bearer "+K}});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j}
+function show(j){S=j;$("st").textContent=j.on?"ON: operator connector gets "+j.caps.join(", "):"OFF: operator connector gets base caps only";$("n").textContent=j.activeOperatorGrants+" active operator grant(s) carry these caps";$("tg").textContent=j.on?"Turn off":"Turn on";$("unlock").hidden=true;$("go").hidden=false}
+async function load(){try{show(await api("/api/admin/operator-exec"))}catch(e){$("unlock").hidden=false;$("go").hidden=true}}
+$("u").onclick=()=>{K=$("k").value.trim();$("k").value="";sessionStorage.setItem("cos_admin",K);load()};
+$("tg").onclick=async()=>{$("tg").disabled=true;$("msg").textContent="";try{const j=await api("/api/admin/operator-exec",{method:"POST",body:JSON.stringify({on:!S.on})});await load();$("msg").textContent=j.on?"Turned on.":"Turned off; revoked "+j.revoked.length+" grant(s)."}catch(e){$("msg").textContent="Failed: "+e.message}$("tg").disabled=false};
+K?load():$("unlock").hidden=false;</script>`,
+    ),
+  ),
 );
