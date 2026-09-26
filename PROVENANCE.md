@@ -143,3 +143,22 @@ before the gatehouse signs, and refuses on any error-severity diagnostic. New ca
 - **Root grants minted before 0.3.2** do not carry the new caps (caps are snapshotted at
   mint). A tenant that needs `lsp.*` gets them via `POST /api/tenants/:id/root-grant`
   (admin, an ACL change — DW-signed). New tenants get them from the start.
+
+### 0.3.2 — LIVE on runtime-svc (2026-09-26 10:30Z, DW-approved)
+
+DW approved attaching the repo as the service source; `runtime-svc` now builds from
+`RightOnPar-LLC/creator-os-runtime` @ `master` on every push (deployment `e83410ea…`,
+commit `ecf0789`). `/health` at https://runtime.meshtool.ai reports `0.3.2`, `armed.lspMcp
+true`, and `source.sha256 2a305897f65707d3812296a0e9441aba5bacd8b173cd340ef935fd1983adb3b3`
+(93,765 bytes) — byte-identical to `npm run build` of the same commit, kept here as
+`live/runtime-0.3.2.bundle.js`; `node live/verify.mjs --url https://runtime.meshtool.ai` → 0.
+
+Live end-to-end (`lsp-mcp/test/smoke-live.mjs`, tenant `smoke-lsp-*` created then
+suspended): root grant carries `lsp.diagnose`; no grant → 403; grant without the cap → 403;
+a TS type error is reported at 0:13; a Rust borrow-checker violation (E0382) is reported via
+`cargo check` in ~5 s; hover reuses the session; the 7th call on a 6-call grant → 402;
+a revoked grant → 403. ALL GREEN.
+
+Housekeeping found on the way: the vault's `RUNTIME_ADMIN_KEY` did not match production
+(nor the Function, nor staging); it was refreshed in-process to the production value. The
+vault's `RAILWAY_TOKEN` is not authorized for this project (the Railway CLI login is).
