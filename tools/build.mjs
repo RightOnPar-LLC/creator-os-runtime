@@ -10,7 +10,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const bun = join(root, "test", "node_modules", "bun", "bin", process.platform === "win32" ? "bun.exe" : "bun");
+const bunBin = join(root, "test", "node_modules", "bun", "bin");
+const bun = process.platform === "win32"
+  ? join(bunBin, "bun.exe")
+  : existsSync(join(bunBin, "bun"))
+    ? join(bunBin, "bun")
+    : join(bunBin, "bun.exe");
 if (!existsSync(bun)) {
   console.error("pinned bun missing: run `npm ci` in test/ first");
   process.exit(2);

@@ -29,7 +29,12 @@ try { linked = lstatSync(rootModules).isSymbolicLink(); } catch {}
 if (!existsSync(rootModules)) symlinkSync(testModules, rootModules, "junction");
 else if (!linked) console.warn("note: using the existing real node_modules at the repo root");
 
-const bun = join(testModules, "bun", "bin", process.platform === "win32" ? "bun.exe" : "bun");
+const bunBin = join(testModules, "bun", "bin");
+const bun = process.platform === "win32"
+  ? join(bunBin, "bun.exe")
+  : existsSync(join(bunBin, "bun"))
+    ? join(bunBin, "bun")
+    : join(bunBin, "bun.exe");
 const arg = process.argv[2];
 const env = { ...process.env };
 if (arg === "dist") env.RUNTIME_ENTRY = join(root, "dist", "runtime.js");

@@ -21,7 +21,7 @@ describe("1. /health", () => {
     const h = r.json;
     expect(h.ok).toBe(true);
     expect(h.service).toBe("creator-os-runtime");
-    expect(h.version).toBe("0.3.2");
+    expect(h.version).toBe("0.3.3");
     expect(h.policy).toBe("p1");
     expect(h.db).toBe(true);
     expect(h.killSwitch).toBe(false);
@@ -55,7 +55,7 @@ describe("1. /health", () => {
   });
 
   test("exports", () => {
-    expect(mod.VERSION).toBe("0.3.2");
+    expect(mod.VERSION).toBe("0.3.3");
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
@@ -95,7 +95,7 @@ describe("2. route table", () => {
   test("/.well-known/creator-os.json", async () => {
     const r = await req("GET", "/.well-known/creator-os.json");
     expect(r.status).toBe(200);
-    expect(r.json.version).toBe("0.3.2");
+    expect(r.json.version).toBe("0.3.3");
     expect(r.json.caps).toEqual(mod.CAPS);
     expect(r.json.templates.probe).toEqual({ desc: "Tiny HTTP responder that proves the deploy path", needs: [], estCents: 25 });
   });
@@ -304,7 +304,7 @@ describe("4. MCP", () => {
 
   test("initialize + tools/list + ping + unknown method", async () => {
     const i = await mcp(t.token, "initialize", { protocolVersion: "2025-06-18" });
-    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.2" });
+    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.3" });
     expect(i.json.result.protocolVersion).toBe("2025-06-18");
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
@@ -349,7 +349,7 @@ describe("4. MCP", () => {
 
   test("runtime_health + grant_verify tools", async () => {
     const h = await mcp(t.token, "tools/call", { name: "runtime_health" });
-    expect(h.json.result.structuredContent.version).toBe("0.3.2");
+    expect(h.json.result.structuredContent.version).toBe("0.3.3");
     const v = await mcp(t.token, "tools/call", { name: "grant_verify" });
     expect(v.json.result.structuredContent.sub).toBe("tenant:root");
   });
@@ -701,7 +701,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("status report runs; every outbound call was blocked and is a known probe", async () => {
     const s = await req("GET", "/status.json");
     expect(s.status).toBe(200);
-    expect(s.json.version).toBe("0.3.2");
+    expect(s.json.version).toBe("0.3.3");
     expect(s.json.bodies.map((b) => b.up)).toEqual([false, false, false]);
     const allowed = new Set([
       "https://devdesk.meshtool.ai/health", "https://market.meshtool.ai/api/health",

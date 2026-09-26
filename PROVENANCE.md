@@ -162,3 +162,9 @@ a revoked grant → 403. ALL GREEN.
 Housekeeping found on the way: the vault's `RUNTIME_ADMIN_KEY` did not match production
 (nor the Function, nor staging); it was refreshed in-process to the production value. The
 vault's `RAILWAY_TOKEN` is not authorized for this project (the Railway CLI login is).
+
+### 0.3.3 — connector exec switch (merged-pending)
+
+- Branch/PR: `connector-exec-toggle` / RightOnPar-LLC/creator-os-runtime#12.
+- `npm run build` artifact: `dist/runtime.js`, 97,674 bytes.
+- sha256: `27c85e27eb25de9372b2019ea91da7b5d246e203b45a12784943988b98b88e2f`.
