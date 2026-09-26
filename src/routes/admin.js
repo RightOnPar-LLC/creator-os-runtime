@@ -1,7 +1,7 @@
 // Routes: admin: tenants, kill switch, policy, breakglass, grants, read-only tables. Registration order is significant.
 import { armedIntegrations, POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN } from "../config.js";
 import { HttpError, newId } from "../util.js";
-import { getGrant, getTenant, isKillSwitchOn, recordEvent, setSetting, sql } from "../db.js";
+import { getGrant, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
 import { mintRootGrant, revokeGrantTree } from "../grants.js";
@@ -139,6 +139,24 @@ app.post("/api/admin/resume", requireAdmin, async (e) => {
     })
   );
 });
+app.post("/api/admin/operator-lsp-caps/on", requireAdmin, async (e) => {
+  return (
+    await setSetting("operator_lsp_caps", "on"),
+    await recordEvent("operator.lsp_caps_enabled", {}, null, "admin"),
+    e.json({
+      operatorLspCaps: !0,
+    })
+  );
+});
+app.post("/api/admin/operator-lsp-caps/off", requireAdmin, async (e) => {
+  return (
+    await setSetting("operator_lsp_caps", "off"),
+    await recordEvent("operator.lsp_caps_disabled", {}, null, "admin"),
+    e.json({
+      operatorLspCaps: !1,
+    })
+  );
+});
 app.get("/api/admin/policy", requireAdmin, (e) =>
   e.json({
     policy: POLICY_VERSION,
@@ -202,6 +220,7 @@ app.get("/api/admin/overview", requireAdmin, async (e) => {
     webhooks: r,
     ledger: s,
     killSwitch: await isKillSwitchOn(),
+    operatorLspCaps: await isOperatorLspCapsEnabled(),
     armed: armedIntegrations(),
   });
 });
