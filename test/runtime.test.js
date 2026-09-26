@@ -1087,7 +1087,9 @@ describe("11. diagnostics gate — refute round", () => {
     const r = await req("POST", "/api/cog/execute", { token: tight.json.token, body: { proposal } });
     expect(r.status).toBe(403);
     expect(r.json).toEqual({ error: "attenuation_violation", detail: ["budget_exceeds_parent_remaining"] });
-    const mine = (await req("GET", "/api/grants", { token: tight.json.token })).json.grants;
-    expect(mine.filter((g) => g.status === "active").length).toBe(1);
+    // root + tight are the only live grants; the hop is revoked and nothing else was issued
+    const all = (await req("GET", "/api/grants", { token: t.token })).json.grants;
+    expect(all.filter((g) => g.status === "active").map((g) => g.sub).sort()).toEqual(["agent:tight", "tenant:root"]);
+    expect(all.find((g) => g.parent === tight.json.id).status).toBe("revoked");
   });
 });
