@@ -107,3 +107,39 @@ It runs on **two** services in project `creator-os-runtime`, the same bytes on b
 
 `node live/verify.mjs` checks the Function URL by default; add
 `--url https://runtime.meshtool.ai` for the Dockerfile service.
+
+## 0.3.2 — merged, not yet on runtime-svc (2026-09-26)
+
+0.3.2 (#9, master `1cfc5a5`) is the diagnostics gate: `cogExecute` asks **lsp-mcp**
+(`RightOnPar-LLC/lsp-mcp`, live at https://lsp-mcp-production.up.railway.app, Railway
+service `lsp-mcp` `7dd86e11…` in this project) for diagnostics over a proposal's `files`
+before the gatehouse signs, and refuses on any error-severity diagnostic. New caps
+`code.write`, `lsp.*`; new route `POST /api/grants/settle`. Full account in `src/README.md`
+("0.3.2 — the diagnostics gate") and the three commit messages squashed into #9.
+
+- **Expected artifact:** `npm run build` of `1cfc5a5` → `dist/runtime.js`, 93,765 bytes,
+  sha256 `2a305897f65707d3812296a0e9441aba5bacd8b173cd340ef935fd1983adb3b3`. The
+  Dockerfile builds the same file inside the image, so `/health` → `source.sha256` must
+  report this once deployed. (Not committed under `live/` until it IS live.)
+- **Gate:** `npm test` 64/64, `npm run test:dist` 64/64; secret scan clean; senior-gate
+  high-risk double loop (first-pass review + independent refute pass, both repos), every
+  finding fixed and re-verified.
+- **runtime-svc `06be2b2e…` still runs 0.3.1** (`/health` version 0.3.1 at 10:09Z).
+  `LSP_MCP_URL=https://lsp-mcp-production.up.railway.app` is already set on it (no
+  redeploy triggered). The service has **no git source attached** — nothing deploys on
+  push; every prior deploy was pushed by hand. Attaching the repo as the source was
+  refused by the agent's permission gate, so the deploy is DW's step:
+  Railway → `runtime-svc` → Settings → Source → `RightOnPar-LLC/creator-os-runtime`,
+  branch `master` (then it deploys on every push), or `railway up` from this repo.
+  After it: `curl -s https://runtime.meshtool.ai/health | jq .version,.source.sha256,.armed.lspMcp`
+  → `0.3.2`, the hash above, `true`; then
+  `node ../lsp-mcp/test/smoke-live.mjs https://lsp-mcp-production.up.railway.app https://runtime.meshtool.ai RUNTIME_ADMIN_KEY`
+  (vault read in-process; creates and suspends one `smoke-lsp-*` tenant).
+- **The Function `runtime` `9d9ea993…` stays on 0.3.1.** It still serves claude.ai
+  connector `/mcp` traffic; its OAuth profile has neither `cog.execute` nor
+  `lsp.diagnose`, so 0.3.2 changes nothing it can reach. Bringing it to 0.3.2 is the same
+  API dance as 0.3.1 (startCommand base64 of `dist/runtime.js`, 93,765 bytes is under the
+  cap) — do it after runtime-svc is verified, or retire it (signed step).
+- **Root grants minted before 0.3.2** do not carry the new caps (caps are snapshotted at
+  mint). A tenant that needs `lsp.*` gets them via `POST /api/tenants/:id/root-grant`
+  (admin, an ACL change — DW-signed). New tenants get them from the start.
