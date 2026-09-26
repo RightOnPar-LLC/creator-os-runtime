@@ -4,6 +4,7 @@ import { POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN, SERVICE_NAME } from "./config.j
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "./db.js";
 import { parseGrantToken, signGrantToken } from "./tokens.js";
+import { effectiveCaps } from "./connector.js";
 import {
   addUsage,
   attenuationViolations,
@@ -270,7 +271,13 @@ export async function verifyGrant(e, t, a, countRate = !0) {
     let i = await getTenant(s.tenant);
     if (!i || i.status !== "active") throw new HttpError(403, "tenant_suspended");
     if (await isKillSwitchOn()) throw new HttpError(503, "runtime_paused");
-    let o = parseJson(s.caps);
+    // 0.3.3: the connector exec switch (src/connector.js). While it is off, a grant
+    // in the connector's lineage cannot use cog.execute / lsp.diagnose even if it
+    // carries them. The masked row travels on as `row`, so introspection, MCP
+    // grant_verify and child issuance (attenuation reads row.caps) all see the mask.
+    let stored = parseJson(s.caps),
+      o = await effectiveCaps(s, stored);
+    if (o.length !== stored.length) s = { ...s, caps: o };
     if (t && !o.includes(t))
       throw new HttpError(403, "missing_cap", {
         need: t,

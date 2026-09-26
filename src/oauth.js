@@ -5,9 +5,10 @@ import { HttpError, nowSec, parseJson, sha256Hex } from "./util.js";
 import { getGrant, getTenant, sql } from "./db.js";
 import { remainingBudget, TIERS } from "./policy.js";
 import { issueChildGrant, mintRootGrant } from "./grants.js";
+import { CONNECTOR_EXEC_CAPS, isConnectorExecOn, OPERATOR_SUB, operatorCapsFor } from "./connector.js";
 
 export var OPERATOR_PROFILE = {
-  sub: "agent:claude-operator",
+  sub: OPERATOR_SUB,
   caps: ["grant.issue", "grant.read", "cog.plan", "ledger.read"],
   usd: 5000,
   calls: 500,
@@ -54,6 +55,10 @@ export var profileForRedirect = (e) => {
     return OPERATOR_PROFILE;
   }
 };
+// 0.3.3: the caps a profile is issued with right now. Only the operator profile
+// moves, and only with the connector exec switch (src/connector.js).
+export var profileCaps = (p, rootRow) =>
+  p?.sub === OPERATOR_SUB ? operatorCapsFor(p.caps, rootRow) : Promise.resolve([...p.caps]);
 var ALLOWED_REDIRECT_HOSTS = new Set([
   "claude.ai",
   "claude.com",
@@ -85,11 +90,15 @@ export var oauthError = (e, t, a, n = 400) =>
     n,
   );
 export async function ensureRootGrant(e) {
-  return (
-    (
-      await sql`SELECT * FROM grants WHERE tenant = ${e.id} AND depth = 0 AND status = 'active' AND exp > ${nowSec() + 3600} ORDER BY exp DESC LIMIT 1`
-    )[0] || (await mintRootGrant(e)).row
-  );
+  let root = (
+    await sql`SELECT * FROM grants WHERE tenant = ${e.id} AND depth = 0 AND status = 'active' AND exp > ${nowSec() + 3600} ORDER BY exp DESC LIMIT 1`
+  )[0];
+  // 0.3.3: caps are snapshotted at mint, so a root minted before 0.3.2 cannot pass
+  // cog.execute / lsp.diagnose down. With the connector exec switch on, approving a
+  // connector (an admin act) mints a fresh root that can. The old root is untouched.
+  if (root && (await isConnectorExecOn()) && !CONNECTOR_EXEC_CAPS.every((c) => parseJson(root.caps).includes(c)))
+    root = null;
+  return root || (await mintRootGrant(e)).row;
 }
 export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
   let n = await getGrant(e),
@@ -102,7 +111,7 @@ export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
     n,
     {
       sub: a.sub,
-      caps: a.caps,
+      caps: await profileCaps(a, n),
       ...(a.parts
         ? {
             scope: {
@@ -126,12 +135,14 @@ export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
     "oauth",
   );
 }
+// scope = what the issued grant actually carries (0.3.3: the operator's caps move
+// with the connector exec switch, so the profile's static list is no longer it).
 export var tokenResponse = (e, t, a = OPERATOR_PROFILE) => ({
   access_token: e.token,
   token_type: "Bearer",
   expires_in: Math.max(0, Number(e.row.exp) - nowSec()),
   refresh_token: t,
-  scope: a.caps.join(" "),
+  scope: (parseJson(e.row.caps) || a.caps).join(" "),
 });
 export async function mintRefreshToken(e, t, a, n, r) {
   let s = randomBytes(32).toString("base64url");

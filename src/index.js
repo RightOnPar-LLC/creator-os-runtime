@@ -18,6 +18,7 @@ import "./routes/mcp.js";
 import "./routes/oauth.js";
 import "./routes/cockpit.js";
 import "./routes/meta.js";
+import "./routes/connector.js";
 
 try {
   recordSource(await Bun.file(import.meta.path).text());
@@ -25,6 +26,8 @@ try {
 await migrateSchema();
 var signingKeySource = await loadGrantSigningKey();
 if (!(await getSetting("kill_switch"))) await setSetting("kill_switch", "off");
+// 0.3.3: the connector exec switch starts OFF (fail closed); only an admin turns it on.
+if (!(await getSetting("connector_exec"))) await setSetting("connector_exec", "off");
 console.log(
   `[${SERVICE_NAME} v${VERSION}] policy=${POLICY_VERSION} signingKey=${signingKeySource} armed=${JSON.stringify(armedIntegrations())}`,
 );
