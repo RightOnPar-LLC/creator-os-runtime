@@ -173,3 +173,16 @@ https://runtime-production-9d95.up.railway.app/health → `0.3.2`, `armed.lspMcp
 `source.sha256 2a305897…adb3b3` (93,765 bytes) — the same bytes as `runtime-svc`.
 Both services run the same bundle again. Known gap unchanged: the Function generates its
 own package.json with `hono: latest`; the repo and the Dockerfile service pin 4.13.9.
+
+### lsp-mcp retry fix — the diagnostics dependency hardened (2026-09-26 22:25Z)
+
+The live smoke that verified the Function surfaced a flake in the gate's dependency, not
+in the runtime: rust-analyzer intermittently rejected a `hover` on a reused session with
+`ContentModified` (`-32801`), which lsp-mcp turned into a 500. `diagnose` — the tool the
+gate actually depends on — was never affected. Fixed in `lsp-mcp` (commit `9058b85`,
+deployment `a4e9002b` SUCCESS): `LspClient.requestRetrying` retries the LSP-defined
+retryable codes `-32801`/`-32802` with linear backoff (hover/definition/references only;
+`diagnose` reads notifications, not a request). lsp-mcp is unversioned and deploys on push
+to `main`, so there is no runtime bundle change here — recorded because the gate's
+correctness rides on this service. Both runtime services re-smoked ALL GREEN afterward
+(runtime.meshtool.ai and the Function), hover-on-hot-session included.
