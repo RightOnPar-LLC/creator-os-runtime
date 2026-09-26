@@ -90,7 +90,8 @@ export var MCP_TOOLS = [
   },
   {
     name: "cog_execute",
-    description: "Proposal \u2192 gatehouse \u2192 grants + deploys (dry-run unless confirm)",
+    description:
+      "Proposal \u2192 gatehouse \u2192 grants + deploys (dry-run unless confirm). proposal.files [{path, content}] are diagnosed by lsp-mcp first (caller needs lsp.diagnose); any error-severity diagnostic refuses the signing with the diagnostic in the reason.",
     inputSchema: {
       type: "object",
       properties: {

@@ -32,6 +32,9 @@ var LISTEN_PORT = Number(env.PORT || 3000);
 var serverConfig = {
   port: LISTEN_PORT,
   fetch: app.fetch,
+  // 0.3.2: a gated cog.execute waits on lsp-mcp (a Rust cargo check can take a
+  // while); Bun's default 10 s idle timeout would drop the socket mid-request.
+  idleTimeout: 255,
 };
 export {
   gatehouseEvaluate,

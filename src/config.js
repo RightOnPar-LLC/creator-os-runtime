@@ -1,7 +1,7 @@
 // Service identity, env (secrets trimmed at load), armed-integration flags, secret fingerprints.
 import { createHash } from "crypto";
 
-export var VERSION = "0.3.1";
+export var VERSION = "0.3.2";
 export var SERVICE_NAME = "creator-os-runtime";
 export var POLICY_VERSION = "p1";
 export var env = Bun.env;
@@ -53,5 +53,6 @@ export var armedIntegrations = () => ({
   brainOut: !!env.BRAIN_URL,
   cognitiveBridge: !!(env.COG_BRIDGE_URL && env.COG_BRIDGE_TOKEN),
   sync: !!env.COG_SYNC_TOKEN,
+  lspMcp: !!env.LSP_MCP_URL,
 });
 export var RATE_LIMIT_MAX_PER_MIN = Number(env.RATE_LIMIT_PER_MIN || 120);

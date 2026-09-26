@@ -1,8 +1,8 @@
 // Routes: grant-holder API: grants, cog, deploys, ledger, events, tenant. Registration order is significant.
 import { HttpError, parseJson } from "../util.js";
 import { getGrant, recordEvent, sql } from "../db.js";
-import { remainingBudget, TIERS } from "../policy.js";
-import { issueChildGrant, revokeGrantTree } from "../grants.js";
+import { normalizeUsage, remainingBudget, TIERS } from "../policy.js";
+import { issueChildGrant, revokeGrantTree, settleGrantUsage } from "../grants.js";
 import { deleteDeploy, deployWorker, refreshDeployStatus, restartDeploy, TEMPLATES } from "../railway.js";
 import { cogExecute, cogPlan } from "../cog.js";
 import { app, readJsonBody, requireGrant } from "../http.js";
@@ -22,6 +22,33 @@ app.get("/api/grants/verify", requireGrant(null), (e) => {
     remaining: remainingBudget(t.row),
     exp: Number(t.row.exp),
   });
+});
+// 0.3.2: a holder settles usage against its OWN grant. This is how a capability
+// service that holds no signing key (lsp-mcp) charges a call: verify, then settle
+// with the same token. 402 when the budget is gone; only the caller's budget moves.
+app.post("/api/grants/settle", requireGrant(null), async (e) => {
+  let t = e.get("auth"),
+    a = await readJsonBody(e);
+  if (!a || typeof a !== "object" || Array.isArray(a)) throw new HttpError(400, "bad_body");
+  let n = normalizeUsage({
+      usd_cents: a.usd_cents,
+      calls: a.calls,
+      deploys: a.deploys,
+    }),
+    r = String(a.ref ?? "self");
+  if (n.calls === 0) throw new HttpError(400, "nothing_to_settle");
+  // Self-settle meters CALLS only. Money and deploys are charged by the runtime's own
+  // executors; a holder writing those into the ledger would be bookkeeping fiction.
+  if (n.usd_cents !== 0 || n.deploys !== 0) throw new HttpError(400, "calls_only");
+  if (!/^[a-z0-9:_.-]{1,120}$/i.test(r)) throw new HttpError(400, "bad_ref");
+  return (
+    await settleGrantUsage(t.row.id, n, r, String(a.note || "settled by holder").slice(0, 200), "self-settle"),
+    e.json({
+      ok: !0,
+      settled: n,
+      remaining: remainingBudget(await getGrant(t.row.id)),
+    })
+  );
 });
 app.post("/api/grants", requireGrant("grant.issue"), async (e) => {
   let t = e.get("auth"),

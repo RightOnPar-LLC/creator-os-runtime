@@ -84,7 +84,11 @@ export async function mintRootGrant(e, t = "tenant:root") {
     }
   );
 }
-export async function issueChildGrant(e, t, a) {
+// o.codeWrite = { filesSha256 }: the diagnostics attestation cogExecute fetched. It is
+// the only way a code.write grant is issued, and the hash is bound into the grant's
+// scope (scope.code.filesSha256) so whatever honours code.write can check that the
+// bytes being written are the bytes that were diagnosed.
+export async function issueChildGrant(e, t, a, w = {}) {
   let n = await getTenant(e.tenant);
   if (!n)
     throw Object.assign(Error("tenant_missing"), {
@@ -107,6 +111,7 @@ export async function issueChildGrant(e, t, a) {
       memory: {
         partitions: t.scope?.memory?.partitions ?? memoryPartitions(s),
       },
+      ...(w?.codeWrite?.filesSha256 ? { code: { filesSha256: String(w.codeWrite.filesSha256) } } : {}),
     },
     T = normalizeUsage(t.budget ?? zeroUsage()),
     R = clampConstraints(t.constraints ?? {}, i),
@@ -118,7 +123,7 @@ export async function issueChildGrant(e, t, a) {
       constraints: R,
       depth: Number(e.depth) + 1,
     },
-    B = attenuationViolations(e, S, n.tier);
+    B = attenuationViolations(e, S, n.tier, w);
   if (B.length)
     throw Object.assign(Error("attenuation_violation"), {
       status: 403,
@@ -218,7 +223,10 @@ export async function revokeGrantTree(e, t, a) {
   }
   return n;
 }
-export async function settleGrantUsage(e, t, a, n) {
+// `k` is the ledger kind: 'settle' for charges the runtime itself makes (deploys),
+// 'self-settle' for a holder settling its own grant via POST /api/grants/settle,
+// so the two can never be confused in the ledger.
+export async function settleGrantUsage(e, t, a, n, k = "settle") {
   await sql.begin(async (r) => {
     let s = (await r`SELECT * FROM grants WHERE id = ${e} FOR UPDATE`)[0];
     if (!s || s.status !== "active")
@@ -231,7 +239,7 @@ export async function settleGrantUsage(e, t, a, n) {
       });
     (await r`UPDATE grants SET settled = ${addUsage(normalizeUsage(parseJson(s.settled)), t)}::jsonb WHERE id = ${e}`,
       await r`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
-      VALUES (${s.tenant}, ${e}, ${s.parent}, 'settle', ${t.usd_cents}, ${t.calls}, ${t.deploys}, ${a}, ${n})`);
+      VALUES (${s.tenant}, ${e}, ${s.parent}, ${k}, ${t.usd_cents}, ${t.calls}, ${t.deploys}, ${a}, ${n})`);
   });
 }
 // Postgres-backed (fixed 60s window keyed by grant id), not a process-local
@@ -287,6 +295,9 @@ export async function verifyGrant(e, t, a, countRate = !0) {
       row: s,
       tenant: i,
       payload: r,
+      // 0.3.2: the presented token travels with the auth so the COG can present it
+      // to lsp-mcp on the caller's behalf (lsp-mcp introspects it back here).
+      token: e,
     };
   } catch (n) {
     if (n instanceof HttpError) throw n;
