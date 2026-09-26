@@ -6,6 +6,22 @@ import { vaultDecrypt, vaultKey } from "./tokens.js";
 import { remainingBudget, TIERS, usageWithin } from "./policy.js";
 import { settleGrantUsage } from "./grants.js";
 
+// Workers that run the creator-worker codebase are built by Railway straight from
+// the repo (Dockerfile at its root). No registry image, no pull credentials:
+// the previous ghcr.io/think-zone/creator-worker image never existed, so every
+// template that named it could not start (2026-09-26 fix).
+var WORKER_REPO = env.CREATOR_WORKER_REPO || "RightOnPar-LLC/creator-worker";
+var WORKER_BRANCH = env.CREATOR_WORKER_BRANCH || "main";
+// Owners whose repos the repo-app template may deploy. Comma-separated, case-insensitive.
+var REPO_OWNERS = String(env.DEPLOY_REPO_OWNERS || "RightOnPar-LLC,think-zone")
+  .split(",")
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+// AUTONOMOUS_DEPLOYS=1 skips the first-run dry-run gate for every grant. Budget,
+// scope, name prefix, maxWorkers, tier limits and the kill switch still apply.
+// Unset it to put the dry-run gate back without a code change.
+export var autonomousDeploys = () => env.AUTONOMOUS_DEPLOYS === "1";
+
 export var TEMPLATES = {
   probe: {
     image: "traefik/whoami:latest",
@@ -16,9 +32,9 @@ export var TEMPLATES = {
     estCents: 25,
   },
   "tip-alert-bot": {
-    image: "ghcr.io/think-zone/creator-worker:latest",
+    repo: WORKER_REPO,
     kind: "tip-alert",
-    desc: "Tip events \u2192 Discord / OBS alerts",
+    desc: "Tip events → Discord / OBS alerts",
     env: {
       WORKER_KIND: "tip-alert",
     },
@@ -26,9 +42,9 @@ export var TEMPLATES = {
     estCents: 60,
   },
   "paywall-link": {
-    image: "ghcr.io/think-zone/creator-worker:latest",
+    repo: WORKER_REPO,
     kind: "paywall",
-    desc: "Checkout link \u2192 content unlock, with receipts",
+    desc: "Checkout link → content unlock, with receipts",
     env: {
       WORKER_KIND: "paywall",
     },
@@ -36,7 +52,7 @@ export var TEMPLATES = {
     estCents: 60,
   },
   "clip-poster": {
-    image: "ghcr.io/think-zone/creator-worker:latest",
+    repo: WORKER_REPO,
     kind: "clips",
     desc: "Schedules and posts clips across platforms",
     env: {
@@ -46,7 +62,7 @@ export var TEMPLATES = {
     estCents: 80,
   },
   "dm-autoresponder": {
-    image: "ghcr.io/think-zone/creator-worker:latest",
+    repo: WORKER_REPO,
     kind: "dm",
     desc: "Answers DMs from a persona, escalates to you",
     env: {
@@ -56,7 +72,7 @@ export var TEMPLATES = {
     estCents: 90,
   },
   "webhook-relay": {
-    image: "ghcr.io/think-zone/creator-worker:latest",
+    repo: WORKER_REPO,
     kind: "relay",
     desc: "Relays platform webhooks to the Brain bus",
     env: {
@@ -65,7 +81,51 @@ export var TEMPLATES = {
     needs: [],
     estCents: 30,
   },
+  // Deploy any repo from an allowed owner. Intent carries { repo: "owner/name", branch? }.
+  "repo-app": {
+    repo: null,
+    kind: "repo-app",
+    desc: "Builds and runs any repo from your org (Dockerfile or Nixpacks)",
+    env: {},
+    needs: [],
+    estCents: 100,
+  },
+  // Spec in, running app out: writes code with Claude into a new org repo, then
+  // deploys it through this runtime with the repo-app template.
+  builder: {
+    repo: WORKER_REPO,
+    kind: "builder",
+    desc: "Turns a written spec into a new repo and deploys it (repo-app)",
+    env: {
+      WORKER_KIND: "builder",
+    },
+    needs: ["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "COS_GRANT_TOKEN", "BUILDER_TOKEN"],
+    estCents: 120,
+  },
 };
+var REPO_RE = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
+function resolveSource(e, t) {
+  if (e.image)
+    return {
+      source: {
+        image: e.image,
+      },
+      label: e.image,
+    };
+  let a = e.repo || t.repo,
+    n = e.repo ? WORKER_BRANCH : t.branch || "main";
+  if (!a || !REPO_RE.test(String(a))) throw new HttpError(400, "bad_repo", { repo: a || null });
+  if (!REPO_OWNERS.includes(String(a).split("/")[0].toLowerCase()))
+    throw new HttpError(403, "repo_owner_not_allowed", { repo: a, allowed: REPO_OWNERS });
+  if (!/^[A-Za-z0-9._/-]{1,100}$/.test(String(n))) throw new HttpError(400, "bad_branch");
+  return {
+    source: {
+      repo: String(a),
+    },
+    branch: String(n),
+    label: `github:${a}@${n}`,
+  };
+}
 var RAILWAY_GRAPHQL_URL = "https://backboard.railway.com/graphql/v2";
 async function railwayGraphql(e, t, a) {
   let n = await fetch(RAILWAY_GRAPHQL_URL, {
@@ -117,6 +177,7 @@ export async function deployWorker(e, t, a, n) {
     throw new HttpError(403, "out_of_scope", {
       project: o,
     });
+  let src = resolveSource(r, t);
   let E = Math.min(Math.max(1, Math.floor(+t.replicas || 1)), s.maxReplicas);
   if (
     (
@@ -151,17 +212,18 @@ export async function deployWorker(e, t, a, n) {
       project: o,
       environment: l,
       name: c,
-      image: r.image,
+      source: src.label,
       replicas: E,
       env: Object.keys(S),
       missingEnv: B,
       estCents: r.estCents,
+      autonomous: autonomousDeploys(),
       policy: POLICY_VERSION,
     },
     C = newId("dp"),
     pe =
       await sql`SELECT 1 FROM deploys WHERE tenant = ${e.tenant.id} AND name = ${c} AND executed = true LIMIT 1`,
-    H = s.requireDryRun && pe.length === 0 && !a,
+    H = s.requireDryRun && pe.length === 0 && !a && !autonomousDeploys(),
     P = await resolveRailwayToken(e.tenant.id),
     ee = "dry_run",
     te = !1,
@@ -172,32 +234,35 @@ export async function deployWorker(e, t, a, n) {
   else if (!P) J = "unarmed:RAILWAY_API_TOKEN";
   else if (!o) J = "no_target_project";
   else if (B.length) J = "missing_env:" + B.join(",");
-  else
-    (await settleGrantUsage(e.row.id, R, C, `deploy ${c}`),
-      (Le =
-        (
-          await railwayGraphql(
-            P.token,
-            "mutation($input: ServiceCreateInput!) { serviceCreate(input: $input) { id name } }",
-            {
-              input: {
-                projectId: o,
-                name: c,
-                source: {
-                  image: r.image,
-                },
-                variables: S,
-              },
-            },
-          )
-        )?.serviceCreate?.id || null),
-      (ee = "deploying"),
-      (te = !0),
-      (ke = {
-        serviceId: Le,
-        via: P.source,
-      }),
-      await sql`UPDATE tenants SET deploys_period = deploys_period + 1, updated_at = now() WHERE id = ${e.tenant.id}`);
+  else {
+    let input = {
+      projectId: o,
+      name: c,
+      source: src.source,
+      variables: S,
+    };
+    if (src.branch) input.branch = src.branch;
+    // Create first, charge after: a Railway rejection no longer burns grant budget.
+    Le =
+      (
+        await railwayGraphql(
+          P.token,
+          "mutation($input: ServiceCreateInput!) { serviceCreate(input: $input) { id name } }",
+          {
+            input,
+          },
+        )
+      )?.serviceCreate?.id || null;
+    await settleGrantUsage(e.row.id, R, C, `deploy ${c}`);
+    ee = "deploying";
+    te = !0;
+    ke = {
+      serviceId: Le,
+      via: P.source,
+      source: src.label,
+    };
+    await sql`UPDATE tenants SET deploys_period = deploys_period + 1, updated_at = now() WHERE id = ${e.tenant.id}`;
+  }
   return (
     await sql`INSERT INTO deploys (id, tenant, grant_id, name, template, intent, plan, status, executed, railway_service_id, target, result)
     VALUES (${C}, ${e.tenant.id}, ${e.row.id}, ${c}, ${t.template}, ${t}::jsonb, ${$}::jsonb, ${ee}, ${te}, ${Le},
