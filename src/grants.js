@@ -287,6 +287,9 @@ export async function verifyGrant(e, t, a, countRate = !0) {
       row: s,
       tenant: i,
       payload: r,
+      // 0.3.2: the presented token travels with the auth so the COG can present it
+      // to lsp-mcp on the caller's behalf (lsp-mcp introspects it back here).
+      token: e,
     };
   } catch (n) {
     if (n instanceof HttpError) throw n;

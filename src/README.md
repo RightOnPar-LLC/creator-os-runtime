@@ -18,11 +18,11 @@ file → these modules, byte for byte.
 | `db.js` | 105 | Postgres via `Bun.SQL`, schema + migration, settings, events, tenant/grant lookups, kill-switch read. |
 | `outbox.js` | 72 | Durable outbox to the Brain and the cognitive bridge, retry with backoff. |
 | `tokens.js` | 58 | Grant tokens (`cog1.<payload>.<hmac>`) and the AES-256-GCM vault. |
-| `policy.js` | 183 | Caps, tiers, usage arithmetic, attenuation rules, the gatehouse, memory-partition boundary check. |
+| `policy.js` | 240 | Caps, tiers, usage arithmetic, attenuation rules, the gatehouse, memory-partition boundary check, source-overlay canon + the diagnostics check (0.3.2). |
 | `grants.js` | 295 | Mint root, issue child, revoke tree, settle usage, Postgres-backed rate limit, `verifyGrant`. |
 | `memory.js` | 110 | Memory write/search/forget, sync records, bridge pull, partition scope check. |
 | `railway.js` | 350 | Worker templates; Railway deploy, status, restart, delete (GraphQL). |
-| `cog.js` | 275 | COG planner (deterministic, optionally LLM-assisted) and executor. |
+| `cog.js` | 355 | COG planner (deterministic, optionally LLM-assisted) and executor; asks lsp-mcp for diagnostics over `proposal.files` before the gatehouse (0.3.2). |
 | `webhooks.js` | 177 | Signature checks, idempotency records, Stripe and Railway event handlers. |
 | `http.js` | 100 | The Hono `app`, auth middleware (admin / grant / sync token — admin reads only Authorization, never x-grant), route inventory, source-hash state. |
 | `mcp.js` | 222 | MCP tool catalogue and JSON-RPC response helper. |
@@ -30,7 +30,7 @@ file → these modules, byte for byte.
 | `cockpit.js` | 212 | Page shell, status report (product probes), docs store, markdown renderer (escapes doc text before the code/bold transforms). |
 | `routes/core.js` | 103 | Error handler, 404, `/health`, `/.well-known/creator-os.json`. |
 | `routes/admin.js` | 240 | Tenants, kill/resume, policy, breakglass, admin grant ops, read-only admin tables. |
-| `routes/grants.js` | 173 | Grant-holder API: grants, cog, deploys, ledger, events, tenant. |
+| `routes/grants.js` | 195 | Grant-holder API: grants (incl. self-settle, 0.3.2), cog, deploys, ledger, events, tenant. |
 | `routes/memory.js` | 93 | Memory API, `/sync/*`, admin outbox + memory. |
 | `routes/railway-auth.js` | 92 | Railway OAuth connect (stores the token in the vault). |
 | `routes/webhooks.js` | 198 | `/webhooks/{stripe,railway,github,brain,mesh}` (Railway checks `x-runtime-token`; no `?token=` query fallback). |
@@ -76,3 +76,33 @@ The suite boots the runtime on 127.0.0.1 against a throwaway PGlite database (se
 over the Postgres wire protocol by `@electric-sql/pglite-socket`), with every outbound
 `fetch` blocked. Pinned tool versions live in `test/package.json`; the root
 `package.json` dependencies are unchanged.
+
+## 0.3.2 — the diagnostics gate (lsp-mcp)
+
+No `code.write` or `deploy.worker` grant signs while the source it is about to touch
+has an error. A proposal may carry `files: [{path, content}]` (the changed files, as
+contents — never paths). `cogExecute` then:
+
+1. canonicalises the overlay (`normalizeOverlay`: no absolute paths, no `..`, sorted,
+   size-capped) and hashes it (`overlayHash`, the same form lsp-mcp uses);
+2. calls lsp-mcp `diagnose` over it, presenting the **caller's own grant** — lsp-mcp
+   introspects that grant back here (`GET /api/grants/verify`) and charges it
+   (`POST /api/grants/settle`), so the caller must hold `lsp.diagnose` and budget;
+   anything the caller attached as `diagnostics` is discarded;
+3. hands the proposal, with the fetched result attached, to `gatehouseEvaluate`, which
+   refuses with `diagnostics_missing` / `diagnostics_stale` (hash mismatch) /
+   `diagnostic_error:<path>:<line>:<col>:<message>` per error. Warnings pass and are
+   recorded as a `cog.diagnostics.warnings` event.
+
+lsp-mcp unreachable, unconfigured (`LSP_MCP_URL`), or refusing → `gatehouse_denied`
+with `diagnostics_unavailable:…` / `diagnostics_refused:…`. Never waved through.
+A proposal without `files` is the pre-0.3.2 flow, untouched. `code.write` without
+`files` is refused (`code_write_requires_files`).
+
+New caps: `code.write`, `lsp.diagnose`, `lsp.hover`, `lsp.definition`, `lsp.references`.
+Caps are snapshotted into a grant row at mint time, so **root grants minted before
+0.3.2 do not carry them**; re-mint with the admin route `POST /api/tenants/:id/root-grant`
+(an ACL change — DW-signed, never automatic). New tenants get them from the start.
+
+Config: `LSP_MCP_URL` (no secret; lsp-mcp holds none either), `LSP_MCP_TIMEOUT_MS`
+(default 150000 — a Rust `cargo check` can take a while).

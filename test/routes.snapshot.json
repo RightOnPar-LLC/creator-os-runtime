@@ -1,5 +1,5 @@
 {
-  "count": 126,
+  "count": 128,
   "appRoutes": [
     "GET /health",
     "GET /api/admin/fingerprints",
@@ -47,6 +47,8 @@
     "GET /api/admin/events",
     "GET /api/grants/verify",
     "GET /api/grants/verify",
+    "POST /api/grants/settle",
+    "POST /api/grants/settle",
     "POST /api/grants",
     "POST /api/grants",
     "GET /api/grants",
@@ -153,6 +155,7 @@
     "GET /api/admin/webhooks :: admin",
     "GET /api/admin/events :: admin",
     "GET /api/grants/verify :: grant",
+    "POST /api/grants/settle :: grant",
     "POST /api/grants :: grant:grant.issue",
     "GET /api/grants :: grant:grant.read",
     "GET /api/grants/:id :: grant:grant.read",

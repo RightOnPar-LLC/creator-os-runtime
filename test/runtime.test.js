@@ -7,7 +7,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   mod, entryPath, BASE, ADMIN_KEY, GITHUB_SECRET, BRAIN_SECRET, MESH_SECRET, RAILWAY_TOKEN, RATE_LIMIT,
-  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown, dbQuery,
+  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown, dbQuery, lsp,
 } from "./harness.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -21,14 +21,14 @@ describe("1. /health", () => {
     const h = r.json;
     expect(h.ok).toBe(true);
     expect(h.service).toBe("creator-os-runtime");
-    expect(h.version).toBe("0.3.1");
+    expect(h.version).toBe("0.3.2");
     expect(h.policy).toBe("p1");
     expect(h.db).toBe(true);
     expect(h.killSwitch).toBe(false);
     expect(h.armed).toEqual({
       admin: true, vault: true, railway: false, railwayOAuth: false, stripe: false,
       railwayWebhook: true, github: true, brain: true, mesh: true, anthropic: false,
-      brainOut: false, cognitiveBridge: false, sync: false,
+      brainOut: false, cognitiveBridge: false, sync: false, lspMcp: true,
     });
     // 2026-09-25: fingerprints are no longer public.
     expect(h.fingerprints).toBeUndefined();
@@ -55,7 +55,7 @@ describe("1. /health", () => {
   });
 
   test("exports", () => {
-    expect(mod.VERSION).toBe("0.3.1");
+    expect(mod.VERSION).toBe("0.3.2");
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
@@ -63,7 +63,8 @@ describe("1. /health", () => {
     expect(Object.keys(mod.TEMPLATES)).toEqual(
       ["probe", "tip-alert-bot", "paywall-link", "clip-poster", "dm-autoresponder", "webhook-relay"],
     );
-    expect(mod.CAPS.length).toBe(20);
+    expect(mod.CAPS.length).toBe(25);
+    expect(mod.CAPS.slice(20)).toEqual(["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references"]);
     expect(mod.default.port).toBe(3000);
     expect(mod.default.fetch).toBe(mod.app.fetch);
     expect(Object.keys(mod).sort()).toEqual(
@@ -94,7 +95,7 @@ describe("2. route table", () => {
   test("/.well-known/creator-os.json", async () => {
     const r = await req("GET", "/.well-known/creator-os.json");
     expect(r.status).toBe(200);
-    expect(r.json.version).toBe("0.3.1");
+    expect(r.json.version).toBe("0.3.2");
     expect(r.json.caps).toEqual(mod.CAPS);
     expect(r.json.templates.probe).toEqual({ desc: "Tiny HTTP responder that proves the deploy path", needs: [], estCents: 25 });
   });
@@ -303,7 +304,7 @@ describe("4. MCP", () => {
 
   test("initialize + tools/list + ping + unknown method", async () => {
     const i = await mcp(t.token, "initialize", { protocolVersion: "2025-06-18" });
-    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.1" });
+    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.2" });
     expect(i.json.result.protocolVersion).toBe("2025-06-18");
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
@@ -348,7 +349,7 @@ describe("4. MCP", () => {
 
   test("runtime_health + grant_verify tools", async () => {
     const h = await mcp(t.token, "tools/call", { name: "runtime_health" });
-    expect(h.json.result.structuredContent.version).toBe("0.3.1");
+    expect(h.json.result.structuredContent.version).toBe("0.3.2");
     const v = await mcp(t.token, "tools/call", { name: "grant_verify" });
     expect(v.json.result.structuredContent.sub).toBe("tenant:root");
   });
@@ -700,7 +701,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("status report runs; every outbound call was blocked and is a known probe", async () => {
     const s = await req("GET", "/status.json");
     expect(s.status).toBe(200);
-    expect(s.json.version).toBe("0.3.1");
+    expect(s.json.version).toBe("0.3.2");
     expect(s.json.bodies.map((b) => b.up)).toEqual([false, false, false]);
     const allowed = new Set([
       "https://devdesk.meshtool.ai/health", "https://market.meshtool.ai/api/health",
@@ -713,5 +714,171 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
     await Promise.all(Array.from({ length: 10 }, () => req("GET", "/status.json")));
     await req("GET", "/status");
     expect(blockedFetches.length).toBe(before);
+  });
+});
+
+// ------------------------------------------------------------------------------------
+// 0.3.2: no code-write / deploy grant signs until lsp-mcp diagnostics come back clean.
+describe("9. diagnostics gate (lsp-mcp, 0.3.2)", () => {
+  const CLEAN = [{ path: "src/ok.ts", content: "export const n: number = 1;\n" }];
+  const BROKEN = [{ path: "src/x.ts", content: "let BROKEN: string = 1;\n" }];
+  const WARN = [{ path: "src/w.ts", content: "let WARN = 1;\n" }];
+  async function plan(t) {
+    const p = await req("POST", "/api/cog/plan", { token: t.token, body: { intent: "send tip alerts to discord" } });
+    expect(p.status).toBe(200);
+    return p.json.proposal;
+  }
+  const exec = (t, proposal) => req("POST", "/api/cog/execute", { token: t.token, body: { proposal } });
+
+  test("root grants carry the five new caps; lsp.* grants are issuable with a short TTL", async () => {
+    const t = await newTenant("lsp-caps");
+    const v = await req("GET", "/api/grants/verify", { token: t.token });
+    for (const c of ["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references"]) expect(v.json.caps).toContain(c);
+    const g = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:reviewer", caps: ["lsp.diagnose", "lsp.hover"], ttlSec: 120, budget: { calls: 20 } } });
+    expect(g.status).toBe(201);
+    expect(g.json.caps).toEqual(["lsp.diagnose", "lsp.hover"]);
+    expect(g.json.exp - Math.floor(Date.now() / 1000)).toBeLessThanOrEqual(120);
+  });
+
+  test("a proposal with a file that has a type error is refused at sign time, diagnostic in the reason", async () => {
+    const t = await newTenant("lsp-broken");
+    const before = lsp.calls.length;
+    const r = await exec(t, { ...(await plan(t)), files: BROKEN });
+    expect(r.status).toBe(403);
+    expect(r.json.error).toBe("gatehouse_denied");
+    expect(r.json.detail).toEqual(["diagnostic_error:src/x.ts:2:5:Type 'number' is not assignable to type 'string'."]);
+    expect(lsp.calls.length).toBe(before + 1);
+    expect(lsp.calls.at(-1)).toEqual({ token: t.token, files: ["src/x.ts"] });
+    const ev = await req("GET", "/api/events", { token: t.token });
+    const denied = ev.json.events.find((e) => e.type === "cog.denied");
+    expect(denied.data.reasons[0]).toStartWith("diagnostic_error:src/x.ts:2:5:");
+    // Nothing was signed: no child grant, no deploy.
+    expect((await req("GET", "/api/grants", { token: t.token })).json.grants.length).toBe(1);
+    expect((await req("GET", "/api/deploys", { token: t.token })).json.deploys.length).toBe(0);
+  });
+
+  test("the same proposal with clean files signs normally and reports the diagnostics summary", async () => {
+    const t = await newTenant("lsp-clean");
+    const r = await exec(t, { ...(await plan(t)), files: CLEAN });
+    expect(r.status).toBe(200);
+    expect(Object.keys(r.json.grants)).toEqual(["deployer"]);
+    expect(r.json.deploys[0].status).toBe("dry_run");
+    expect(r.json.diagnostics.summary).toEqual({ errors: 0, warnings: 0, informations: 0, hints: 0 });
+    expect(r.json.diagnostics.filesSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(r.json.diagnostics.backend).toBe("typescript");
+  });
+
+  test("a proposal with no files is the existing flow: lsp-mcp is not called, nothing changes", async () => {
+    const t = await newTenant("lsp-nofiles");
+    const before = lsp.calls.length;
+    const r = await exec(t, await plan(t));
+    expect(r.status).toBe(200);
+    expect(r.json.diagnostics).toBeUndefined();
+    expect(lsp.calls.length).toBe(before);
+  });
+
+  test("warnings do not block; they are logged as an event", async () => {
+    const t = await newTenant("lsp-warn");
+    const r = await exec(t, { ...(await plan(t)), files: WARN });
+    expect(r.status).toBe(200);
+    expect(r.json.diagnostics.summary.warnings).toBe(1);
+    const ev = await req("GET", "/api/events", { token: t.token });
+    const w = ev.json.events.find((e) => e.type === "cog.diagnostics.warnings");
+    expect(w.data.warnings).toEqual(["src/w.ts:1:1:'x' is declared but never used."]);
+  });
+
+  test("caller-attached diagnostics are ignored: the gatehouse only trusts what it fetched itself", async () => {
+    const t = await newTenant("lsp-forged");
+    const forged = { filesSha256: "0".repeat(64), files: [{ path: "src/x.ts", diagnostics: [] }], summary: { errors: 0 } };
+    const r = await exec(t, { ...(await plan(t)), files: BROKEN, diagnostics: forged });
+    expect(r.status).toBe(403);
+    expect(r.json.detail[0]).toStartWith("diagnostic_error:src/x.ts:2:5:");
+  });
+
+  test("caller grant without lsp.diagnose: lsp-mcp refuses it and so does the gatehouse (no bypass)", async () => {
+    const t = await newTenant("lsp-nocap");
+    const child = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:builder", caps: ["grant.issue", "cog.plan", "cog.execute", "deploy.worker", "worker.status", "memory.read", "memory.write"], ttlSec: 600, budget: { usd_cents: 200, calls: 50, deploys: 2 } },
+    });
+    expect(child.status).toBe(201);
+    const p = await req("POST", "/api/cog/plan", { token: child.json.token, body: { intent: "send tip alerts to discord" } });
+    const r = await req("POST", "/api/cog/execute", { token: child.json.token, body: { proposal: { ...p.json.proposal, files: CLEAN } } });
+    expect(r.status).toBe(403);
+    expect(r.json).toEqual({ error: "gatehouse_denied", detail: ["diagnostics_refused:missing_cap"] });
+  });
+
+  test("lsp-mcp down or unconfigured: a proposal with files is refused, never waved through", async () => {
+    const t = await newTenant("lsp-down");
+    const proposal = { ...(await plan(t)), files: CLEAN };
+    lsp.mode = "down";
+    try {
+      const r = await exec(t, proposal);
+      expect(r.status).toBe(403);
+      expect(r.json).toEqual({ error: "gatehouse_denied", detail: ["diagnostics_unavailable:unreachable"] });
+    } finally { lsp.mode = "ok"; }
+    const url = process.env.LSP_MCP_URL;
+    delete process.env.LSP_MCP_URL;
+    try {
+      expect((await req("GET", "/health")).json.armed.lspMcp).toBe(false);
+      const r = await exec(t, proposal);
+      expect(r.status).toBe(403);
+      expect(r.json).toEqual({ error: "gatehouse_denied", detail: ["diagnostics_unavailable:LSP_MCP_URL"] });
+    } finally { process.env.LSP_MCP_URL = url; }
+    lsp.mode = "broke";
+    try {
+      const r = await exec(t, proposal);
+      expect(r.status).toBe(403);
+      expect(r.json.detail).toEqual(["diagnostics_refused:budget_exhausted"]);
+    } finally { lsp.mode = "ok"; }
+  });
+
+  test("bad overlay entries are refused before lsp-mcp is called", async () => {
+    const t = await newTenant("lsp-badfiles");
+    const before = lsp.calls.length;
+    const proposal = await plan(t);
+    for (const files of [[{ path: "../x.ts", content: "" }], [{ path: "C:/x.ts", content: "" }], [{ path: "a.ts" }], [{ path: "a.ts", content: "" }, { path: "a.ts", content: "" }]]) {
+      const r = await exec(t, { ...proposal, files });
+      expect(r.status).toBe(403);
+      expect(r.json.error).toBe("gatehouse_denied");
+      expect(r.json.detail[0]).toMatch(/^(bad_path|bad_file_entry|duplicate_path):/);
+    }
+    expect(lsp.calls.length).toBe(before);
+  });
+
+  test("pure gatehouseEvaluate: code.write needs files; files need fresh, clean diagnostics", () => {
+    const tenant = { id: "t", status: "active", tier: "starter", allowed_targets: {} };
+    const grant = (caps) => ({ key: "w", sub: "agent:w", caps, ttlSec: 600, budget: { usd_cents: 10, calls: 5, deploys: 0 }, scope: {}, constraints: {} });
+    const ev = (p) => mod.gatehouseEvaluate(tenant, null, p).reasons;
+    expect(ev({ grants: [grant(["code.write"])], deploys: [] })).toEqual(["code_write_requires_files"]);
+    expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN })).toEqual(["diagnostics_missing"]);
+    expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: "nope", files: [] } })).toEqual(["diagnostics_stale"]);
+    const h = sha256Hex(Buffer.concat([Buffer.from("src/ok.ts\0"), Buffer.from(CLEAN[0].content + "\0")]));
+    expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: h, files: [] } })).toEqual([]);
+    expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: h, files: [{ path: "src/ok.ts", diagnostics: [{ severity: "error", line: 0, col: 2, message: "boom\nmore" }] }] } }))
+      .toEqual(["diagnostic_error:src/ok.ts:1:3:boom"]);
+    expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: h, files: [{ path: "src/ok.ts", diagnostics: [{ severity: "warning", line: 0, col: 2, message: "meh" }] }] } })).toEqual([]);
+    // Files on a proposal that signs neither code.write nor a deploy are not gated.
+    expect(ev({ grants: [grant(["memory.read"])], deploys: [], files: CLEAN })).toEqual([]);
+    // A deploy with files is gated even without code.write.
+    expect(ev({ grants: [grant(["deploy.worker"])], deploys: [], files: CLEAN })).toEqual(["diagnostics_missing"]);
+  });
+
+  test("POST /api/grants/settle: a holder charges its own budget; 402 when it is gone; 401 without a grant", async () => {
+    const t = await newTenant("settle");
+    const c = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:lsp", caps: ["lsp.diagnose"], ttlSec: 120, budget: { calls: 2 } } });
+    expect(c.status).toBe(201);
+    const s1 = await req("POST", "/api/grants/settle", { token: c.json.token, body: { calls: 1, ref: "lsp:diagnose", note: "lsp.diagnose 1 file(s)" } });
+    expect(s1.status).toBe(200);
+    expect(s1.json.settled).toEqual({ usd_cents: 0, calls: 1, deploys: 0 });
+    expect(s1.json.remaining.calls).toBe(1);
+    expect((await req("POST", "/api/grants/settle", { token: c.json.token, body: { calls: 1 } })).json.remaining.calls).toBe(0);
+    const s3 = await req("POST", "/api/grants/settle", { token: c.json.token, body: { calls: 1 } });
+    expect(s3.status).toBe(402);
+    expect(s3.json.error).toBe("budget_exhausted");
+    expect((await req("POST", "/api/grants/settle", { token: c.json.token, body: {} })).json.error).toBe("nothing_to_settle");
+    expect((await req("POST", "/api/grants/settle", { body: { calls: 1 } })).status).toBe(401);
+    const led = await req("GET", "/api/ledger", { token: t.token });
+    expect(led.json.ledger.filter((l) => l.kind === "settle" && l.grant_id === c.json.id).map((l) => l.ref)).toEqual(["self", "lsp:diagnose"]);
   });
 });

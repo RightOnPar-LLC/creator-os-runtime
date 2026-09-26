@@ -3,7 +3,7 @@ import { randomBytes } from "crypto";
 import { env } from "./config.js";
 import { HttpError, parseJson } from "./util.js";
 import { recordEvent, sql } from "./db.js";
-import { gatehouseEvaluate, remainingBudget, tenantWorkerPrefix, TIERS } from "./policy.js";
+import { gatehouseEvaluate, normalizeOverlay, remainingBudget, tenantWorkerPrefix, TIERS } from "./policy.js";
 import { issueChildGrant } from "./grants.js";
 import { searchMemories, writeMemory } from "./memory.js";
 import { deployWorker, TEMPLATES } from "./railway.js";
@@ -189,8 +189,82 @@ export async function cogPlan(e, t, a) {
     r
   );
 }
+// 0.3.2: ask lsp-mcp for diagnostics over the proposal's files, presenting the
+// CALLER's grant (lsp-mcp introspects it here; the caller must hold lsp.diagnose).
+// Nothing the caller attached as `diagnostics` is trusted: this is the only source.
+export async function diagnoseProposalFiles(e, t) {
+  let a = (env.LSP_MCP_URL || "").replace(/\/$/, "");
+  if (!a) throw new HttpError(503, "diagnostics_unavailable", { needs: "LSP_MCP_URL" });
+  let n, r;
+  try {
+    ((n = await fetch(`${a}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${t}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "diagnose",
+          arguments: {
+            files: e,
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(Number(env.LSP_MCP_TIMEOUT_MS || 150000)),
+    })),
+      (r = await n.json()));
+  } catch {
+    throw new HttpError(503, "diagnostics_unavailable", { lsp: "unreachable" });
+  }
+  if (!n.ok || r?.error)
+    throw new HttpError(n.status === 402 ? 402 : 403, "diagnostics_refused", {
+      lsp: r?.error?.message || `http_${n.status}`,
+      detail: r?.error?.data ?? null,
+    });
+  let s = r?.result?.structuredContent;
+  if (!s || typeof s !== "object" || !Array.isArray(s.files)) throw new HttpError(502, "diagnostics_unavailable", { lsp: "bad_result" });
+  return s;
+}
+async function denyCog(e, t) {
+  await recordEvent(
+    "cog.denied",
+    {
+      reasons: t,
+    },
+    e.tenant.id,
+    e.row.sub,
+  );
+  return new HttpError(403, "gatehouse_denied", t);
+}
 export async function cogExecute(e, t, a) {
-  let n = gatehouseEvaluate(e.tenant, e.row, t);
+  let n;
+  if (Array.isArray(t?.files) && t.files.length) {
+    let d;
+    try {
+      let f = normalizeOverlay(t.files);
+      d = await diagnoseProposalFiles(f, e.token);
+      t = { ...t, files: f, diagnostics: d };
+    } catch (f) {
+      let g = f instanceof HttpError ? f : new HttpError(500, "diagnostics_unavailable");
+      throw await denyCog(e, [`${g.code}:${g.detail?.lsp || g.detail?.needs || g.detail?.path || g.code}`]);
+    }
+    if (d.summary?.warnings)
+      await recordEvent(
+        "cog.diagnostics.warnings",
+        {
+          filesSha256: d.filesSha256,
+          summary: d.summary,
+          warnings: d.files.flatMap((f) => (f.diagnostics || []).filter((g) => g.severity === "warning").slice(0, 20).map((g) => `${f.path}:${g.line + 1}:${g.col + 1}:${String(g.message).split("\n")[0].slice(0, 160)}`)),
+        },
+        e.tenant.id,
+        e.row.sub,
+      );
+  }
+  n = gatehouseEvaluate(e.tenant, e.row, t);
   if (!n.ok)
     throw (
       await recordEvent(
@@ -270,6 +344,14 @@ export async function cogExecute(e, t, a) {
         ]),
       ),
       deploys: s,
+      diagnostics: t.diagnostics
+        ? {
+            filesSha256: t.diagnostics.filesSha256,
+            backend: t.diagnostics.backend,
+            summary: t.diagnostics.summary,
+            warnings: t.diagnostics.warnings || [],
+          }
+        : void 0,
     }
   );
 }

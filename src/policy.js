@@ -1,5 +1,6 @@
 // Caps, tiers, usage arithmetic, attenuation rules and the gatehouse.
-import { nowSec, parseJson, sha256Hex } from "./util.js";
+import { createHash } from "crypto";
+import { HttpError, nowSec, parseJson, sha256Hex } from "./util.js";
 import { TEMPLATES } from "./railway.js";
 
 export var CAPS = [
@@ -23,6 +24,13 @@ export var CAPS = [
   "store.clips.price",
   "store.ingest",
   "store.clips.publish",
+  // 0.3.2: source-aware capabilities. code.write marks a grant that will change
+  // source; lsp.* are what lsp-mcp checks for (it introspects the grant here).
+  "code.write",
+  "lsp.diagnose",
+  "lsp.hover",
+  "lsp.definition",
+  "lsp.references",
 ];
 var CAP_SET = new Set(CAPS);
 export var TIERS = {
@@ -170,6 +178,16 @@ export function gatehouseEvaluate(e, t, a) {
       if (!l.template || !TEMPLATES[l.template]) n.push(`unknown_template:${l.template}`);
     }
     if (t && t.status !== "active") n.push("caller_grant_not_active");
+    // 0.3.2 diagnostics gate. A proposal that carries source files must carry an
+    // lsp.diagnose result for EXACTLY those files (hash-bound) with no error-severity
+    // diagnostic before any code.write / deploy.worker grant or deploy is signed.
+    // cogExecute obtains that result from lsp-mcp itself and never trusts one the
+    // caller attached; this is the pure check on what it attached. Warnings pass.
+    let f = Array.isArray(a?.files) ? a.files : null,
+      w = (s || []).some((l) => (l.caps || []).includes("code.write")),
+      d = (s || []).some((l) => (l.caps || []).includes("deploy.worker")) || (i || []).length > 0;
+    if (w && !f?.length) n.push("code_write_requires_files");
+    if (f?.length && (w || d)) n.push(...diagnosticsViolations(f, a.diagnostics));
   } catch {
     n.push("policy_evaluation_error");
   }
@@ -180,4 +198,51 @@ export function gatehouseEvaluate(e, t, a) {
 }
 export function tenantWorkerPrefix(e) {
   return `t-${sha256Hex(e).slice(0, 6)}-`;
+}
+// ---- source overlays (0.3.2) ----------------------------------------------------
+// The same canonical form and hash lsp-mcp uses (src/session.js there), so a
+// diagnostics result can be bound to the exact bytes it was computed over.
+export var MAX_OVERLAY_FILES = 200;
+export var MAX_OVERLAY_BYTES = 4 * 1024 * 1024;
+export function normalizeOverlay(e) {
+  if (!Array.isArray(e) || e.length === 0) throw new HttpError(400, "files_required");
+  if (e.length > MAX_OVERLAY_FILES) throw new HttpError(413, "too_many_files", { max: MAX_OVERLAY_FILES });
+  let t = 0,
+    a = new Set(),
+    n = e.map((r) => {
+      if (!r || typeof r.path !== "string" || typeof r.content !== "string") throw new HttpError(400, "bad_file_entry");
+      let s = r.path.replace(/\\/g, "/").replace(/^\.\//, "");
+      if (!s || s.startsWith("/") || /^[a-zA-Z]:/.test(s) || s.split("/").some((i) => i === ".." || i === "" || i === "."))
+        throw new HttpError(400, "bad_path", { path: r.path });
+      if (a.has(s)) throw new HttpError(400, "duplicate_path", { path: s });
+      a.add(s);
+      t += Buffer.byteLength(r.content, "utf8");
+      return { path: s, content: r.content };
+    });
+  if (t > MAX_OVERLAY_BYTES) throw new HttpError(413, "overlay_too_large", { max: MAX_OVERLAY_BYTES });
+  return n.sort((r, s) => (r.path < s.path ? -1 : 1));
+}
+export function overlayHash(e) {
+  let t = createHash("sha256");
+  for (let a of e) t.update(a.path).update("\0").update(a.content).update("\0");
+  return t.digest("hex");
+}
+// Reasons a diagnostics result does not clear `files`: missing, computed over other
+// bytes, or carrying an error. Each error is one reason with 1-based line:col and
+// the first line of the message, so a refusal names the exact problem.
+export function diagnosticsViolations(e, t) {
+  let a = [];
+  try {
+    let n = overlayHash(normalizeOverlay(e));
+    if (!t || typeof t !== "object") return ["diagnostics_missing"];
+    if (t.filesSha256 !== n) return ["diagnostics_stale"];
+    for (let r of Array.isArray(t.files) ? t.files : [])
+      for (let s of Array.isArray(r.diagnostics) ? r.diagnostics : [])
+        if (s.severity === "error")
+          a.push(`diagnostic_error:${r.path}:${(+s.line | 0) + 1}:${(+s.col | 0) + 1}:${String(s.message ?? "").split("\n")[0].slice(0, 160)}`);
+    if (a.length > 40) a = [...a.slice(0, 40), `diagnostic_errors_truncated:${a.length - 40}`];
+  } catch (n) {
+    a.push(n instanceof HttpError ? `bad_files:${n.code}` : "diagnostics_evaluation_error");
+  }
+  return a;
 }
