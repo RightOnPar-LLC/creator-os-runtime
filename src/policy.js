@@ -192,7 +192,7 @@ export function gatehouseEvaluate(e, t, a) {
       w = (s || []).some((l) => (l.caps || []).includes("code.write")),
       d = (s || []).some((l) => (l.caps || []).includes("deploy.worker")) || (i || []).length > 0;
     if (w && !f?.length) n.push("code_write_requires_files");
-    if (f?.length && (w || d)) n.push(...diagnosticsViolations(f, a.diagnostics));
+    if (f?.length && (w || d)) n.push(...diagnosticsViolations(f, a.diagnostics, { codeWrite: w }));
   } catch {
     n.push("policy_evaluation_error");
   }
@@ -209,6 +209,7 @@ export function tenantWorkerPrefix(e) {
 // diagnostics result can be bound to the exact bytes it was computed over.
 export var MAX_OVERLAY_FILES = 200;
 export var MAX_OVERLAY_BYTES = 4 * 1024 * 1024;
+var OVERLAY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$|^\.[A-Za-z0-9][A-Za-z0-9._-]*$/;
 export function normalizeOverlay(e) {
   if (!Array.isArray(e) || e.length === 0) throw new HttpError(400, "files_required");
   if (e.length > MAX_OVERLAY_FILES) throw new HttpError(413, "too_many_files", { max: MAX_OVERLAY_FILES });
@@ -216,8 +217,9 @@ export function normalizeOverlay(e) {
     a = new Set(),
     n = e.map((r) => {
       if (!r || typeof r.path !== "string" || typeof r.content !== "string") throw new HttpError(400, "bad_file_entry");
+      if (/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(r.content)) throw new HttpError(400, "bad_file_entry", { path: r.path, reason: "control_chars" });
       let s = r.path.replace(/\\/g, "/").replace(/^\.\//, "");
-      if (!s || s.startsWith("/") || /^[a-zA-Z]:/.test(s) || s.split("/").some((i) => i === ".." || i === "" || i === "."))
+      if (!s || s.startsWith("/") || /^[a-zA-Z]:/.test(s) || s.split("/").some((i) => i === ".." || i === "" || i === "." || !OVERLAY_SEGMENT.test(i)))
         throw new HttpError(400, "bad_path", { path: r.path });
       if (a.has(s)) throw new HttpError(400, "duplicate_path", { path: s });
       a.add(s);
@@ -227,24 +229,35 @@ export function normalizeOverlay(e) {
   if (t > MAX_OVERLAY_BYTES) throw new HttpError(413, "overlay_too_large", { max: MAX_OVERLAY_BYTES });
   return n.sort((r, s) => (r.path < s.path ? -1 : 1));
 }
+// Shared byte-for-byte with lsp-mcp (src/session.js overlayHash) — change both or
+// neither. Length-prefixed fields make it injective (a mismatch fails closed as
+// diagnostics_stale, so the two can never silently disagree).
 export function overlayHash(e) {
   let t = createHash("sha256");
-  for (let a of e) t.update(a.path).update("\0").update(a.content).update("\0");
+  t.update("overlay/v2\n");
+  for (let a of e)
+    t.update(`${Buffer.byteLength(a.path, "utf8")}:`).update(a.path).update(`\n${Buffer.byteLength(a.content, "utf8")}:`).update(a.content).update("\n");
   return t.digest("hex");
 }
 // Reasons a diagnostics result does not clear `files`: missing, computed over other
 // bytes, or carrying an error. Each error is one reason with 1-based line:col and
 // the first line of the message, so a refusal names the exact problem.
-export function diagnosticsViolations(e, t) {
+export function diagnosticsViolations(e, t, r = {}) {
   let a = [];
   try {
-    let n = overlayHash(normalizeOverlay(e));
+    let o = normalizeOverlay(e),
+      n = overlayHash(o);
     if (!t || typeof t !== "object") return ["diagnostics_missing"];
     if (t.filesSha256 !== n) return ["diagnostics_stale"];
-    for (let r of Array.isArray(t.files) ? t.files : [])
-      for (let s of Array.isArray(r.diagnostics) ? r.diagnostics : [])
-        if (s.severity === "error")
-          a.push(`diagnostic_error:${r.path}:${(+s.line | 0) + 1}:${(+s.col | 0) + 1}:${String(s.message ?? "").split("\n")[0].slice(0, 160)}`);
+    let f = Array.isArray(t.files) ? t.files : [],
+      d = new Set(f.filter((s) => Array.isArray(s?.diagnostics)).map((s) => s.path));
+    // code.write: every file in the overlay must have been looked at by a backend;
+    // a file no language server diagnosed cannot ride on a clean attestation.
+    if (r.codeWrite) for (let s of o) if (!d.has(s.path)) a.push(`file_not_diagnosed:${s.path}`);
+    for (let s of f)
+      for (let i of Array.isArray(s.diagnostics) ? s.diagnostics : [])
+        if (i && i.severity === "error")
+          a.push(`diagnostic_error:${s.path}:${(+i.line | 0) + 1}:${(+i.col | 0) + 1}:${String(i.message ?? "").split("\n")[0].slice(0, 160)}`);
     if (a.length > 40) a = [...a.slice(0, 40), `diagnostic_errors_truncated:${a.length - 40}`];
   } catch (n) {
     a.push(n instanceof HttpError ? `bad_files:${n.code}` : "diagnostics_evaluation_error");

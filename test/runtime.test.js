@@ -7,7 +7,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   mod, entryPath, BASE, ADMIN_KEY, GITHUB_SECRET, BRAIN_SECRET, MESH_SECRET, RAILWAY_TOKEN, RATE_LIMIT,
-  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown, dbQuery, lsp,
+  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown, dbQuery, lsp, overlayHash,
 } from "./harness.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -748,12 +748,19 @@ describe("9. diagnostics gate (lsp-mcp, 0.3.2)", () => {
     expect(r.json.error).toBe("gatehouse_denied");
     expect(r.json.detail).toEqual(["diagnostic_error:src/x.ts:2:5:Type 'number' is not assignable to type 'string'."]);
     expect(lsp.calls.length).toBe(before + 1);
-    expect(lsp.calls.at(-1)).toEqual({ token: t.token, files: ["src/x.ts"] });
+    expect(lsp.calls.at(-1).files).toEqual(["src/x.ts"]);
+    // lsp-mcp saw an ephemeral least-privilege hop grant, not the caller's token.
+    expect(lsp.calls.at(-1).token).not.toBe(t.token);
     const ev = await req("GET", "/api/events", { token: t.token });
     const denied = ev.json.events.find((e) => e.type === "cog.denied");
     expect(denied.data.reasons[0]).toStartWith("diagnostic_error:src/x.ts:2:5:");
-    // Nothing was signed: no child grant, no deploy.
-    expect((await req("GET", "/api/grants", { token: t.token })).json.grants.length).toBe(1);
+    // Nothing was signed: the only child is the hop grant, already revoked; no deploy.
+    const grants = (await req("GET", "/api/grants", { token: t.token })).json.grants;
+    expect(grants.filter((g) => g.status === "active").length).toBe(1);
+    const hop = grants.find((g) => g.parent === t.grantId);
+    expect(hop.status).toBe("revoked");
+    expect(hop.caps).toEqual(["lsp.diagnose"]);
+    expect(hop.sub).toBe("tenant:root:lsp");
     expect((await req("GET", "/api/deploys", { token: t.token })).json.deploys.length).toBe(0);
   });
 
@@ -853,8 +860,10 @@ describe("9. diagnostics gate (lsp-mcp, 0.3.2)", () => {
     expect(ev({ grants: [grant(["code.write"])], deploys: [] })).toEqual(["code_write_requires_files"]);
     expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN })).toEqual(["diagnostics_missing"]);
     expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: "nope", files: [] } })).toEqual(["diagnostics_stale"]);
-    const h = sha256Hex(Buffer.concat([Buffer.from("src/ok.ts\0"), Buffer.from(CLEAN[0].content + "\0")]));
-    expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: h, files: [] } })).toEqual([]);
+    const h = overlayHash(CLEAN);
+    // A result that lists no file diagnosed nothing: code.write refuses it.
+    expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: h, files: [] } })).toEqual(["file_not_diagnosed:src/ok.ts"]);
+    expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: h, files: [{ path: "src/ok.ts", diagnostics: [] }] } })).toEqual([]);
     expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: h, files: [{ path: "src/ok.ts", diagnostics: [{ severity: "error", line: 0, col: 2, message: "boom\nmore" }] }] } }))
       .toEqual(["diagnostic_error:src/ok.ts:1:3:boom"]);
     expect(ev({ grants: [grant(["code.write"])], deploys: [], files: CLEAN, diagnostics: { filesSha256: h, files: [{ path: "src/ok.ts", diagnostics: [{ severity: "warning", line: 0, col: 2, message: "meh" }] }] } })).toEqual([]);
@@ -879,7 +888,8 @@ describe("9. diagnostics gate (lsp-mcp, 0.3.2)", () => {
     expect((await req("POST", "/api/grants/settle", { token: c.json.token, body: {} })).json.error).toBe("nothing_to_settle");
     expect((await req("POST", "/api/grants/settle", { body: { calls: 1 } })).status).toBe(401);
     const led = await req("GET", "/api/ledger", { token: t.token });
-    expect(led.json.ledger.filter((l) => l.kind === "settle" && l.grant_id === c.json.id).map((l) => l.ref)).toEqual(["self", "lsp:diagnose"]);
+    expect(led.json.ledger.filter((l) => l.kind === "self-settle" && l.grant_id === c.json.id).map((l) => l.ref)).toEqual(["self", "lsp:diagnose"]);
+    expect(led.json.ledger.filter((l) => l.kind === "settle" && l.grant_id === c.json.id).length).toBe(0);
   });
 });
 
@@ -912,9 +922,11 @@ describe("10. diagnostics gate — binding, no side doors, settle in the loop", 
     const ev = await req("GET", "/api/events", { token: t.token });
     expect(ev.json.events.find((e) => e.type === "cog.executed").data.filesSha256).toBe(r.json.diagnostics.filesSha256);
     const led = await req("GET", "/api/ledger", { token: t.token });
-    const settle = led.json.ledger.find((l) => l.kind === "settle" && l.ref === "lsp:diagnose");
-    expect(settle.grant_id).toBe(t.grantId);
+    const settle = led.json.ledger.find((l) => l.kind === "self-settle" && l.ref === "lsp:diagnose");
+    expect(settle.parent).toBe(t.grantId); // charged on the ephemeral hop grant, reserved from the caller
     expect(settle.calls).toBe(1);
+    const hop = (await req("GET", "/api/grants", { token: t.token })).json.grants.find((g) => g.id === settle.grant_id);
+    expect(hop.status).toBe("revoked");
     // and the grant token itself carries no hash-free code.write
     const v = await req("GET", "/api/grants/verify", { token: r.json.grants.writer.token });
     expect(v.json.scope.code.filesSha256).toMatch(/^[0-9a-f]{64}$/);
@@ -925,7 +937,7 @@ describe("10. diagnostics gate — binding, no side doors, settle in the loop", 
     const r = await exec(t, { grants: [writer], deploys: [], files: BROKEN });
     expect(r.status).toBe(403);
     expect(r.json.detail[0]).toStartWith("diagnostic_error:src/x.ts:2:5:");
-    expect((await req("GET", "/api/grants", { token: t.token })).json.grants.length).toBe(1);
+    expect((await req("GET", "/api/grants", { token: t.token })).json.grants.filter((g) => g.status === "active").length).toBe(1);
   });
 
   test("no files + forged diagnostics: nothing is reflected back as if the runtime produced it", async () => {
@@ -948,7 +960,7 @@ describe("10. diagnostics gate — binding, no side doors, settle in the loop", 
       lsp.mode = "ok";
       delete process.env.LSP_MCP_TIMEOUT_MS;
     }
-    expect((await req("GET", "/api/grants", { token: t.token })).json.grants.length).toBe(1);
+    expect((await req("GET", "/api/grants", { token: t.token })).json.grants.filter((g) => g.status === "active").length).toBe(1);
     expect(mod.default.idleTimeout).toBe(255);
   });
 
@@ -974,4 +986,108 @@ describe("10. diagnostics gate — binding, no side doors, settle in the loop", 
   });
 
   const exec = (t, proposal) => req("POST", "/api/cog/execute", { token: t.token, body: { proposal } });
+});
+
+// ------------------------------------------------------------------------------------
+// 0.3.2 refute round: the canon is injective, the hop is least-privilege, self-settle is calls only.
+describe("11. diagnostics gate — refute round", () => {
+  const CLEAN = [{ path: "src/ok.ts", content: "export const n: number = 1;\n" }];
+  const writer = { key: "writer", sub: "agent:writer", caps: ["code.write", "memory.read"], ttlSec: 600, budget: { usd_cents: 0, calls: 5, deploys: 0 } };
+  const exec = (t, proposal) => req("POST", "/api/cog/execute", { token: t.token, body: { proposal } });
+
+  test("NUL in content cannot fake a file boundary: refused before lsp-mcp, and the canon is length-prefixed", async () => {
+    const t = await newTenant("canon");
+    const before = lsp.calls.length;
+    const r = await exec(t, { grants: [writer], deploys: [], files: [{ path: "a.ts", content: "// ok\0evil.ts\0export const pwn = 1;" }] });
+    expect(r.status).toBe(403);
+    expect(r.json.detail).toEqual(["bad_file_entry:a.ts"]);
+    expect(lsp.calls.length).toBe(before);
+    expect(overlayHash([{ path: "a.ts", content: "// ok" }, { path: "evil.ts", content: "export const pwn = 1;" }]))
+      .not.toBe(overlayHash([{ path: "a.ts", content: "// ok\0evil.ts\0export const pwn = 1;" }]));
+    // Path charset is the same as lsp-mcp's.
+    const r2 = await exec(t, { grants: [writer], deploys: [], files: [{ path: 'x"]#[path="/etc/passwd"].rs', content: "" }] });
+    expect(r2.json.detail[0]).toStartWith("bad_path:");
+  });
+
+  test("code.write: a file no backend diagnosed cannot ride on a clean attestation", async () => {
+    const t = await newTenant("undiagnosed");
+    // The fake lsp-mcp reports only what it was sent; here it reports both, so make one report nothing.
+    const r = await exec(t, { grants: [writer], deploys: [], files: [...CLEAN, { path: "notes.md", content: "# hi" }] });
+    // fake returns a diagnostics array for every file, so this signs; the pure check is what refuses an omission:
+    expect(r.status).toBe(200);
+    const h = overlayHash([...CLEAN, { path: "notes.md", content: "# hi" }].sort((a, b) => (a.path < b.path ? -1 : 1)));
+    const tenant = { id: "t", status: "active", tier: "starter", allowed_targets: {} };
+    const ev = mod.gatehouseEvaluate(tenant, null, {
+      grants: [writer], deploys: [], files: [...CLEAN, { path: "notes.md", content: "# hi" }],
+      diagnostics: { filesSha256: h, files: [{ path: "src/ok.ts", diagnostics: [] }] },
+    });
+    expect(ev.reasons).toEqual(["file_not_diagnosed:notes.md"]);
+  });
+
+  test("the hop grant is least privilege and short: lsp.diagnose only, one call, revoked after; the caller keeps its budget minus one", async () => {
+    const t = await newTenant("hop");
+    const before = (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining;
+    const r = await exec(t, { grants: [writer], deploys: [], files: CLEAN });
+    expect(r.status).toBe(200);
+    const grants = (await req("GET", "/api/grants", { token: t.token })).json.grants;
+    const hop = grants.find((g) => g.sub === "tenant:root:lsp");
+    expect(hop.status).toBe("revoked");
+    expect(hop.caps).toEqual(["lsp.diagnose"]);
+    expect(hop.budget).toEqual({ usd_cents: 0, calls: 1, deploys: 0 });
+    expect(hop.exp - Math.floor(Date.now() / 1000)).toBeLessThanOrEqual(300);
+    const after = (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining;
+    // one call for the hop, plus the writer grant's own reserve (5 calls)
+    expect(before.calls - after.calls).toBe(1 + 5);
+    expect(before.usd_cents - after.usd_cents).toBe(0);
+  });
+
+  test("a caller that cannot mint the hop presents its own token (still gated, still works)", async () => {
+    const t = await newTenant("nohop");
+    const c = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:solo", caps: ["cog.execute", "lsp.diagnose", "memory.read"], ttlSec: 600, budget: { calls: 10 } } });
+    expect(c.status).toBe(201);
+    const r = await req("POST", "/api/cog/execute", { token: c.json.token, body: { proposal: { grants: [], deploys: [], files: CLEAN } } });
+    expect(r.status).toBe(200);
+    expect(lsp.calls.at(-1).token).toBe(c.json.token);
+  });
+
+  test("LSP_MCP_URL must be https or private: an http public URL never receives a token", async () => {
+    const t = await newTenant("insecure");
+    const url = process.env.LSP_MCP_URL;
+    process.env.LSP_MCP_URL = "http://example.com";
+    const before = blockedFetches.length;
+    try {
+      const r = await exec(t, { grants: [writer], deploys: [], files: CLEAN });
+      expect(r.status).toBe(403);
+      expect(r.json.detail).toEqual(["diagnostics_unavailable:insecure_url"]);
+    } finally { process.env.LSP_MCP_URL = url; }
+    expect(blockedFetches.length).toBe(before);
+  });
+
+  test("self-settle is calls only and lands as kind self-settle, never as a deploy charge", async () => {
+    const t = await newTenant("selfsettle");
+    const bad = await req("POST", "/api/grants/settle", { token: t.token, body: { calls: 1, usd_cents: 25, deploys: 1, ref: "dp_a1b2c3d4e5f6", note: "deploy t-abc123-probe-1" } });
+    expect(bad.status).toBe(400);
+    expect(bad.json.error).toBe("calls_only");
+    const ok = await req("POST", "/api/grants/settle", { token: t.token, body: { calls: 1, ref: "dp_a1b2c3d4e5f6", note: "deploy t-abc123-probe-1" } });
+    expect(ok.status).toBe(200);
+    const led = await req("GET", "/api/ledger", { token: t.token });
+    const row = led.json.ledger.find((l) => l.ref === "dp_a1b2c3d4e5f6");
+    expect(row.kind).toBe("self-settle");
+    expect(row.usd_cents).toBe(0);
+    expect(row.deploys).toBe(0);
+  });
+
+  test("the calls clamp never rescues a usd/deploys shortfall: that stays a clean refusal with nothing issued", async () => {
+    const t = await newTenant("noclamp");
+    const tight = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:tight", caps: ["grant.issue", "cog.plan", "cog.execute", "lsp.diagnose", "deploy.worker", "worker.status", "memory.read", "memory.write"], ttlSec: 600, budget: { usd_cents: 100, calls: 20, deploys: 0 } } });
+    expect(tight.status).toBe(201);
+    const p = await req("POST", "/api/cog/plan", { token: tight.json.token, body: { intent: "send tip alerts to discord" } });
+    const proposal = { ...p.json.proposal, files: CLEAN };
+    proposal.grants[0].budget.deploys = 1; // asks for a deploy the caller cannot fund
+    const r = await req("POST", "/api/cog/execute", { token: tight.json.token, body: { proposal } });
+    expect(r.status).toBe(403);
+    expect(r.json).toEqual({ error: "attenuation_violation", detail: ["budget_exceeds_parent_remaining"] });
+    const mine = (await req("GET", "/api/grants", { token: tight.json.token })).json.grants;
+    expect(mine.filter((g) => g.status === "active").length).toBe(1);
+  });
 });

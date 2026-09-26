@@ -59,9 +59,12 @@ globalThis.fetch = async (input, init) => {
 // lsp.diagnose, and returns diagnostics bound to the overlay hash. Content that
 // contains "BROKEN" gets an error, "WARN" a warning. `lsp.mode` flips failure modes.
 export const lsp = { mode: "ok", calls: [] };
-const overlayHash = (files) => {
+/** The overlay canon (mirrors src/policy.js overlayHash and lsp-mcp's, length-prefixed). */
+export const overlayHash = (files) => {
   const h = createHash("sha256");
-  for (const f of [...files].sort((a, b) => (a.path < b.path ? -1 : 1))) h.update(f.path).update("\0").update(f.content).update("\0");
+  h.update("overlay/v2\n");
+  for (const f of [...files].sort((a, b) => (a.path < b.path ? -1 : 1)))
+    h.update(`${Buffer.byteLength(f.path, "utf8")}:`).update(f.path).update(`\n${Buffer.byteLength(f.content, "utf8")}:`).update(f.content).update("\n");
   return h.digest("hex");
 };
 const lspServer = Bun.serve({

@@ -4,7 +4,7 @@ import { env } from "./config.js";
 import { HttpError, parseJson } from "./util.js";
 import { getGrant, recordEvent, sql } from "./db.js";
 import { gatehouseEvaluate, normalizeOverlay, normalizeUsage, remainingBudget, tenantWorkerPrefix, TIERS } from "./policy.js";
-import { issueChildGrant } from "./grants.js";
+import { issueChildGrant, revokeGrantTree } from "./grants.js";
 import { searchMemories, writeMemory } from "./memory.js";
 import { deployWorker, TEMPLATES } from "./railway.js";
 
@@ -194,11 +194,25 @@ export async function cogPlan(e, t, a) {
 // Nothing the caller attached as `diagnostics` is trusted: this is the only source.
 export function lspTimeoutMs() {
   let e = Number(env.LSP_MCP_TIMEOUT_MS);
-  return e > 0 && e <= 240000 ? Math.floor(e) : 120000;
+  return e > 0 ? Math.min(Math.floor(e), 240000) : 120000;
+}
+// A grant token only ever travels to lsp-mcp over TLS or the private network.
+function lspMcpUrl() {
+  let e = (env.LSP_MCP_URL || "").replace(/\/$/, "");
+  if (!e) throw new HttpError(503, "diagnostics_unavailable", { needs: "LSP_MCP_URL" });
+  let t;
+  try {
+    t = new URL(e);
+  } catch {
+    throw new HttpError(503, "diagnostics_unavailable", { lsp: "bad_url" });
+  }
+  let a = t.hostname;
+  if (t.protocol !== "https:" && !(a === "127.0.0.1" || a === "localhost" || a.endsWith(".railway.internal")))
+    throw new HttpError(503, "diagnostics_unavailable", { lsp: "insecure_url" });
+  return e;
 }
 export async function diagnoseProposalFiles(e, t) {
-  let a = (env.LSP_MCP_URL || "").replace(/\/$/, "");
-  if (!a) throw new HttpError(503, "diagnostics_unavailable", { needs: "LSP_MCP_URL" });
+  let a = lspMcpUrl();
   let n, r;
   try {
     ((n = await fetch(`${a}/mcp`, {
@@ -251,10 +265,35 @@ export async function cogExecute(e, t, a) {
   t = proposal;
   let n;
   if (Array.isArray(t.files) && t.files.length) {
-    let d;
+    let d,
+      remBefore = remainingBudget(e.row),
+      hop = null;
     try {
       let f = normalizeOverlay(t.files);
-      d = await diagnoseProposalFiles(f, e.token);
+      // Least privilege for the hop: present lsp-mcp an ephemeral child grant
+      // (lsp.diagnose only, one call, 5 minutes) when the caller can mint one;
+      // otherwise the caller's own token. Revoked right after, whatever happens.
+      if (parseJson(e.row.caps).includes("grant.issue") && parseJson(e.row.caps).includes("lsp.diagnose"))
+        try {
+          hop = await issueChildGrant(
+            e.row,
+            {
+              sub: `${e.row.sub}:lsp`.slice(0, 80),
+              caps: ["lsp.diagnose"],
+              ttlSec: 300,
+              budget: { usd_cents: 0, calls: 1, deploys: 0 },
+              scope: { memory: { partitions: [] } },
+            },
+            e.row.sub,
+          );
+        } catch {
+          hop = null;
+        }
+      try {
+        d = await diagnoseProposalFiles(f, hop ? hop.token : e.token);
+      } finally {
+        if (hop) await revokeGrantTree(hop.row.id, "lsp hop done", e.row.sub).catch(() => {});
+      }
       t = { ...t, files: f, diagnostics: d };
     } catch (f) {
       let g = f instanceof HttpError ? f : new HttpError(500, "diagnostics_unavailable"),
@@ -277,19 +316,16 @@ export async function cogExecute(e, t, a) {
         e.tenant.id,
         e.row.sub,
       );
-    // lsp-mcp charged one call against the caller's grant while we waited; a plan
-    // budgeted against the pre-charge remaining would now overshoot by one. Clamp.
+    // The hop cost the caller `calls` while we waited. A plan whose grants fitted
+    // the pre-charge remaining is nudged down by exactly that delta, on that one
+    // dimension only; every other shortfall stays a refusal (attenuation 402/403).
     let fresh = await getGrant(e.row.id),
-      rem = fresh ? remainingBudget(fresh) : null;
-    if (rem)
-      t.grants = (Array.isArray(t.grants) ? t.grants : []).map((g) => ({
-        ...g,
-        budget: {
-          usd_cents: Math.min(normalizeUsage(g.budget).usd_cents, Math.max(0, rem.usd_cents)),
-          calls: Math.min(normalizeUsage(g.budget).calls, Math.max(0, rem.calls)),
-          deploys: Math.min(normalizeUsage(g.budget).deploys, Math.max(0, rem.deploys)),
-        },
-      }));
+      remAfter = fresh ? remainingBudget(fresh) : null;
+    if (remAfter && Array.isArray(t.grants))
+      t.grants = t.grants.map((g) => {
+        let b = normalizeUsage(g?.budget);
+        return b.calls > remAfter.calls && b.calls <= remBefore.calls ? { ...g, budget: { ...b, calls: Math.max(0, remAfter.calls) } } : g;
+      });
   }
   n = gatehouseEvaluate(e.tenant, e.row, t);
   if (!n.ok)

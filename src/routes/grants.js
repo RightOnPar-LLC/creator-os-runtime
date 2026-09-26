@@ -36,10 +36,13 @@ app.post("/api/grants/settle", requireGrant(null), async (e) => {
       deploys: a.deploys,
     }),
     r = String(a.ref ?? "self");
-  if (n.usd_cents + n.calls + n.deploys === 0) throw new HttpError(400, "nothing_to_settle");
+  if (n.calls === 0) throw new HttpError(400, "nothing_to_settle");
+  // Self-settle meters CALLS only. Money and deploys are charged by the runtime's own
+  // executors; a holder writing those into the ledger would be bookkeeping fiction.
+  if (n.usd_cents !== 0 || n.deploys !== 0) throw new HttpError(400, "calls_only");
   if (!/^[a-z0-9:_.-]{1,120}$/i.test(r)) throw new HttpError(400, "bad_ref");
   return (
-    await settleGrantUsage(t.row.id, n, r, String(a.note || "settled by holder").slice(0, 200)),
+    await settleGrantUsage(t.row.id, n, r, String(a.note || "settled by holder").slice(0, 200), "self-settle"),
     e.json({
       ok: !0,
       settled: n,

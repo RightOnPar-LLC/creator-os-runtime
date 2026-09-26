@@ -223,7 +223,10 @@ export async function revokeGrantTree(e, t, a) {
   }
   return n;
 }
-export async function settleGrantUsage(e, t, a, n) {
+// `k` is the ledger kind: 'settle' for charges the runtime itself makes (deploys),
+// 'self-settle' for a holder settling its own grant via POST /api/grants/settle,
+// so the two can never be confused in the ledger.
+export async function settleGrantUsage(e, t, a, n, k = "settle") {
   await sql.begin(async (r) => {
     let s = (await r`SELECT * FROM grants WHERE id = ${e} FOR UPDATE`)[0];
     if (!s || s.status !== "active")
@@ -236,7 +239,7 @@ export async function settleGrantUsage(e, t, a, n) {
       });
     (await r`UPDATE grants SET settled = ${addUsage(normalizeUsage(parseJson(s.settled)), t)}::jsonb WHERE id = ${e}`,
       await r`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
-      VALUES (${s.tenant}, ${e}, ${s.parent}, 'settle', ${t.usd_cents}, ${t.calls}, ${t.deploys}, ${a}, ${n})`);
+      VALUES (${s.tenant}, ${e}, ${s.parent}, ${k}, ${t.usd_cents}, ${t.calls}, ${t.deploys}, ${a}, ${n})`);
   });
 }
 // Postgres-backed (fixed 60s window keyed by grant id), not a process-local
