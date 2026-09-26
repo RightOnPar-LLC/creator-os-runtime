@@ -99,10 +99,26 @@ with `diagnostics_unavailable:…` / `diagnostics_refused:…`. Never waved thro
 A proposal without `files` is the pre-0.3.2 flow, untouched. `code.write` without
 `files` is refused (`code_write_requires_files`).
 
+**What is actually bound.** `code.write` is issuable ONLY through `cogExecute`:
+`issueChildGrant` requires a runtime-fetched diagnostics attestation for that cap
+(`attenuationViolations` → `code_write_requires_diagnostics` on the direct REST and MCP
+grant routes), and the issued grant carries `scope.code.filesSha256`, the hash of the
+diagnosed overlay. Whatever honours `code.write` must check that the bytes it writes are
+that overlay. `cog.executed` events record the same hash. Deploys via the COG with
+`files` are gated the same way; deploys of template images without `files` (the direct
+`/api/deploys` route) carry no source and are not, which is their pre-0.3.2 behaviour.
+
+Cost: one gated execute spends three rate-limit slots on the caller's grant (the route,
+lsp-mcp's verify, lsp-mcp's settle) and one `calls` of budget; grant budgets in the
+proposal are clamped to what remains after that charge. The caller's own token is what
+lsp-mcp sees (first-party, held in memory, never logged); a least-privilege ephemeral
+child grant for that hop is a follow-up.
+
 New caps: `code.write`, `lsp.diagnose`, `lsp.hover`, `lsp.definition`, `lsp.references`.
 Caps are snapshotted into a grant row at mint time, so **root grants minted before
 0.3.2 do not carry them**; re-mint with the admin route `POST /api/tenants/:id/root-grant`
 (an ACL change — DW-signed, never automatic). New tenants get them from the start.
 
 Config: `LSP_MCP_URL` (no secret; lsp-mcp holds none either), `LSP_MCP_TIMEOUT_MS`
-(default 150000 — a Rust `cargo check` can take a while).
+(default 120000, max 240000 — a Rust `cargo check` can take a while; the server's
+`idleTimeout` is 255 s so the socket outlives the wait).

@@ -2,8 +2,8 @@
 import { randomBytes } from "crypto";
 import { env } from "./config.js";
 import { HttpError, parseJson } from "./util.js";
-import { recordEvent, sql } from "./db.js";
-import { gatehouseEvaluate, normalizeOverlay, remainingBudget, tenantWorkerPrefix, TIERS } from "./policy.js";
+import { getGrant, recordEvent, sql } from "./db.js";
+import { gatehouseEvaluate, normalizeOverlay, normalizeUsage, remainingBudget, tenantWorkerPrefix, TIERS } from "./policy.js";
 import { issueChildGrant } from "./grants.js";
 import { searchMemories, writeMemory } from "./memory.js";
 import { deployWorker, TEMPLATES } from "./railway.js";
@@ -192,6 +192,10 @@ export async function cogPlan(e, t, a) {
 // 0.3.2: ask lsp-mcp for diagnostics over the proposal's files, presenting the
 // CALLER's grant (lsp-mcp introspects it here; the caller must hold lsp.diagnose).
 // Nothing the caller attached as `diagnostics` is trusted: this is the only source.
+export function lspTimeoutMs() {
+  let e = Number(env.LSP_MCP_TIMEOUT_MS);
+  return e > 0 && e <= 240000 ? Math.floor(e) : 120000;
+}
 export async function diagnoseProposalFiles(e, t) {
   let a = (env.LSP_MCP_URL || "").replace(/\/$/, "");
   if (!a) throw new HttpError(503, "diagnostics_unavailable", { needs: "LSP_MCP_URL" });
@@ -214,7 +218,7 @@ export async function diagnoseProposalFiles(e, t) {
           },
         },
       }),
-      signal: AbortSignal.timeout(Number(env.LSP_MCP_TIMEOUT_MS || 150000)),
+      signal: AbortSignal.timeout(lspTimeoutMs()),
     })),
       (r = await n.json()));
   } catch {
@@ -241,16 +245,21 @@ async function denyCog(e, t) {
   return new HttpError(403, "gatehouse_denied", t);
 }
 export async function cogExecute(e, t, a) {
+  // Whatever the caller attached as `diagnostics` is dropped on entry: the only
+  // diagnostics this function ever sees are the ones it fetches itself.
+  let { diagnostics: _dropped, ...proposal } = t && typeof t === "object" ? t : {};
+  t = proposal;
   let n;
-  if (Array.isArray(t?.files) && t.files.length) {
+  if (Array.isArray(t.files) && t.files.length) {
     let d;
     try {
       let f = normalizeOverlay(t.files);
       d = await diagnoseProposalFiles(f, e.token);
       t = { ...t, files: f, diagnostics: d };
     } catch (f) {
-      let g = f instanceof HttpError ? f : new HttpError(500, "diagnostics_unavailable");
-      throw await denyCog(e, [`${g.code}:${g.detail?.lsp || g.detail?.needs || g.detail?.path || g.code}`]);
+      let g = f instanceof HttpError ? f : new HttpError(500, "diagnostics_unavailable"),
+        h = g.detail?.lsp || g.detail?.needs || g.detail?.path || (g.detail?.max !== void 0 ? `max=${g.detail.max}` : g.code);
+      throw await denyCog(e, [`${g.code}:${String(h).slice(0, 200)}`]);
     }
     if (d.summary?.warnings)
       await recordEvent(
@@ -258,11 +267,29 @@ export async function cogExecute(e, t, a) {
         {
           filesSha256: d.filesSha256,
           summary: d.summary,
-          warnings: d.files.flatMap((f) => (f.diagnostics || []).filter((g) => g.severity === "warning").slice(0, 20).map((g) => `${f.path}:${g.line + 1}:${g.col + 1}:${String(g.message).split("\n")[0].slice(0, 160)}`)),
+          warnings: d.files.flatMap((f) =>
+            (Array.isArray(f?.diagnostics) ? f.diagnostics : [])
+              .filter((g) => g && typeof g === "object" && g.severity === "warning")
+              .slice(0, 20)
+              .map((g) => `${f.path}:${(+g.line | 0) + 1}:${(+g.col | 0) + 1}:${String(g.message ?? "").split("\n")[0].slice(0, 160)}`),
+          ),
         },
         e.tenant.id,
         e.row.sub,
       );
+    // lsp-mcp charged one call against the caller's grant while we waited; a plan
+    // budgeted against the pre-charge remaining would now overshoot by one. Clamp.
+    let fresh = await getGrant(e.row.id),
+      rem = fresh ? remainingBudget(fresh) : null;
+    if (rem)
+      t.grants = (Array.isArray(t.grants) ? t.grants : []).map((g) => ({
+        ...g,
+        budget: {
+          usd_cents: Math.min(normalizeUsage(g.budget).usd_cents, Math.max(0, rem.usd_cents)),
+          calls: Math.min(normalizeUsage(g.budget).calls, Math.max(0, rem.calls)),
+          deploys: Math.min(normalizeUsage(g.budget).deploys, Math.max(0, rem.deploys)),
+        },
+      }));
   }
   n = gatehouseEvaluate(e.tenant, e.row, t);
   if (!n.ok)
@@ -283,7 +310,12 @@ export async function cogExecute(e, t, a) {
       throw new HttpError(403, "missing_cap", {
         need: "grant.issue",
       });
-    let o = await issueChildGrant(e.row, i, e.row.sub);
+    let o = await issueChildGrant(
+      e.row,
+      i,
+      e.row.sub,
+      t.diagnostics && (i.caps || []).includes("code.write") ? { codeWrite: { filesSha256: t.diagnostics.filesSha256 } } : {},
+    );
     r[i.key || o.row.id] = {
       id: o.row.id,
       token: o.token,
@@ -327,6 +359,7 @@ export async function cogExecute(e, t, a) {
         grants: Object.values(r).map((i) => i.id),
         deploys: s.map((i) => i.id),
         confirm: !!a,
+        filesSha256: t.diagnostics?.filesSha256 ?? null,
       },
       e.tenant.id,
       e.row.sub,

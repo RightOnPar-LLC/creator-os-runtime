@@ -81,7 +81,16 @@ const lspServer = Bun.serve({
     const caps = (await v.json()).caps || [];
     if (!caps.includes("lsp.diagnose")) return rpcErr(403, "missing_cap", { need: "lsp.diagnose" });
     if (lsp.mode === "broke") return rpcErr(402, "budget_exhausted");
+    if (lsp.mode === "slow") await new Promise((r) => setTimeout(r, 2500));
     const files = body.params?.arguments?.files || [];
+    // Charge the call exactly as the real gate does (verify, then settle with the same token).
+    const st = await realFetch(`${BASE}/api/grants/settle`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ calls: 1, usd_cents: 0, deploys: 0, ref: "lsp:diagnose", note: `lsp.diagnose ${files.length} file(s)` }),
+    });
+    if (st.status === 402) return rpcErr(402, "budget_exhausted");
+    if (st.status !== 200) return rpcErr(403, (await st.json()).error || "settle_failed");
     lsp.calls.push({ token, files: files.map((f) => f.path) });
     const out = files.map((f) => ({
       path: f.path,

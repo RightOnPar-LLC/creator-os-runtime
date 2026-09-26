@@ -28,15 +28,18 @@ app.get("/api/grants/verify", requireGrant(null), (e) => {
 // with the same token. 402 when the budget is gone; only the caller's budget moves.
 app.post("/api/grants/settle", requireGrant(null), async (e) => {
   let t = e.get("auth"),
-    a = await readJsonBody(e),
-    n = normalizeUsage({
+    a = await readJsonBody(e);
+  if (!a || typeof a !== "object" || Array.isArray(a)) throw new HttpError(400, "bad_body");
+  let n = normalizeUsage({
       usd_cents: a.usd_cents,
       calls: a.calls,
       deploys: a.deploys,
-    });
+    }),
+    r = String(a.ref ?? "self");
   if (n.usd_cents + n.calls + n.deploys === 0) throw new HttpError(400, "nothing_to_settle");
+  if (!/^[a-z0-9:_.-]{1,120}$/i.test(r)) throw new HttpError(400, "bad_ref");
   return (
-    await settleGrantUsage(t.row.id, n, String(a.ref || "self").slice(0, 120), String(a.note || "settled by holder").slice(0, 200)),
+    await settleGrantUsage(t.row.id, n, r, String(a.note || "settled by holder").slice(0, 200)),
     e.json({
       ok: !0,
       settled: n,

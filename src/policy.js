@@ -114,11 +114,16 @@ export var clampConstraints = (e, t) => ({
   requireDryRun: e?.requireDryRun === !1 ? t.requireDryRun && !1 : !0,
 });
 var isSubset = (e, t) => (e || []).every((a) => (t || []).includes(a));
-export function attenuationViolations(e, t, a) {
+export function attenuationViolations(e, t, a, w = {}) {
   let n = [];
   try {
     let r = TIERS[a];
     if (!r) return ["unknown_tier"];
+    // 0.3.2: code.write is never issued on request alone. The issuer must carry
+    // the runtime-fetched diagnostics hash (only cogExecute has one), so the
+    // direct grant routes cannot mint a code.write grant with no diagnostics.
+    if ((t.caps || []).includes("code.write") && !/^[0-9a-f]{64}$/.test(String(w?.codeWrite?.filesSha256 || "")))
+      n.push("code_write_requires_diagnostics");
     let s = parseJson(e.caps),
       i = parseJson(e.scope),
       o = parseJson(e.constraints);

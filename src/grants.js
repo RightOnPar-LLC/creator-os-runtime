@@ -84,7 +84,11 @@ export async function mintRootGrant(e, t = "tenant:root") {
     }
   );
 }
-export async function issueChildGrant(e, t, a) {
+// o.codeWrite = { filesSha256 }: the diagnostics attestation cogExecute fetched. It is
+// the only way a code.write grant is issued, and the hash is bound into the grant's
+// scope (scope.code.filesSha256) so whatever honours code.write can check that the
+// bytes being written are the bytes that were diagnosed.
+export async function issueChildGrant(e, t, a, w = {}) {
   let n = await getTenant(e.tenant);
   if (!n)
     throw Object.assign(Error("tenant_missing"), {
@@ -107,6 +111,7 @@ export async function issueChildGrant(e, t, a) {
       memory: {
         partitions: t.scope?.memory?.partitions ?? memoryPartitions(s),
       },
+      ...(w?.codeWrite?.filesSha256 ? { code: { filesSha256: String(w.codeWrite.filesSha256) } } : {}),
     },
     T = normalizeUsage(t.budget ?? zeroUsage()),
     R = clampConstraints(t.constraints ?? {}, i),
@@ -118,7 +123,7 @@ export async function issueChildGrant(e, t, a) {
       constraints: R,
       depth: Number(e.depth) + 1,
     },
-    B = attenuationViolations(e, S, n.tier);
+    B = attenuationViolations(e, S, n.tier, w);
   if (B.length)
     throw Object.assign(Error("attenuation_violation"), {
       status: 403,

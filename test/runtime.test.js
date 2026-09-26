@@ -882,3 +882,96 @@ describe("9. diagnostics gate (lsp-mcp, 0.3.2)", () => {
     expect(led.json.ledger.filter((l) => l.kind === "settle" && l.grant_id === c.json.id).map((l) => l.ref)).toEqual(["self", "lsp:diagnose"]);
   });
 });
+
+// ------------------------------------------------------------------------------------
+// 0.3.2 review round: the gate is a control, not a checkbox.
+describe("10. diagnostics gate — binding, no side doors, settle in the loop", () => {
+  const CLEAN = [{ path: "src/ok.ts", content: "export const n: number = 1;\n" }];
+  const BROKEN = [{ path: "src/x.ts", content: "let BROKEN: string = 1;\n" }];
+  const writer = { key: "writer", sub: "agent:writer", caps: ["code.write", "memory.read"], ttlSec: 600, budget: { usd_cents: 0, calls: 5, deploys: 0 } };
+
+  test("code.write cannot be issued through the direct grant routes (REST or MCP): no diagnostics, no grant", async () => {
+    const t = await newTenant("cw-direct");
+    const rest = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:sneak", caps: ["code.write"], ttlSec: 600 } });
+    expect(rest.status).toBe(403);
+    expect(rest.json).toEqual({ error: "attenuation_violation", detail: ["code_write_requires_diagnostics"] });
+    const m = await mcp(t.token, "tools/call", { name: "grant_issue", arguments: { sub: "agent:sneak", caps: ["code.write"], ttlSec: 600 } });
+    expect(m.status).toBe(403);
+    expect(m.json.error).toBe("attenuation_violation");
+    expect((await req("GET", "/api/grants", { token: t.token })).json.grants.length).toBe(1);
+  });
+
+  test("a code.write grant issued by the COG carries the diagnosed hash in scope.code; the event records it; the ledger shows lsp settled", async () => {
+    const t = await newTenant("cw-bound");
+    const r = await exec(t, { grants: [writer], deploys: [], files: CLEAN });
+    expect(r.status).toBe(200);
+    const id = r.json.grants.writer.id;
+    const g = await req("GET", `/api/grants/${id}`, { token: t.token });
+    expect(g.json.grant.scope.code).toEqual({ filesSha256: r.json.diagnostics.filesSha256 });
+    expect(g.json.grant.caps).toEqual(["code.write", "memory.read"]);
+    const ev = await req("GET", "/api/events", { token: t.token });
+    expect(ev.json.events.find((e) => e.type === "cog.executed").data.filesSha256).toBe(r.json.diagnostics.filesSha256);
+    const led = await req("GET", "/api/ledger", { token: t.token });
+    const settle = led.json.ledger.find((l) => l.kind === "settle" && l.ref === "lsp:diagnose");
+    expect(settle.grant_id).toBe(t.grantId);
+    expect(settle.calls).toBe(1);
+    // and the grant token itself carries no hash-free code.write
+    const v = await req("GET", "/api/grants/verify", { token: r.json.grants.writer.token });
+    expect(v.json.scope.code.filesSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("a code.write proposal with a broken file signs nothing", async () => {
+    const t = await newTenant("cw-broken");
+    const r = await exec(t, { grants: [writer], deploys: [], files: BROKEN });
+    expect(r.status).toBe(403);
+    expect(r.json.detail[0]).toStartWith("diagnostic_error:src/x.ts:2:5:");
+    expect((await req("GET", "/api/grants", { token: t.token })).json.grants.length).toBe(1);
+  });
+
+  test("no files + forged diagnostics: nothing is reflected back as if the runtime produced it", async () => {
+    const t = await newTenant("cw-reflect");
+    const p = await req("POST", "/api/cog/plan", { token: t.token, body: { intent: "send tip alerts to discord" } });
+    const r = await exec(t, { ...p.json.proposal, diagnostics: { filesSha256: "f".repeat(64), summary: { errors: 0 }, backend: "forged" } });
+    expect(r.status).toBe(200);
+    expect(r.json.diagnostics).toBeUndefined();
+  });
+
+  test("lsp-mcp slower than LSP_MCP_TIMEOUT_MS: refused as unavailable, no grant, no deploy", async () => {
+    const t = await newTenant("cw-slow");
+    lsp.mode = "slow";
+    process.env.LSP_MCP_TIMEOUT_MS = "600";
+    try {
+      const r = await exec(t, { grants: [writer], deploys: [], files: CLEAN });
+      expect(r.status).toBe(403);
+      expect(r.json).toEqual({ error: "gatehouse_denied", detail: ["diagnostics_unavailable:unreachable"] });
+    } finally {
+      lsp.mode = "ok";
+      delete process.env.LSP_MCP_TIMEOUT_MS;
+    }
+    expect((await req("GET", "/api/grants", { token: t.token })).json.grants.length).toBe(1);
+    expect(mod.default.idleTimeout).toBe(255);
+  });
+
+  test("a plan budgeted before the lsp charge still issues: budgets are clamped to what remains", async () => {
+    const t = await newTenant("cw-clamp");
+    // A tight caller grant: 3 calls. lsp-mcp takes 1; the child asks for 3.
+    const tight = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:tight", caps: ["grant.issue", "cog.execute", "lsp.diagnose", "memory.read"], ttlSec: 600, budget: { calls: 3 } } });
+    expect(tight.status).toBe(201);
+    const r = await req("POST", "/api/cog/execute", {
+      token: tight.json.token,
+      body: { proposal: { grants: [{ key: "m", sub: "agent:m", caps: ["memory.read"], ttlSec: 300, budget: { calls: 3 } }], deploys: [], files: CLEAN } },
+    });
+    expect(r.status).toBe(200);
+    const child = await req("GET", `/api/grants/${r.json.grants.m.id}`, { token: t.token });
+    expect(child.json.grant.budget.calls).toBe(2);
+  });
+
+  test("POST /api/grants/settle rejects non-object bodies and odd refs", async () => {
+    const t = await newTenant("settle-shape");
+    expect((await req("POST", "/api/grants/settle", { token: t.token, raw: "[1]", headers: { "content-type": "application/json" } })).json.error).toBe("bad_body");
+    expect((await req("POST", "/api/grants/settle", { token: t.token, raw: "1", headers: { "content-type": "application/json" } })).json.error).toBe("bad_body");
+    expect((await req("POST", "/api/grants/settle", { token: t.token, body: { calls: 1, ref: "dep_1 OR 1=1" } })).json.error).toBe("bad_ref");
+  });
+
+  const exec = (t, proposal) => req("POST", "/api/cog/execute", { token: t.token, body: { proposal } });
+});
