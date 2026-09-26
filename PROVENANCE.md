@@ -162,3 +162,14 @@ a revoked grant → 403. ALL GREEN.
 Housekeeping found on the way: the vault's `RUNTIME_ADMIN_KEY` did not match production
 (nor the Function, nor staging); it was refreshed in-process to the production value. The
 vault's `RAILWAY_TOKEN` is not authorized for this project (the Railway CLI login is).
+
+### 0.3.2 — the Function `runtime` too (2026-09-26 22:15Z, DW-approved)
+
+DW asked for the Function to follow. Deployed the same way as 0.3.1: `serviceInstanceUpdate`
+startCommand `./run.sh <base64 of live/runtime-0.3.2.bundle.js>` (125,029 chars, over the
+CLI's limit, under Railway's), then `serviceInstanceDeployV2` → deployment `9aee7837…`.
+`LSP_MCP_URL` was set on the service first (no redeploy) so one deploy carried both.
+https://runtime-production-9d95.up.railway.app/health → `0.3.2`, `armed.lspMcp true`,
+`source.sha256 2a305897…adb3b3` (93,765 bytes) — the same bytes as `runtime-svc`.
+Both services run the same bundle again. Known gap unchanged: the Function generates its
+own package.json with `hono: latest`; the repo and the Dockerfile service pin 4.13.9.
