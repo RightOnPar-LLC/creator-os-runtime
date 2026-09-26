@@ -2,13 +2,13 @@
 import { randomBytes } from "crypto";
 import { env } from "./config.js";
 import { HttpError, nowSec, parseJson, sha256Hex } from "./util.js";
-import { getGrant, getTenant, sql } from "./db.js";
+import { getGrant, getTenant, isOperatorLspCapsEnabled, sql } from "./db.js";
 import { remainingBudget, TIERS } from "./policy.js";
 import { issueChildGrant, mintRootGrant } from "./grants.js";
 
 export var OPERATOR_PROFILE = {
   sub: "agent:claude-operator",
-  caps: ["grant.issue", "grant.read", "cog.plan", "ledger.read"],
+  caps: ["grant.issue", "grant.read", "cog.plan", "ledger.read", "cog.execute", "lsp.diagnose"],
   usd: 5000,
   calls: 500,
   ttl: 604800,
@@ -91,18 +91,28 @@ export async function ensureRootGrant(e) {
     )[0] || (await mintRootGrant(e)).row
   );
 }
+// Caps a profile actually gets, filtered against the live operator_lsp_caps
+// toggle (default off, 2026-09-26). Only OPERATOR is ever filtered — every
+// other profile is untouched. Shared by the approval-screen preview and the
+// real grant mint so the two can never show/give different caps.
+export async function effectiveCaps(a) {
+  return a === OPERATOR_PROFILE && !(await isOperatorLspCapsEnabled())
+    ? a.caps.filter((c) => c !== "cog.execute" && c !== "lsp.diagnose")
+    : a.caps;
+}
 export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
   let n = await getGrant(e),
     r = n && (await getTenant(n.tenant));
   if (!n || n.status !== "active" || Number(n.exp) <= nowSec() || !r)
     throw new HttpError(400, "root_inactive");
   let s = remainingBudget(n),
-    i = Math.min(a.ttl, TIERS[r.tier].maxTtlSec, Number(n.exp) - nowSec(), t - nowSec());
+    i = Math.min(a.ttl, TIERS[r.tier].maxTtlSec, Number(n.exp) - nowSec(), t - nowSec()),
+    caps = await effectiveCaps(a);
   return issueChildGrant(
     n,
     {
       sub: a.sub,
-      caps: a.caps,
+      caps,
       ...(a.parts
         ? {
             scope: {
@@ -131,7 +141,7 @@ export var tokenResponse = (e, t, a = OPERATOR_PROFILE) => ({
   token_type: "Bearer",
   expires_in: Math.max(0, Number(e.row.exp) - nowSec()),
   refresh_token: t,
-  scope: a.caps.join(" "),
+  scope: (parseJson(e.row.caps) || a.caps).join(" "),
 });
 export async function mintRefreshToken(e, t, a, n, r) {
   let s = randomBytes(32).toString("base64url");
