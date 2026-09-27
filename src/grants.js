@@ -242,6 +242,43 @@ export async function settleGrantUsage(e, t, a, n, k = "settle") {
       VALUES (${s.tenant}, ${e}, ${s.parent}, ${k}, ${t.usd_cents}, ${t.calls}, ${t.deploys}, ${a}, ${n})`);
   });
 }
+// Release a child grant's UNSPENT reservation (budget - settled, the same amount
+// revokeGrantTree computes) back to its parent when it transitions active->expired.
+// The `RETURNING id` length guard is the idempotency lever: only the call that
+// actually flips the row releases, so a second sweep, the lazy verify path, and a
+// later revoke can never double-credit the parent. Mirrors revokeGrantTree's
+// release (same math, same 'release' ledger row).
+async function releaseExpiredGrant(tx, g) {
+  let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING id`;
+  if (flipped.length !== 1) return !1; // someone else already moved it (revoked/expired) — never double-release
+  if (!g.parent) return !0; // a root holds no reservation upward
+  let unspent = subtractUsage(normalizeUsage(parseJson(g.budget)), normalizeUsage(parseJson(g.settled))),
+    p = (await tx`SELECT reserved FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0];
+  if (p) {
+    let c = subtractUsage(normalizeUsage(parseJson(p.reserved)), unspent);
+    (await tx`UPDATE grants SET reserved = ${{
+      usd_cents: Math.max(0, c.usd_cents),
+      calls: Math.max(0, c.calls),
+      deploys: Math.max(0, c.deploys),
+    }}::jsonb WHERE id = ${g.parent}`,
+      await tx`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
+      VALUES (${g.tenant}, ${g.id}, ${g.parent}, 'release', ${unspent.usd_cents}, ${unspent.calls}, ${unspent.deploys}, ${g.id}, 'reservation released on expiry')`);
+  }
+  return !0;
+}
+// The periodic sweep that actually cures the drain: the dominant leak is ABANDONED
+// grants (guest/OAuth children that never present a token again), for which the
+// lazy release-on-verify below never fires. depth DESC releases a child before its
+// own parent is processed; FOR UPDATE SKIP LOCKED lets replicas sweep concurrently.
+export async function reapExpiredGrants({ limit = 500 } = {}) {
+  let ids = [];
+  await sql.begin(async (tx) => {
+    let rows = await tx`SELECT * FROM grants WHERE status='active' AND exp <= ${nowSec()} ORDER BY depth DESC LIMIT ${limit} FOR UPDATE SKIP LOCKED`;
+    for (let g of rows) if (await releaseExpiredGrant(tx, g)) ids.push(g.id);
+  });
+  if (ids.length) await recordEvent("grant.reaped", { ids }, null, "reaper");
+  return ids;
+}
 // Postgres-backed (fixed 60s window keyed by grant id), not a process-local
 // Map: the runtime scales to multiple replicas and a replica-local bucket let
 // each replica give the same grant its own fresh budget (2026-09-25 fix).
@@ -260,11 +297,16 @@ export async function verifyGrant(e, t, a, countRate = !0) {
     let n = parseGrantToken(e);
     if (!n) throw new HttpError(401, "bad_grant");
     let r = n.payload;
-    if (Number(r.exp) <= nowSec())
-      throw (
-        await sql`UPDATE grants SET status='expired' WHERE id=${r.id} AND status='active'`,
-        new HttpError(401, "grant_expired")
-      );
+    if (Number(r.exp) <= nowSec()) {
+      // lazy release: a re-presented expired token frees its reservation now, via
+      // the SAME helper the sweep uses (idempotent — the RETURNING guard means the
+      // sweep won't release it again).
+      await sql.begin(async (tx) => {
+        let g = (await tx`SELECT * FROM grants WHERE id = ${r.id} FOR UPDATE`)[0];
+        if (g) await releaseExpiredGrant(tx, g);
+      });
+      throw new HttpError(401, "grant_expired");
+    }
     let s = await getGrant(r.id);
     if (!s || s.status !== "active") throw new HttpError(401, "grant_revoked");
     let i = await getTenant(s.tenant);
