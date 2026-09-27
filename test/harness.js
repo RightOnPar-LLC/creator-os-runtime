@@ -122,7 +122,7 @@ for (const k of [
   "ANTHROPIC_API_KEY", "RAILWAY_API_TOKEN", "RAILWAY_OAUTH_CLIENT_ID", "RAILWAY_OAUTH_CLIENT_SECRET",
   "STRIPE_WEBHOOK_SECRET", "STRIPE_PRICE_MAP", "COG_BRIDGE_URL", "COG_BRIDGE_TOKEN", "COG_SYNC_TOKEN",
   "BRAIN_URL", "GRANT_SIGNING_KEY", "OAUTH_REDIRECT_HOSTS", "POSTGRES_URL", "PORT", "RUNTIME_MODE", "COG_MODEL",
-  "LSP_MCP_URL", "LSP_MCP_TIMEOUT_MS",
+  "LSP_MCP_URL", "LSP_MCP_TIMEOUT_MS", "REAP_INTERVAL_MS",
 ]) delete process.env[k];
 Object.assign(process.env, {
   LSP_MCP_URL: LSP_URL,
@@ -136,6 +136,10 @@ Object.assign(process.env, {
   BRAIN_WEBHOOK_SECRET: BRAIN_SECRET,
   PUBLIC_URL: BASE,
   RATE_LIMIT_PER_MIN: String(RATE_LIMIT),
+  // reaper background timer OFF under test: the PGlite pool is pinned to one
+  // connection, so an out-of-band sweep would contend with the test's own query.
+  // The suite drives the reaper deterministically via POST /api/admin/grants/reap.
+  REAP_INTERVAL_MS: "0",
 });
 
 export const mod = await import(pathToFileURL(entryPath).href);
