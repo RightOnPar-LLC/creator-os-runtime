@@ -1127,3 +1127,68 @@ describe("12. creator-worker deploy guard", () => {
     }
   });
 });
+
+describe("13. A2A Agent Card (Phase 1: /.well-known/agent.json)", () => {
+  const getCard = () => req("GET", "/.well-known/agent.json"); // NO token — discovery is keyless
+  // Import src modules DYNAMICALLY (after the harness has set env + booted the app), never at the
+  // test file's top level — a static import evaluates config.js before the harness sets env, which
+  // silently changes runtime config (e.g. the rate limit). Cached, so this is cheap.
+  const a2a = () => import("../src/a2a.js");
+  const mcpMod = () => import("../src/mcp.js");
+
+  test("AC#1: the card fetches with no auth, as application/json, cacheable", async () => {
+    const r = await getCard();
+    expect(r.status).toBe(200);
+    expect(String(r.headers.get("content-type") || "")).toContain("application/json");
+    expect(String(r.headers.get("cache-control") || "")).toContain("max-age");
+    expect(r.json.name).toBeTruthy();
+    expect(r.json.provider.organization).toBe("RightOnPar LLC");
+  });
+
+  test("AC#2: the card validates against the pinned A2A v1.0.1 contract", async () => {
+    const { validateAgentCard } = await a2a();
+    const r = await getCard();
+    expect(validateAgentCard(r.json)).toEqual([]);
+    // spot-check the v1.0.x shape: transport in supportedInterfaces, no top-level id/url
+    expect(Array.isArray(r.json.supportedInterfaces)).toBe(true);
+    expect(r.json.id).toBeUndefined();
+    expect(r.json.url).toBeUndefined();
+    expect(r.json.skills.every((s) => Array.isArray(s.tags) && s.tags.length > 0)).toBe(true); // tags REQUIRED
+  });
+
+  test("AC#3: every interface URL in the card is a live route (nothing listed is dead)", async () => {
+    const r = await getCard();
+    for (const iface of r.json.supportedInterfaces) {
+      const path = new URL(iface.url).pathname;
+      const probe = await req("GET", path); // no token; a live route answers (not 404)
+      expect(probe.status).not.toBe(404);
+    }
+  });
+
+  test("AC#4: the auth section matches the enforced reality", async () => {
+    // discovery is keyless (proven above); the interface it advertises (/mcp) is grant-gated:
+    // a POST with no grant is rejected, matching the card's grantBearer requirement.
+    const r = await getCard();
+    expect(r.json.securityRequirements[0].schemes.grantBearer).toBeDefined();
+    const gated = await req("POST", "/mcp", { body: { jsonrpc: "2.0", id: 1, method: "tools/list" } });
+    expect(gated.status).toBe(401);
+  });
+
+  test("AC#4b: drift — the card's skills are exactly the MCP tool registry", async () => {
+    const { MCP_TOOLS } = await mcpMod();
+    const r = await getCard();
+    const ids = r.json.skills.map((s) => s.id).sort();
+    const tools = MCP_TOOLS.map((t) => t.name).sort();
+    expect(ids).toEqual(tools);
+  });
+
+  test("AC#5: a stock A2A client can enumerate skills with no runtime-specific code", async () => {
+    const r = await getCard();
+    expect(r.json.skills.length).toBeGreaterThan(0);
+    for (const s of r.json.skills) {
+      expect(typeof s.id).toBe("string");
+      expect(typeof s.name).toBe("string");
+      expect(typeof s.description).toBe("string");
+    }
+  });
+});

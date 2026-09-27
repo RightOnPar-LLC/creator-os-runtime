@@ -5,6 +5,8 @@ import { parseGrantToken, signGrantToken, vaultDecrypt, vaultEncrypt, vaultKey }
 import { attenuationViolations, gatehouseEvaluate, zeroUsage } from "../policy.js";
 import { verifyTimestampedSignature } from "../webhooks.js";
 import { app, routeInventory } from "../http.js";
+import { MCP_TOOLS } from "../mcp.js";
+import { buildAgentCard, validateAgentCard } from "../a2a.js";
 
 app.get("/routes", (e) => {
   let t = routeInventory();
@@ -232,6 +234,21 @@ app.get("/selftest", async (e) => {
           count: i.length,
         }
       );
+    }),
+    a("A2A agent card validates against the pinned v1.0.1 contract", () => {
+      let v = validateAgentCard(buildAgentCard("https://selftest.local"));
+      return v.length === 0 || v;
+    }),
+    a("A2A card skills match the MCP tool registry (no drift)", () => {
+      let ids = buildAgentCard("https://selftest.local").skills.map((s) => s.id).sort(),
+        tools = MCP_TOOLS.map((t) => t.name).sort();
+      return JSON.stringify(ids) === JSON.stringify(tools) || { ids, tools };
+    }),
+    a("A2A card interface path is a live route", () => {
+      let iface = buildAgentCard("https://selftest.local").supportedInterfaces[0].url,
+        path = new URL(iface).pathname,
+        inv = routeInventory();
+      return inv.some((o) => o.path === path) || { path };
     }),
     a(
       "memory scope widening rejected",
