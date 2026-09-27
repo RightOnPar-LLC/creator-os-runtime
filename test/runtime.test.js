@@ -1923,3 +1923,96 @@ describe("20. A2A Agent Card (Phase 1: /.well-known/agent.json)", () => {
     }
   });
 });
+
+describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
+  const remainingOf = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
+  const meshReceipt = (obj) => { const m = JSON.stringify(obj); return req("POST", "/webhooks/mesh", { raw: m, headers: { "x-mesh-signature": hmacHex(MESH_SECRET, m) } }); };
+  const openEscrow = (token, over = {}) => req("POST", "/api/escrow", { token, body: { amount: 500, payee_tenant: "t_payee", condition: { kind: "receipt:mesh" }, ...over } });
+  const creditRows = async (payee, escrowId) => (await dbQuery("SELECT count(*)::int AS n, coalesce(sum(usd_cents),0)::int AS cents FROM ledger WHERE tenant=$1 AND kind='mesh-credit' AND ref=$2", [payee, escrowId])).rows[0];
+
+  test("a signed delivery receipt captures: escrow->captured, payer settled (not refunded), payee credited in MESH", async () => {
+    const root = await newTenant("cap-a", "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const open = await openEscrow(root.token, { payee_tenant: "t_payeeA" });
+    expect(open.status).toBe(201);
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    expect((await remainingOf(root.token)).usd_cents).toBe(before - 500); // held
+    const r = await meshReceipt({ receipt_id: "rc-A1", escrow_id: esId, capability: "delivered" });
+    expect(r.status).toBe(202);
+    expect(r.json.escrow.captured).toBe(true);
+    // captured, not refunded: the held value became a SPEND, so remaining stays down (not restored)
+    expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("captured");
+    expect((await remainingOf(root.token)).usd_cents).toBe(before - 500);
+    // payee credited exactly the amount, once
+    expect(await creditRows("t_payeeA", esId)).toEqual({ n: 1, cents: 500 });
+    // the payer's spend is on the ledger too
+    expect((await dbQuery("SELECT count(*)::int AS n FROM ledger WHERE grant_id=$1 AND kind='escrow-capture'", [gid])).rows[0].n).toBe(1);
+  });
+
+  test("CONTROL: double-capture is impossible — a second receipt credits the payee ZERO more", async () => {
+    const root = await newTenant("cap-dup", "pro");
+    const open = await openEscrow(root.token, { payee_tenant: "t_payeeD" });
+    const esId = open.json.escrow.id;
+    expect((await meshReceipt({ receipt_id: "rc-D1", escrow_id: esId })).json.escrow.captured).toBe(true);
+    // a fresh receipt (new id) for the same escrow: webhook processes it, capture no-ops
+    const second = await meshReceipt({ receipt_id: "rc-D2", escrow_id: esId });
+    expect(second.json.escrow.captured).toBe(false);
+    // a replayed receipt (same id) is dropped as a replay before capture is even reached
+    expect((await meshReceipt({ receipt_id: "rc-D1", escrow_id: esId })).json.replay).toBe(true);
+    expect(await creditRows("t_payeeD", esId)).toEqual({ n: 1, cents: 500 }); // credited exactly once
+  });
+
+  test("CONTROL: capture and refund are mutually exclusive — a captured escrow cannot be refunded", async () => {
+    const root = await newTenant("cap-vs-refund", "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const open = await openEscrow(root.token, { payee_tenant: "t_payeeX" });
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    expect((await meshReceipt({ receipt_id: "rc-X1", escrow_id: esId })).json.escrow.captured).toBe(true);
+    // now try to refund via revoke: it must NOT re-credit the payer (escrow is captured, not active)
+    const rev = await req("POST", "/api/grants/" + gid + "/revoke", { token: root.token, body: { reason: "late refund attempt" } });
+    expect(rev.json.revoked).not.toContain(gid); // revoke skips the non-active escrow
+    expect((await remainingOf(root.token)).usd_cents).toBe(before - 500); // still spent, never returned
+  });
+
+  test("CONTROL: a refunded escrow cannot be captured — the payee is NOT credited", async () => {
+    const root = await newTenant("refund-vs-cap", "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const open = await openEscrow(root.token, { payee_tenant: "t_payeeR" });
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    // refund first (revoke) -> value returns to payer
+    await req("POST", "/api/grants/" + gid + "/revoke", { token: root.token, body: { reason: "failed" } });
+    expect((await remainingOf(root.token)).usd_cents).toBe(before);
+    // a delivery receipt now must NOT capture (escrow already refunded)
+    const r = await meshReceipt({ receipt_id: "rc-R1", escrow_id: esId });
+    expect(r.json.escrow.captured).toBe(false);
+    expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("refunded");
+    expect(await creditRows("t_payeeR", esId)).toEqual({ n: 0, cents: 0 });
+  });
+
+  test("CONTROL: capture requires a matching escrow and the right condition", async () => {
+    const root = await newTenant("cap-cond", "pro");
+    // no escrow_id in the receipt -> no capture attempted
+    expect((await meshReceipt({ receipt_id: "rc-N1", amount: 10 })).json.escrow).toBeNull();
+    // unknown escrow id -> declined
+    expect((await meshReceipt({ receipt_id: "rc-N2", escrow_id: "es_nope" })).json.escrow.captured).toBe(false);
+    // ref-bound escrow: a receipt whose capability != the bound ref must NOT capture
+    const open = await openEscrow(root.token, { payee_tenant: "t_payeeC", condition: { kind: "receipt:mesh", ref: "job-42" } });
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    const bad = await meshReceipt({ receipt_id: "rc-N3", escrow_id: esId, capability: "job-99" });
+    expect(bad.json.escrow.captured).toBe(false);
+    expect(bad.json.escrow.reason).toBe("ref_mismatch");
+    expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("open");
+    // the matching ref DOES capture
+    expect((await meshReceipt({ receipt_id: "rc-N4", escrow_id: esId, capability: "job-42" })).json.escrow.captured).toBe(true);
+  });
+
+  test("CONTROL: an attestation:self-settle escrow does not capture on a mesh receipt (wrong condition)", async () => {
+    const root = await newTenant("cap-wrongcond", "pro");
+    const open = await openEscrow(root.token, { payee_tenant: "t_payeeW", condition: { kind: "attestation:self-settle" } });
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    const r = await meshReceipt({ receipt_id: "rc-W1", escrow_id: esId });
+    expect(r.json.escrow.captured).toBe(false);
+    expect(r.json.escrow.reason).toBe("condition_mismatch");
+    expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("open");
+  });
+});

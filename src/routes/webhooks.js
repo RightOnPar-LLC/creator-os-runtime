@@ -9,6 +9,7 @@ import {
   recordWebhookEvent,
   verifyTimestampedSignature,
 } from "../webhooks.js";
+import { captureFromMeshReceipt } from "../escrow.js";
 import { app, readJsonBody } from "../http.js";
 
 app.post("/webhooks/stripe", async (e) => {
@@ -175,7 +176,11 @@ app.post("/webhooks/mesh", async (e) => {
       received: !0,
       replay: !0,
     });
-  let r = (await getSetting("receipt_grants")) === "on";
+  let r = (await getSetting("receipt_grants")) === "on",
+    // A receipt naming an escrow is a delivery proof: capture (release the held value to the payee).
+    // captureFromMeshReceipt never throws for an unknown/mismatched escrow \u2014 it just declines \u2014 and
+    // captureEscrow is exactly-once, so a fresh receipt for an already-captured escrow is a no-op.
+    cap = a.escrow_id ? await captureFromMeshReceipt(a) : null;
   return (
     await recordEvent(
       "mesh.receipt",
@@ -183,6 +188,7 @@ app.post("/webhooks/mesh", async (e) => {
         amount: a.amount,
         capability: a.capability,
         minted: r,
+        escrowCaptured: cap?.captured ?? !1,
       },
       a.tenant || null,
       "mesh",
@@ -191,12 +197,14 @@ app.post("/webhooks/mesh", async (e) => {
       stored: !0,
       minted: !1,
       receiptGrants: r,
+      escrow: cap,
     }),
     e.json(
       {
         received: !0,
         stored: !0,
         minted: !1,
+        escrow: cap,
         note: r
           ? "receipt\u2192grant lane armed but minting not yet implemented"
           : "receipt stored; receipt\u2192grant lane is off",
