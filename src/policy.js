@@ -38,6 +38,19 @@ export var CAPS = [
 ];
 var CAP_SET = new Set(CAPS);
 export var TIERS = {
+  // A visitor with no prior identity (guest_welcome). Look, plan, remember in
+  // its own scope, run the free probe — nothing else. Attenuated below starter:
+  // one worker, a handful of probe deploys, house-credit budget, depth 1 (it has
+  // no grant.issue cap, so it can never mint a child anyway). Keyed by name like
+  // every tier, so its position in this map does not matter.
+  guest: {
+    maxWorkers: 1,
+    deploysPerPeriod: 3,
+    usdCents: 500,
+    maxTtlSec: 3600,
+    maxDepth: 1,
+    maxReplicas: 1,
+  },
   starter: {
     maxWorkers: 2,
     deploysPerPeriod: 20,
@@ -145,6 +158,11 @@ export function attenuationViolations(e, t, a, w = {}) {
     if (!(t.scope.workers?.namePrefix || "").startsWith(l)) n.push("scope_prefix_widened");
     if (!memoryPartitions(t.scope).every((c) => memoryPartitions(i).some((E) => partitionCovers(E, c))))
       n.push("scope_memory_widened");
+    // template allow-list: a restricted parent is a ceiling — the child must be a
+    // subset AND cannot drop back to wildcard (a missing list). Wildcard parent (no
+    // i.templates) imposes nothing, so existing grants are unaffected.
+    if (Array.isArray(i.templates) && (!Array.isArray(t.scope.templates) || !isSubset(t.scope.templates, i.templates)))
+      n.push("scope_templates_widened");
     if (!usageWithin(t.budget, remainingBudget(e))) n.push("budget_exceeds_parent_remaining");
     if (t.constraints.maxWorkers > o.maxWorkers) n.push("maxWorkers_widened");
     if (t.constraints.maxReplicas > o.maxReplicas) n.push("maxReplicas_widened");
