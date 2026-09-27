@@ -1244,3 +1244,60 @@ describe("12. guest-welcome (Phase 1)", () => {
     expect(g.json.house_rules).toBe(g.json.directory + "#rules");
   });
 });
+
+describe("12b. public base URL host hardening (keyless surfaces)", () => {
+  test("PUBLIC_URL wins over a forged X-Forwarded-Host in the welcome package", async () => {
+    const r = await req("POST", "/api/guest", { headers: { "x-forwarded-host": "evil.com" } });
+    expect(r.status).toBe(201);
+    expect(r.json.directory.startsWith(BASE + "/")).toBe(true);
+    expect(r.json.directory).not.toContain("evil.com");
+    expect(r.json.house_rules).not.toContain("evil.com");
+  });
+
+  test("GET /directory ignores a forged Host", async () => {
+    const r = await req("GET", "/directory", { headers: { "x-forwarded-host": "attacker.example" } });
+    expect(r.json.guest.grant_via).toBe(BASE + "/api/guest");
+    expect(JSON.stringify(r.json)).not.toContain("attacker.example");
+  });
+
+  test("fail-safe: PUBLIC_URL unset AND host untrusted -> 503, never emits the attacker host", async () => {
+    const saved = process.env.PUBLIC_URL;
+    delete process.env.PUBLIC_URL;
+    try {
+      const g = await req("POST", "/api/guest", { headers: { "x-forwarded-host": "evil.com" } });
+      expect(g.status).toBe(503);
+      expect(g.json.error).toBe("public_url_unset");
+      expect(g.json.detail).toEqual({ needs: "PUBLIC_URL" });
+      const d = await req("GET", "/directory", { headers: { "x-forwarded-host": "evil.com" } });
+      expect(d.status).toBe(503);
+      expect(d.text).not.toContain("evil.com");
+    } finally {
+      process.env.PUBLIC_URL = saved;
+    }
+  });
+
+  test("dev is not broken: PUBLIC_URL unset with a loopback Host still works over http", async () => {
+    const saved = process.env.PUBLIC_URL;
+    delete process.env.PUBLIC_URL;
+    try {
+      const r = await req("POST", "/api/guest");
+      expect(r.status).toBe(201);
+      expect(r.json.directory).toContain("127.0.0.1");
+      expect(r.json.directory.endsWith("/directory")).toBe(true);
+    } finally {
+      process.env.PUBLIC_URL = saved;
+    }
+  });
+
+  test("shared surfaces inherit the fix — OAuth protected-resource metadata also fails safe, never advertising the attacker host", async () => {
+    const saved = process.env.PUBLIC_URL;
+    delete process.env.PUBLIC_URL;
+    try {
+      const p = await req("GET", "/.well-known/oauth-protected-resource/mcp", { headers: { "x-forwarded-host": "evil.com" } });
+      expect(p.status).toBe(503);
+      expect(p.text).not.toContain("evil.com");
+    } finally {
+      process.env.PUBLIC_URL = saved;
+    }
+  });
+});

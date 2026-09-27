@@ -77,8 +77,25 @@ var ALLOWED_REDIRECT_HOSTS = new Set([
     .map((e) => e.trim())
     .filter(Boolean),
 ]);
-export var publicBaseUrl = (e) =>
-  env.PUBLIC_URL || `https://${e.req.header("x-forwarded-host") || e.req.header("host")}`;
+// Hosts we will reflect when PUBLIC_URL is unset. Built like ALLOWED_REDIRECT_HOSTS
+// from env.PUBLIC_BASE_HOSTS; localhost/127.0.0.1 reflect over http for dev.
+var TRUSTED_BASE_HOSTS = new Set([
+  ...String(env.PUBLIC_BASE_HOSTS || "").split(",").map((s) => s.trim()).filter(Boolean),
+  "localhost",
+  "127.0.0.1",
+]);
+// The one self-URL reflector — used by the guest welcome package, /directory, the
+// OAuth AS/PR metadata and the MCP 401 pointer. PUBLIC_URL wins; otherwise the Host
+// is reflected ONLY when it is trusted; otherwise FAIL SAFE with 503 rather than
+// hand a keyless caller an attacker-controlled origin as its authoritative
+// "house rules" (security review 2026-09-27). Set PUBLIC_URL on runtime-svc.
+export var publicBaseUrl = (e) => {
+  if (env.PUBLIC_URL) return env.PUBLIC_URL.replace(/\/+$/, "");
+  let raw = (e.req.header("x-forwarded-host") || e.req.header("host") || "").split(",")[0].trim(),
+    bare = raw.replace(/:\d+$/, "");
+  if (raw && TRUSTED_BASE_HOSTS.has(bare)) return `${bare === "localhost" || bare === "127.0.0.1" ? "http" : "https"}://${raw}`;
+  throw new HttpError(503, "public_url_unset", { needs: "PUBLIC_URL" });
+};
 export var isAllowedRedirectUri = (e) => {
   try {
     let t = new URL(e);
