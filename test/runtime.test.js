@@ -1186,4 +1186,33 @@ describe("reservation reaper (runtime-wide)", () => {
     const grants = (await admin("GET", "/api/admin/grants")).json.grants;
     expect(grants.find((g) => g.id === root.grantId).status).toBe("expired");
   });
+
+  // Guards the deadlock fix's refactor: the sweep is now one txn PER GRANT over an
+  // unlocked, depth-DESC candidate scan (not one batch txn). This proves a full
+  // multi-level chain is still reaped in a single sweep and each parent is credited
+  // its child's unspent reservation at every level. (The deadlock itself is a
+  // lock-ordering invariant — single-grant child→parent txns cannot cycle in a tree —
+  // not a behavior this single-connection PGlite harness can exercise; see the PR.)
+  test("multi-level: a 3-deep expired chain is fully reaped in one sweep, crediting every parent", async () => {
+    const root = await newTenant("reaper-deep", "pro");
+    const P = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:dP", caps: ["grant.issue", "deploy.worker"], ttlSec: 3600, budget: { usd_cents: 100, calls: 6, deploys: 3 } } });
+    const C = await req("POST", "/api/grants", { token: P.json.token, body: { sub: "agent:dC", caps: ["grant.issue", "deploy.worker"], ttlSec: 3600, budget: { usd_cents: 50, calls: 4, deploys: 2 } } });
+    const GC = await req("POST", "/api/grants", { token: C.json.token, body: { sub: "agent:dGC", caps: ["deploy.worker"], ttlSec: 3600, budget: { usd_cents: 20, calls: 2, deploys: 1 } } });
+    expect(GC.status).toBe(201);
+    // reservations flowed up: C holds 2 of its 4 for GC; P holds 4 of its 6 for C
+    expect((await remainingOf(C.json.token)).calls).toBe(2);
+    expect((await remainingOf(P.json.token)).calls).toBe(2);
+    // expire the entire chain and sweep ONCE
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = ANY($2)", [past, [GC.json.id, C.json.id, P.json.id]]);
+    const reaped = (await admin("POST", "/api/admin/grants/reap")).json.reaped;
+    expect(reaped).toContain(GC.json.id);
+    expect(reaped).toContain(C.json.id);
+    expect(reaped).toContain(P.json.id);
+    // every level flipped and root got P's full unspent back (P used nothing → 6 calls returned)
+    const grants = (await admin("GET", "/api/admin/grants")).json.grants;
+    for (const id of [GC.json.id, C.json.id, P.json.id]) expect(grants.find((g) => g.id === id).status).toBe("expired");
+    const rootRow = grants.find((g) => g.id === root.grantId);
+    const reserved = typeof rootRow.reserved === "string" ? JSON.parse(rootRow.reserved) : rootRow.reserved || {};
+    expect(reserved.calls || 0).toBe(0); // P's reservation (6 calls) fully returned to root — chain released top-to-bottom
+  });
 });

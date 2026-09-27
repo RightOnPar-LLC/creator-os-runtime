@@ -268,14 +268,37 @@ async function releaseExpiredGrant(tx, g) {
 }
 // The periodic sweep that actually cures the drain: the dominant leak is ABANDONED
 // grants (guest/OAuth children that never present a token again), for which the
-// lazy release-on-verify below never fires. depth DESC releases a child before its
-// own parent is processed; FOR UPDATE SKIP LOCKED lets replicas sweep concurrently.
+// lazy release-on-verify below never fires.
+//
+// ONE GRANT PER TRANSACTION, never a batch (deadlock fix, review 2026-09-27). The
+// earlier version held ONE transaction that skip-locked a whole batch of expired
+// children (from unrelated subtrees) and THEN reached for each child's parent with
+// a blocking `FOR UPDATE`. That wide held-set — many children at once, parents still
+// wanted — could cycle against a concurrent revokeGrantTree / settleGrantUsage /
+// issueChildGrant, or a second replica's sweep, and Postgres would abort one side on
+// a real deadlock. Now: an UNLOCKED candidate scan (deepest first, so a child is
+// released before its parent), then each release in its OWN txn that locks the child
+// then its parent — the same child→parent order every other writer takes. A
+// single-grant txn's lock footprint is one grant + its parent, and a wait-for cycle
+// among such txns would require a cycle in the parent pointers, which a tree has none
+// of; every other writer that touches both rows also takes child-before-parent (or
+// the parent alone), so no writer ever holds a parent while requesting its child.
 export async function reapExpiredGrants({ limit = 500 } = {}) {
-  let ids = [];
-  await sql.begin(async (tx) => {
-    let rows = await tx`SELECT * FROM grants WHERE status='active' AND exp <= ${nowSec()} ORDER BY depth DESC LIMIT ${limit} FOR UPDATE SKIP LOCKED`;
-    for (let g of rows) if (await releaseExpiredGrant(tx, g)) ids.push(g.id);
-  });
+  let candidates = await sql`SELECT id FROM grants WHERE status='active' AND exp <= ${nowSec()} ORDER BY depth DESC LIMIT ${limit}`,
+    ids = [];
+  for (let { id } of candidates) {
+    // Re-check status/exp UNDER the lock — the candidate scan was unlocked, so the
+    // row may have been revoked/settled/re-issued since. SKIP LOCKED (not a blocking
+    // wait): if another writer already holds this row, skip it this pass — the next
+    // sweep catches it, or that writer releases it — rather than queue behind them.
+    let reaped = await sql.begin(async (tx) => {
+      let g = (
+        await tx`SELECT * FROM grants WHERE id = ${id} AND status='active' AND exp <= ${nowSec()} FOR UPDATE SKIP LOCKED`
+      )[0];
+      return g ? await releaseExpiredGrant(tx, g) : !1;
+    });
+    if (reaped) ids.push(id);
+  }
   if (ids.length) await recordEvent("grant.reaped", { ids }, null, "reaper");
   return ids;
 }
