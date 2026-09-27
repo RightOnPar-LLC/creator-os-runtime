@@ -19,6 +19,11 @@ import { getTenant, sql } from "./db.js";
 import { nowSec, newId, parseJson } from "./util.js";
 import { issueChildGrant, mintRootGrant } from "./grants.js";
 import { TIERS } from "./policy.js";
+import { SERVICE_NAME, VERSION } from "./config.js";
+import { TEMPLATES } from "./railway.js";
+
+/** The one worker template a guest may deploy — the free probe. Enforced at deploy in step 4; published in the directory now. */
+export var GUEST_TEMPLATE = "probe";
 
 /** The tenant every guest grant is a child of. Its root grant is the pool. */
 export var GUEST_POOL_TENANT = "guest-pool";
@@ -72,6 +77,61 @@ export async function issueGuestGrant({ agentName = "", homeUrl = "" } = {}) {
     },
     "guest-welcome",
   );
+}
+
+/**
+ * The published guest policy — ONE source of truth. The directory serves it as
+ * the #rules section, and step 4's sybil enforcement reads the SAME constants,
+ * so what is advertised and what is enforced can never drift (Law 5). Nothing
+ * here is enforced until step 4; nothing is deployed until step 4 either.
+ */
+export var GUEST_POLICY = {
+  issuance: { per_fingerprint_per_hour: 3, one_active_grant_per_fingerprint: true },
+  guest_grant: {
+    budget_usd_cents: TIERS.guest.usdCents,
+    ttl_sec: TIERS.guest.maxTtlSec,
+    caps: GUEST_CAPS,
+    worker_template: GUEST_TEMPLATE,
+    max_workers: TIERS.guest.maxWorkers,
+  },
+  acceptable_use:
+    "A guest may look, plan, remember in its own scope, read its own ledger, and run the free probe. No paid templates, no grant issuance, no code execution until resident. One active guest grant per fingerprint; issuance is rate-limited.",
+  graduation: { settle_calls: 10, becomes: "resident grant (higher budget, longer TTL, paid templates)" },
+};
+
+/**
+ * The public capability shopfront. Every priced, deployable capability is a
+ * worker TEMPLATE: name, description, price, the input contract (env keys the
+ * caller must supply), whether a guest may run it, and REAL reliability derived
+ * from the deploys table — never a fabricated number, and "no sample yet" until
+ * a template has actually run.
+ */
+export async function directory(baseUrl) {
+  let rows = await sql`SELECT template,
+      count(*) FILTER (WHERE executed) AS runs,
+      count(*) FILTER (WHERE executed AND status = 'failed') AS failed
+    FROM deploys GROUP BY template`,
+    stat = Object.fromEntries(rows.map((r) => [r.template, { runs: Number(r.runs), failed: Number(r.failed) }]));
+  let capabilities = Object.entries(TEMPLATES).map(([name, t]) => {
+    let s = stat[name] || { runs: 0, failed: 0 };
+    return {
+      name,
+      kind: t.kind,
+      description: t.desc,
+      price: { usd_cents: t.estCents },
+      input_contract: { requires: t.needs || [] },
+      guest_allowed: name === GUEST_TEMPLATE,
+      reliability: s.runs > 0 ? { runs: s.runs, failed: s.failed } : { runs: 0, note: "no sample yet" },
+    };
+  });
+  return {
+    service: SERVICE_NAME,
+    version: VERSION,
+    capabilities,
+    guest: { grant_via: baseUrl + "/api/guest", ...GUEST_POLICY.guest_grant },
+    rules: GUEST_POLICY,
+    graduation: GUEST_POLICY.graduation,
+  };
 }
 
 /** The welcome package: everything an agent needs to start doing business, machine-readable, in one shot. */

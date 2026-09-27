@@ -1184,4 +1184,40 @@ describe("12. guest-welcome (Phase 1)", () => {
     expect(list.json.grants.length).toBe(1);
     expect(list.json.grants[0].depth).toBe(1);
   });
+
+  test("GET /directory is public and lists priced capabilities with an honest reliability sample", async () => {
+    const r = await req("GET", "/directory"); // no token
+    expect(r.status).toBe(200);
+    expect(r.json.service).toBe("creator-os-runtime");
+    const probe = r.json.capabilities.find((c) => c.name === "probe");
+    expect(probe).toBeTruthy();
+    expect(probe.price.usd_cents).toBe(25);
+    expect(probe.input_contract.requires).toEqual([]);
+    expect(probe.guest_allowed).toBe(true);
+    // reliability is never fabricated: a number always, and "no sample yet" when it has not run
+    expect(typeof probe.reliability.runs).toBe("number");
+    if (probe.reliability.runs === 0) expect(probe.reliability.note).toBe("no sample yet");
+    // a paid template is listed but NOT guest-allowed
+    const paid = r.json.capabilities.find((c) => c.name === "tip-alert-bot");
+    expect(paid.guest_allowed).toBe(false);
+    expect(paid.price.usd_cents).toBeGreaterThan(0);
+    expect(Array.isArray(paid.input_contract.requires)).toBe(true);
+  });
+
+  test("the directory carries the house rules the welcome package points at (graduation, guest envelope)", async () => {
+    const r = await req("GET", "/directory");
+    expect(r.json.rules.graduation.settle_calls).toBe(10);
+    expect(r.json.rules.guest_grant.caps).toEqual(["grant.read", "cog.plan", "memory.write", "ledger.read", "deploy.worker"]);
+    expect(r.json.rules.guest_grant.worker_template).toBe("probe");
+    expect(r.json.rules.guest_grant.budget_usd_cents).toBe(500);
+    expect(r.json.guest.grant_via.endsWith("/api/guest")).toBe(true);
+  });
+
+  test("the welcome package's directory URL actually resolves — no dangling promise", async () => {
+    const g = await req("POST", "/api/guest");
+    const d = await req("GET", new URL(g.json.directory).pathname);
+    expect(d.status).toBe(200);
+    expect(Array.isArray(d.json.capabilities)).toBe(true);
+    expect(g.json.house_rules).toBe(g.json.directory + "#rules");
+  });
 });

@@ -8,7 +8,12 @@ import { HttpError } from "../util.js";
 import { isKillSwitchOn } from "../db.js";
 import { app, readJsonBody } from "../http.js";
 import { publicBaseUrl } from "../oauth.js";
-import { issueGuestGrant, welcomePackage } from "../guest.js";
+import { directory, issueGuestGrant, welcomePackage } from "../guest.js";
+
+// The public capability shopfront + house rules. No grant needed — this is what
+// a guest reads to decide what to buy, and where the welcome package's
+// `directory` / `house_rules` URLs point. Read-only.
+app.get("/directory", async (e) => e.json(await directory(publicBaseUrl(e))));
 
 app.post("/api/guest", async (e) => {
   if (await isKillSwitchOn()) throw new HttpError(503, "runtime_paused");
