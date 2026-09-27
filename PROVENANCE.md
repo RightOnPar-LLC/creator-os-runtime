@@ -218,3 +218,19 @@ the bundle.
 - **Verify:** `node live/verify.mjs --url https://runtime.meshtool.ai` and
   `--url https://runtime-production-9d95.up.railway.app` both exit 0;
   `lsp-mcp/test/smoke-live.mjs` green against both.
+
+## 0.3.4 — guard the empty creator-worker repo (2026-09-26)
+
+#20 repointed the tip-alert / paywall / clips / dm / relay / builder templates to build
+from `RightOnPar-LLC/creator-worker`, but that repo is still empty, so a deploy from any of
+them would fail obscurely inside a Railway build. `resolveSource` (src/railway.js) now refuses
+a build whose source resolves to the creator-worker repo with `409 creator_worker_repo_unpopulated`
+(a clear reason, before any Railway call), unless `CREATOR_WORKER_READY=1`. It fires for both
+the dry-run and the confirmed path (resolveSource runs before the dry-run branch), so the COG
+refuses at plan/execute time too. `probe` (image) and `repo-app` pointed at another populated
+org repo are unaffected. Lift the guard by populating creator-worker and setting
+`CREATOR_WORKER_READY=1`.
+
+- **File:** `live/runtime-0.3.4.bundle.js` — 95,845 bytes, sha256
+  `560c0099e861f2b927c129e5907901a89b2109d47609beddd9806eab6cc9b4eb`. Suite 65/65 on source
+  and dist. Both services shipped to this bundle (runtime-svc on merge, Function via startCommand API).

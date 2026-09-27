@@ -117,6 +117,16 @@ function resolveSource(e, t) {
   if (!a || !REPO_RE.test(String(a))) throw new HttpError(400, "bad_repo", { repo: a || null });
   if (!REPO_OWNERS.includes(String(a).split("/")[0].toLowerCase()))
     throw new HttpError(403, "repo_owner_not_allowed", { repo: a, allowed: REPO_OWNERS });
+  // creator-worker is the declared build source for the tip-alert/paywall/clips/dm/
+  // relay/builder templates, but the repo is still empty (2026-09-26). Refuse a build
+  // from it until it has code, so a deploy fails HERE with a clear reason instead of
+  // obscurely inside a Railway build. Lift with CREATOR_WORKER_READY=1 once populated;
+  // a repo-app deploy of some other populated repo is unaffected (source != WORKER_REPO).
+  if (String(a) === WORKER_REPO && env.CREATOR_WORKER_READY !== "1")
+    throw new HttpError(409, "creator_worker_repo_unpopulated", {
+      repo: a,
+      hint: "the creator-worker repo has no code yet; populate it and set CREATOR_WORKER_READY=1, or use repo-app with a repo that has a Dockerfile/Nixpacks build",
+    });
   if (!/^[A-Za-z0-9._/-]{1,100}$/.test(String(n))) throw new HttpError(400, "bad_branch");
   return {
     source: {

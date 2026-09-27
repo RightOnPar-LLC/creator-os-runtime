@@ -126,6 +126,7 @@ for (const k of [
 ]) delete process.env[k];
 Object.assign(process.env, {
   LSP_MCP_URL: LSP_URL,
+  CREATOR_WORKER_READY: "1",
   DATABASE_URL: `postgres://postgres:postgres@${pgServer.getServerConn()}/postgres`,
   RUNTIME_ADMIN_KEY: ADMIN_KEY,
   VAULT_KEY,
