@@ -99,11 +99,17 @@ export function serializeEscrow(grantRow) {
   };
 }
 
-// Resolve either the stable escrow id (es_...) OR the custodian grant id to the escrow grant row.
+// Resolve either the custodian grant id (gr_...) OR the stable escrow id (es_...) to the escrow
+// grant row. Only try the grants PK lookup for a gr_ id — a receipt carries the es_ id, which can
+// never be a grant PK, so an unconditional getGrant was a wasted round-trip on every receipt. The
+// es_ path is indexed (grants_escrow_id on scope->'escrow'->>'escrow_id'), not a full scan.
 async function findEscrowGrant(idOrEscrowId) {
-  let byGrant = await getGrant(idOrEscrowId);
-  if (byGrant && escrowBlock(byGrant)) return byGrant;
-  let r = await sql`SELECT * FROM grants WHERE scope->'escrow'->>'escrow_id' = ${String(idOrEscrowId)} LIMIT 1`;
+  let id = String(idOrEscrowId);
+  if (id.startsWith("gr")) {
+    let byGrant = await getGrant(id);
+    if (byGrant && escrowBlock(byGrant)) return byGrant;
+  }
+  let r = await sql`SELECT * FROM grants WHERE scope->'escrow'->>'escrow_id' = ${id} LIMIT 1`;
   return r[0] || null;
 }
 
@@ -146,11 +152,13 @@ export async function captureEscrow(idOrEscrowId, { source = "capture", ref = nu
     await tx`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
       VALUES (${g.tenant}, ${g.id}, ${g.parent}, 'escrow-capture', ${amount}, 0, 0, ${b.escrow_id}, ${"captured for " + b.payee_tenant})`;
     await tx`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
-      VALUES (${b.payee_tenant}, ${g.id}, ${g.parent}, 'mesh-credit', ${amount}, 0, 0, ${b.escrow_id}, ${"escrow delivered via " + source}) `;
-    ((out.captured = true), (out.amount = amount), (out.payee_tenant = b.payee_tenant));
+      VALUES (${b.payee_tenant}, ${g.id}, ${g.parent}, 'mesh-credit', ${amount}, 0, 0, ${b.escrow_id}, ${"escrow delivered via " + source + (ref ? " receipt=" + ref : "")}) `;
+    ((out.captured = true), (out.amount = amount), (out.payee_tenant = b.payee_tenant), (out.receipt = ref));
   });
   if (out.captured)
-    await recordEvent("escrow.captured", { escrow_id: out.escrow_id, amount: out.amount, payee_tenant: out.payee_tenant, source }, g0.tenant, source);
+    // provenance: the triggering receipt id is recorded on the event so an auditor can trace a
+    // mesh-credit row back to the exact delivery receipt that authorized the value movement.
+    await recordEvent("escrow.captured", { escrow_id: out.escrow_id, amount: out.amount, payee_tenant: out.payee_tenant, source, receipt: ref }, g0.tenant, source);
   return out;
 }
 
@@ -167,5 +175,11 @@ export async function captureFromMeshReceipt(receipt) {
   if (b?.condition?.kind !== "receipt:mesh") return { captured: false, reason: "condition_mismatch" };
   if (b.condition.ref && String(receipt.capability ?? receipt.ref ?? "") !== b.condition.ref)
     return { captured: false, reason: "ref_mismatch" };
+  // Defense: if the signed receipt names a payee, it MUST be this escrow's payee. The receipt is
+  // HMAC-signed by a trusted secret, but a mis-routed receipt (right escrow_id, wrong payee) must
+  // never settle to the escrow's fixed payee on the strength of the id alone (review 2026-09-27).
+  let receiptPayee = receipt.payee_tenant ?? receipt.payee ?? null;
+  if (receiptPayee != null && String(receiptPayee) !== b.payee_tenant)
+    return { captured: false, reason: "payee_mismatch" };
   return captureEscrow(g.id, { source: "receipt:mesh", ref: String(receipt.receipt_id ?? "") });
 }

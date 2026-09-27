@@ -1,7 +1,7 @@
 // Characterisation suite for creator-os-runtime. Written against the UNSPLIT
 // src/runtime.js (the proven-readable form of the live 0.3.0 bundle) so that any
 // refactor has to keep every behaviour pinned here.
-import { describe, test, expect, afterAll } from "bun:test";
+import { describe, test, expect, afterAll, beforeAll } from "bun:test";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1929,6 +1929,11 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
   const meshReceipt = (obj) => { const m = JSON.stringify(obj); return req("POST", "/webhooks/mesh", { raw: m, headers: { "x-mesh-signature": hmacHex(MESH_SECRET, m) } }); };
   const openEscrow = (token, over = {}) => req("POST", "/api/escrow", { token, body: { amount: 500, payee_tenant: "t_payee", condition: { kind: "receipt:mesh" }, ...over } });
   const creditRows = async (payee, escrowId) => (await dbQuery("SELECT count(*)::int AS n, coalesce(sum(usd_cents),0)::int AS cents FROM ledger WHERE tenant=$1 AND kind='mesh-credit' AND ref=$2", [payee, escrowId])).rows[0];
+  const setSetting = (k, v) => dbQuery("INSERT INTO settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()", [k, v]);
+  // Capture is an operator-gated value movement (review 2026-09-27): OFF by default, so these tests
+  // enable it. The gate + kill-switch behaviour is itself tested below.
+  beforeAll(() => setSetting("escrow_capture", "on"));
+  afterAll(async () => { await setSetting("escrow_capture", "off"); await setSetting("kill_switch", "off"); });
 
   test("a signed delivery receipt captures: escrow->captured, payer settled (not refunded), payee credited in MESH", async () => {
     const root = await newTenant("cap-a", "pro");
@@ -1947,6 +1952,8 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     expect(await creditRows("t_payeeA", esId)).toEqual({ n: 1, cents: 500 });
     // the payer's spend is on the ledger too
     expect((await dbQuery("SELECT count(*)::int AS n FROM ledger WHERE grant_id=$1 AND kind='escrow-capture'", [gid])).rows[0].n).toBe(1);
+    // provenance: the mesh-credit row records the triggering receipt id (auditor can trace it back)
+    expect((await dbQuery("SELECT note FROM ledger WHERE tenant=$1 AND kind='mesh-credit' AND ref=$2", ["t_payeeA", esId])).rows[0].note).toContain("receipt=rc-A1");
   });
 
   test("CONTROL: double-capture is impossible — a second receipt credits the payee ZERO more", async () => {
@@ -2014,5 +2021,49 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     expect(r.json.escrow.captured).toBe(false);
     expect(r.json.escrow.reason).toBe("condition_mismatch");
     expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("open");
+  });
+
+  test("CONTROL (fix): capture is gated — OFF by default, and the kill switch stops it", async () => {
+    const root = await newTenant("cap-gate", "pro");
+    const open = await openEscrow(root.token, { payee_tenant: "t_payeeG" });
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    // gate OFF -> a signed receipt does NOT capture (no off-switch would be a HIGH finding)
+    await setSetting("escrow_capture", "off");
+    expect((await meshReceipt({ receipt_id: "rc-G1", escrow_id: esId })).json.escrow).toBeNull();
+    expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("open");
+    // gate ON but kill switch ON -> still no capture
+    await setSetting("escrow_capture", "on");
+    await setSetting("kill_switch", "on");
+    expect((await meshReceipt({ receipt_id: "rc-G2", escrow_id: esId })).json.escrow).toBeNull();
+    await setSetting("kill_switch", "off"); // restore BEFORE any gated read (reads are 503 while paused)
+    expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("open");
+  });
+
+  test("CONTROL (fix): capture is retry-safe — a receipt that could not capture, retried, still captures", async () => {
+    const root = await newTenant("cap-retry", "pro");
+    const open = await openEscrow(root.token, { payee_tenant: "t_payeeRT" });
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    // first delivery arrives while capture is disabled: the receipt_id is RECORDED, but no capture
+    await setSetting("escrow_capture", "off");
+    expect((await meshReceipt({ receipt_id: "rc-RT1", escrow_id: esId })).json.escrow).toBeNull();
+    // re-enable, and the SAME receipt_id is retried: recordWebhookEvent sees a replay, but capture
+    // is attempted BEFORE the replay short-circuit, so the escrow still captures (durability fix).
+    await setSetting("escrow_capture", "on");
+    const retry = await meshReceipt({ receipt_id: "rc-RT1", escrow_id: esId });
+    expect(retry.json.replay).toBe(true);
+    expect(retry.json.escrow.captured).toBe(true);
+    expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("captured");
+    expect(await creditRows("t_payeeRT", esId)).toEqual({ n: 1, cents: 500 });
+  });
+
+  test("CONTROL (fix): a receipt naming a different payee does not settle to the escrow's payee", async () => {
+    const root = await newTenant("cap-payee", "pro");
+    const open = await openEscrow(root.token, { payee_tenant: "t_payeeP" });
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    const r = await meshReceipt({ receipt_id: "rc-P1", escrow_id: esId, payee_tenant: "t_somebody_else" });
+    expect(r.json.escrow.captured).toBe(false);
+    expect(r.json.escrow.reason).toBe("payee_mismatch");
+    expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("open");
+    expect(await creditRows("t_payeeP", esId)).toEqual({ n: 0, cents: 0 });
   });
 });
