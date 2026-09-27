@@ -309,6 +309,7 @@ describe("4. MCP", () => {
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
     expect(l.json.result.tools.map((x) => x.name)).toEqual([
+      "guest_welcome",
       "runtime_health", "grant_verify", "grant_issue", "grant_list", "grant_revoke", "cog_plan", "cog_execute",
       "deploy_worker", "deploy_status", "ledger_query", "memory_search", "memory_write", "memory_forget",
     ]);
@@ -1561,5 +1562,62 @@ describe("16. guest pool circuit breaker", () => {
     expect(g.json.budget.total).toBe(500); // == TIERS.guest.usdCents, from GUEST_BUDGET()
     const v = await req("GET", "/api/grants/verify", { token: g.json.grant });
     expect(v.json.budget.usd_cents).toBe(500);
+  });
+});
+
+describe("17. keyless guest_welcome over MCP", () => {
+  // req directly (not the mcp() helper) so we can set x-real-ip for the sybil gate
+  const mcpGuest = (ip, args = {}) =>
+    req("POST", "/mcp", { headers: { "x-real-ip": ip }, body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "guest_welcome", arguments: args } } });
+
+  test("keyless mint: guest_welcome over /mcp with NO token yields the same working guest grant as POST /api/guest", async () => {
+    const r = await mcpGuest("10.17.1.1", { agent_name: "McpWanderer" });
+    expect(r.status).toBe(200);
+    const pkg = r.json.result.structuredContent;
+    expect(typeof pkg.grant).toBe("string");
+    expect(pkg.budget.total).toBe(500);
+    expect(pkg.directory.endsWith("/directory")).toBe(true);
+    const v = await req("GET", "/api/grants/verify", { token: pkg.grant });
+    expect(v.json.caps).toEqual(["grant.read", "cog.plan", "memory.write", "deploy.worker", "ledger.read"]);
+    expect(v.json.tenant).toBe("guest-pool");
+    expect(v.json.sub.startsWith("guest:McpWanderer:")).toBe(true);
+    expect(v.json.depth).toBe(1);
+  });
+
+  test("no OTHER door opens: every other keyless /mcp method is still 401 missing_grant", async () => {
+    for (const m of ["initialize", "tools/list", "ping"]) {
+      const r = await mcp(undefined, m, {});
+      expect(r.status).toBe(401);
+      expect(r.json.error).toBe("missing_grant");
+    }
+    // a DIFFERENT tools/call name keyless is refused — only guest_welcome passes
+    const other = await mcp(undefined, "tools/call", { name: "memory_write", arguments: { content: "x" } });
+    expect(other.status).toBe(401);
+    expect(other.json.error).toBe("missing_grant");
+  });
+
+  test("attenuation parity: the MCP-minted guest is the same fail-closed envelope", async () => {
+    const r = await mcpGuest("10.17.3.1");
+    const tok = r.json.result.structuredContent.grant;
+    expect((await req("POST", "/api/grants", { token: tok, body: { sub: "child", caps: ["grant.read"] } })).status).toBe(403);
+    expect((await req("POST", "/api/cog/execute", { token: tok, body: { proposal: {} } })).status).toBe(403);
+  });
+
+  test("the kill switch closes the keyless door too", async () => {
+    try {
+      await admin("POST", "/api/admin/kill");
+      const paused = await mcpGuest("10.17.4.1");
+      expect(paused.status).toBe(503);
+      expect(paused.json.error).toBe("runtime_paused");
+    } finally {
+      await admin("POST", "/api/admin/resume");
+    }
+    const back = await mcpGuest("10.17.4.2");
+    expect(back.status).toBe(200);
+  });
+
+  test("discoverability: the public keyless GET /mcp lists guest_welcome", async () => {
+    const r = await req("GET", "/mcp");
+    expect(r.json.tools).toContain("guest_welcome");
   });
 });
