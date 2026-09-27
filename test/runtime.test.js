@@ -59,7 +59,7 @@ describe("1. /health", () => {
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
-    expect(Object.keys(mod.TIERS)).toEqual(["starter", "pro", "studio", "house"]);
+    expect(Object.keys(mod.TIERS)).toEqual(["guest", "starter", "pro", "studio", "house"]);
     expect(Object.keys(mod.TEMPLATES)).toEqual(
       ["probe", "tip-alert-bot", "paywall-link", "clip-poster", "dm-autoresponder", "webhook-relay", "repo-app", "builder"],
     );

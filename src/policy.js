@@ -34,6 +34,19 @@ export var CAPS = [
 ];
 var CAP_SET = new Set(CAPS);
 export var TIERS = {
+  // A visitor with no prior identity (guest_welcome). Look, plan, remember in
+  // its own scope, run the free probe — nothing else. Attenuated below starter:
+  // one worker, a handful of probe deploys, house-credit budget, depth 1 (it has
+  // no grant.issue cap, so it can never mint a child anyway). Keyed by name like
+  // every tier, so its position in this map does not matter.
+  guest: {
+    maxWorkers: 1,
+    deploysPerPeriod: 3,
+    usdCents: 500,
+    maxTtlSec: 3600,
+    maxDepth: 1,
+    maxReplicas: 1,
+  },
   starter: {
     maxWorkers: 2,
     deploysPerPeriod: 20,
