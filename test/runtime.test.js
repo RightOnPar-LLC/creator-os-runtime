@@ -1527,3 +1527,39 @@ describe("15. guest memory-write cap + brain-sync quarantine", () => {
     expect(r.json.rules.memory.brain_sync).toBe("quarantined");
   });
 });
+
+describe("16. guest pool circuit breaker", () => {
+  test("a drained pool refuses with a clean 503, and auto-resumes when it refills — no restart", async () => {
+    // materialize the pool, then find its depth-0 root
+    const g0 = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.16.1.1" } });
+    expect(g0.status).toBe(201);
+    const pool = (await admin("GET", "/api/admin/grants")).json.grants.find((x) => x.tenant === "guest-pool" && x.depth === 0);
+    expect(pool).toBeTruthy();
+    const budget = typeof pool.budget === "string" ? JSON.parse(pool.budget) : pool.budget;
+    const origReserved = typeof pool.reserved === "string" ? pool.reserved : JSON.stringify(pool.reserved);
+    try {
+      // drain: reserve the whole pool budget so remaining slots hit 0
+      await dbQuery("UPDATE grants SET reserved = $1::jsonb WHERE id = $2", [JSON.stringify(budget), pool.id]);
+      const dry = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.16.1.2" } });
+      expect(dry.status).toBe(503);
+      expect(dry.json.error).toBe("guest_pool_exhausted");
+      expect(dry.json.detail.remaining_slots).toBe(0);
+      expect(dry.json.detail.retry_after_sec).toBeGreaterThan(0);
+      expect((await admin("GET", "/api/admin/overview")).json.guest_pool.open).toBe(false);
+      // refill (simulate the reaper releasing reservations) -> next call passes, no restart/flag
+      await dbQuery("UPDATE grants SET reserved = $1::jsonb WHERE id = $2", [origReserved, pool.id]);
+      const back = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.16.1.3" } });
+      expect(back.status).toBe(201);
+      expect((await admin("GET", "/api/admin/overview")).json.guest_pool.open).toBe(true);
+    } finally {
+      await dbQuery("UPDATE grants SET reserved = $1::jsonb WHERE id = $2", [origReserved, pool.id]);
+    }
+  });
+
+  test("the envelope is single-sourced: a fresh guest's budget equals TIERS.guest (breaker slot math and the grant can't drift)", async () => {
+    const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.16.2.1" } });
+    expect(g.json.budget.total).toBe(500); // == TIERS.guest.usdCents, from GUEST_BUDGET()
+    const v = await req("GET", "/api/grants/verify", { token: g.json.grant });
+    expect(v.json.budget.usd_cents).toBe(500);
+  });
+});

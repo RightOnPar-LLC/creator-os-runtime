@@ -19,8 +19,8 @@ import { randomBytes } from "crypto";
 import { getTenant, getSetting, setSetting, sql } from "./db.js";
 import { nowSec, newId, parseJson, hmacSha256, HttpError } from "./util.js";
 import { issueChildGrant, mintRootGrant } from "./grants.js";
-import { TIERS, memoryPartitions } from "./policy.js";
-import { SERVICE_NAME, VERSION, GUEST_MAX_PER_HOUR, GUEST_FP_WINDOW_SEC, GUEST_FP_SALT_TTL_SEC } from "./config.js";
+import { TIERS, memoryPartitions, remainingBudget } from "./policy.js";
+import { SERVICE_NAME, VERSION, GUEST_MAX_PER_HOUR, GUEST_FP_WINDOW_SEC, GUEST_FP_SALT_TTL_SEC, GUEST_POOL_MIN_SLOTS } from "./config.js";
 import { TEMPLATES } from "./railway.js";
 
 /**
@@ -91,6 +91,28 @@ export async function ensureGuestPool() {
   return r || (await mintRootGrant(t)).row;
 }
 
+// The guest envelope's budget — ONE source, read by both issueGuestGrant (below)
+// and the pool breaker, so advertised capacity and the issued grant cannot drift.
+export var GUEST_BUDGET = () => ({ usd_cents: TIERS.guest.usdCents, calls: TIERS.guest.deploysPerPeriod * 20, deploys: TIERS.guest.deploysPerPeriod });
+
+/** Read-only: the active depth-0 pool root, or null. NEVER mints (safe for a public read path). */
+export async function readGuestPool() {
+  return (
+    (await sql`SELECT * FROM grants WHERE tenant = ${GUEST_POOL_TENANT} AND depth = 0 AND status = 'active' AND exp > ${nowSec()} ORDER BY exp DESC LIMIT 1`)[0] || null
+  );
+}
+
+/**
+ * The pool's health in whole guest ENVELOPES (slots), the tightest budget
+ * dimension governing. `open` is false below the floor. Pure — no mint, no write.
+ */
+export function guestPoolStatus(pool) {
+  let rem = remainingBudget(pool),
+    env = GUEST_BUDGET(),
+    slots = Math.min(Math.floor(rem.usd_cents / env.usd_cents), Math.floor(rem.calls / env.calls), Math.floor(rem.deploys / env.deploys));
+  return { open: slots > GUEST_POOL_MIN_SLOTS, remaining_slots: slots, floor_slots: GUEST_POOL_MIN_SLOTS, remaining: rem };
+}
+
 /**
  * Mint a guest grant. `agentName` and `homeUrl` are optional visitor hints;
  * homeUrl is accepted now for API stability and used by the step-4 fingerprint,
@@ -104,13 +126,20 @@ export async function issueGuestGrant({ agentName = "", homeUrl = "" } = {}) {
     name = String(agentName || "").replace(/[^\w .:-]/g, "").slice(0, 60),
     // homeUrl: accepted, sanitised, reserved for step-4 sybil fingerprinting.
     _home = String(homeUrl || "").replace(/[^\w.:/?=&%-]/g, "").slice(0, 200);
+  // Circuit breaker: pause with a clean 503 before the pool hits the hard 402 wall
+  // (soft; issueChildGrant's FOR UPDATE + budget recheck is still the transactional
+  // floor). Resume is automatic — the next call recomputes remaining live once the
+  // reaper releases expired reservations.
+  let st = guestPoolStatus(pool);
+  if (!st.open)
+    throw new HttpError(503, "guest_pool_exhausted", { remaining_slots: st.remaining_slots, floor_slots: st.floor_slots, retry_after_sec: g.maxTtlSec });
   return issueChildGrant(
     pool,
     {
       sub: ("guest:" + (name || "anon") + ":" + key).slice(0, 80),
       caps: GUEST_CAPS,
       ttlSec: g.maxTtlSec,
-      budget: { usd_cents: g.usdCents, calls: g.deploysPerPeriod * 20, deploys: g.deploysPerPeriod },
+      budget: GUEST_BUDGET(),
       constraints: { maxWorkers: g.maxWorkers, maxReplicas: g.maxReplicas, allowDelete: false, requireDryRun: true },
       scope: { memory: { partitions: ["guest/" + key] }, templates: [GUEST_TEMPLATE] },
     },
