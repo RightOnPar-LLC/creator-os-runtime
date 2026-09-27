@@ -265,7 +265,7 @@ app.post("/mcp", async (e) => {
           assertMemoryScope(c, E[0].partition),
           e.json(
             o({
-              memory: await forgetMemory(c.tenant.id, String(i.id)),
+              memory: await forgetMemory(c.tenant.id, String(i.id), c),
             }),
           )
         );

@@ -41,15 +41,20 @@ async function enforceGuestWriteLimits(gx, partition, key, content) {
   let effKey = key || sha256Hex(content).slice(0, 16),
     pat = gx.base.replace(/([\\%_])/g, "\\$1") + "%",
     agg = (
-      await sql`SELECT count(*)::int AS n, coalesce(sum(length(content)),0)::bigint AS bytes,
+      await sql`SELECT count(*)::int AS n,
+        coalesce(sum(octet_length(content)), 0)::bigint AS bytes,
+        coalesce(sum(octet_length(content)) FILTER (WHERE partition = ${partition} AND key = ${effKey}), 0)::bigint AS oldbytes,
         bool_or(partition = ${partition} AND key = ${effKey}) AS present
         FROM memories WHERE tenant = ${gx.tenant} AND deleted = false AND partition LIKE ${pat} ESCAPE '\\'`
     )[0];
-  if (!agg.present) {
-    if (Number(agg.n) >= gx.maxRows) throw new HttpError(429, "memory_partition_full", { memories: Number(agg.n), max: gx.maxRows });
-    if (Number(agg.bytes) + Buffer.byteLength(content, "utf8") > gx.maxBytes)
-      throw new HttpError(413, "memory_partition_bytes", { bytes: Number(agg.bytes), max: gx.maxBytes });
-  }
+  // row cap: only a NEW (partition,key) adds a row.
+  if (!agg.present && Number(agg.n) >= gx.maxRows)
+    throw new HttpError(429, "memory_partition_full", { memories: Number(agg.n), max: gx.maxRows });
+  // byte cap in BYTES (octet_length, not char length), enforced on BOTH create AND
+  // update — an update REPLACES the row, so the projected total subtracts the old bytes.
+  let projected = Number(agg.bytes) - Number(agg.oldbytes) + Buffer.byteLength(content, "utf8");
+  if (projected > gx.maxBytes)
+    throw new HttpError(413, "memory_partition_bytes", { bytes: Number(agg.bytes), projected, max: gx.maxBytes });
 }
 export async function writeMemory(e, t, a, n, r, s, auth = null) {
   let gx = guestWriteContext(auth);
@@ -73,11 +78,18 @@ export async function searchMemories(e, t, a, n) {
       : await sql`SELECT * FROM memories WHERE tenant = ${e} AND deleted = false AND partition LIKE ${s} ORDER BY updated_at DESC LIMIT ${r}`
   ).map(serializeMemory);
 }
-export async function forgetMemory(e, t) {
+export async function forgetMemory(e, t, auth = null) {
+  // A guest's forget is metered and QUARANTINED just like its write: without this,
+  // write-then-forget would fan the (still-populated) content to the brain sync,
+  // bypassing the quarantine (security review 2026-09-27).
+  let gx = guestWriteContext(auth);
+  if (gx && !(await checkNamedRateLimit(`mw:${gx.grantId}`, gx.ratePerMin)))
+    throw new HttpError(429, "memory_write_rate_limited", { limit: gx.ratePerMin });
   let a =
     await sql`UPDATE memories SET deleted = true, version = ${Date.now()}, updated_at = now() WHERE id = ${t} AND tenant = ${e} RETURNING *`;
   if (!a.length) throw new HttpError(404, "memory_not_found");
-  return (await enqueueOutbox("memory.sync", toSyncRecord(a[0])), serializeMemory(a[0]));
+  if (!gx) await enqueueOutbox("memory.sync", toSyncRecord(a[0])); // guest forgets never sync
+  return serializeMemory(a[0]);
 }
 export async function applySyncRecords(e) {
   let t = 0,

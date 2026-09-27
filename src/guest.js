@@ -200,7 +200,13 @@ export async function issueGuestGrantGuarded({ ip = "noip", agentName = "", home
     await sql`UPDATE guest_fingerprints SET grant_id = ${r.row.id}, grant_exp = ${Number(r.row.exp)} WHERE fp = ${fp}`;
     return r;
   } catch (e) {
-    await sql`UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = ${fp} AND grant_id IS NULL`;
+    // Release the optimistic hold this attempt took (claimGuestFingerprint set
+    // grant_exp=predicted). We only reach here after claim confirmed there was NO
+    // active grant, so clearing the lock and any stale grant_id is correct — a
+    // failed mint (e.g. a transient pool_exhausted 503) must NOT lock the
+    // fingerprint for a window. The old `WHERE grant_id IS NULL` never matched a
+    // returning fingerprint, so it self-inflicted a ~1h 409 lockout (review 2026-09-27).
+    await sql`UPDATE guest_fingerprints SET grant_exp = 0, grant_id = NULL WHERE fp = ${fp}`;
     throw e;
   }
 }

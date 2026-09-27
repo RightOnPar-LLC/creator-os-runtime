@@ -1621,3 +1621,66 @@ describe("17. keyless guest_welcome over MCP", () => {
     expect(r.json.tools).toContain("guest_welcome");
   });
 });
+
+describe("18. step-4 double-loop fixes (regression controls)", () => {
+  test("HIGH: a failed mint releases the fingerprint lock — no self-inflicted 409 lockout", async () => {
+    const ip = "10.18.1.1";
+    const g1 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+    expect(g1.status).toBe(201);
+    // expire this fp's active-lock so a re-mint passes the one-active gate
+    const gid = (await req("GET", "/api/grants/verify", { token: g1.json.grant })).json.id;
+    const fp = (await dbQuery("SELECT fp FROM guest_fingerprints WHERE grant_id = $1", [gid])).rows[0].fp;
+    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+    // drain the pool so the NEXT mint fails AFTER the fingerprint claim (breaker 503)
+    const pool = (await admin("GET", "/api/admin/grants")).json.grants.find((x) => x.tenant === "guest-pool" && x.depth === 0);
+    const budget = typeof pool.budget === "string" ? JSON.parse(pool.budget) : pool.budget;
+    const orig = typeof pool.reserved === "string" ? pool.reserved : JSON.stringify(pool.reserved);
+    try {
+      await dbQuery("UPDATE grants SET reserved = $1::jsonb WHERE id = $2", [JSON.stringify(budget), pool.id]);
+      expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(503); // mint failed after claim
+    } finally {
+      await dbQuery("UPDATE grants SET reserved = $1::jsonb WHERE id = $2", [orig, pool.id]);
+    }
+    // the fingerprint must NOT be locked: the same IP mints again immediately (was 409 before the fix)
+    expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201);
+  });
+
+  test("HIGH: a guest's forget is quarantined from the brain sync (write-then-forget cannot leak)", async () => {
+    const savedUrl = process.env.COG_BRIDGE_URL, savedTok = process.env.COG_BRIDGE_TOKEN;
+    process.env.COG_BRIDGE_URL = "http://127.0.0.1:1";
+    process.env.COG_BRIDGE_TOKEN = "x";
+    try {
+      const cnt = async () => (await dbQuery("SELECT count(*)::int AS n FROM outbox WHERE kind = 'memory.sync'")).rows[0].n;
+      const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.18.2.1" } });
+      const base = (await req("GET", "/api/grants/verify", { token: g.json.grant })).json.scope.memory.partitions[0];
+      const w = await req("POST", "/api/memory", { token: g.json.grant, body: { partition: base, key: "q", content: "guest secret" } });
+      expect(w.status).toBe(201);
+      const before = await cnt();
+      const f = await req("DELETE", "/api/memory/" + w.json.memory.id, { token: g.json.grant });
+      expect(f.status).toBe(200);
+      expect(await cnt()).toBe(before); // guest forget enqueued NO sync (was +1 before the fix)
+      // a normal tenant's forget DOES sync
+      const t = await newTenant("forget-sync", "pro");
+      const nw = await req("POST", "/api/memory", { token: t.token, body: { partition: "tenant", key: "n", content: "x" } });
+      const b2 = await cnt();
+      await req("DELETE", "/api/memory/" + nw.json.memory.id, { token: t.token });
+      expect(await cnt()).toBe(b2 + 1);
+    } finally {
+      if (savedUrl === undefined) delete process.env.COG_BRIDGE_URL; else process.env.COG_BRIDGE_URL = savedUrl;
+      if (savedTok === undefined) delete process.env.COG_BRIDGE_TOKEN; else process.env.COG_BRIDGE_TOKEN = savedTok;
+    }
+  });
+
+  test("MED: the guest byte cap applies to UPDATES too (was bypassable via existing keys)", async () => {
+    const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.18.3.1" } });
+    const base = (await req("GET", "/api/grants/verify", { token: g.json.grant })).json.scope.memory.partitions[0];
+    await dbQuery(
+      "INSERT INTO memories (id,tenant,partition,key,content,tags,version,deleted,actor,updated_at) VALUES ('ka','guest-pool',$1,'ka',$2,'[]'::jsonb,1,false,'seed',now()),('kb','guest-pool',$1,'kb',$3,'[]'::jsonb,1,false,'seed',now())",
+      [base, "z".repeat(250000), "z".repeat(1000)],
+    );
+    // updating the EXISTING key kb to 20000 bytes pushes the partition total over the cap
+    const over = await req("POST", "/api/memory", { token: g.json.grant, body: { partition: base, key: "kb", content: "y".repeat(20000) } });
+    expect(over.status).toBe(413);
+    expect(over.json.error).toBe("memory_partition_bytes");
+  });
+});

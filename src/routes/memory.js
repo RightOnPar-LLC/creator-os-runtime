@@ -61,7 +61,7 @@ app.delete("/api/memory/:id", requireGrant("memory.write"), async (e) => {
   return (
     assertMemoryScope(t, a[0].partition),
     e.json({
-      memory: await forgetMemory(t.tenant.id, e.req.param("id")),
+      memory: await forgetMemory(t.tenant.id, e.req.param("id"), t),
     })
   );
 });
