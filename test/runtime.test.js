@@ -21,7 +21,7 @@ describe("1. /health", () => {
     const h = r.json;
     expect(h.ok).toBe(true);
     expect(h.service).toBe("creator-os-runtime");
-    expect(h.version).toBe("0.3.2");
+    expect(h.version).toBe("0.3.3");
     expect(h.policy).toBe("p1");
     expect(h.db).toBe(true);
     expect(h.killSwitch).toBe(false);
@@ -55,13 +55,13 @@ describe("1. /health", () => {
   });
 
   test("exports", () => {
-    expect(mod.VERSION).toBe("0.3.2");
+    expect(mod.VERSION).toBe("0.3.3");
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
     expect(Object.keys(mod.TIERS)).toEqual(["starter", "pro", "studio", "house"]);
     expect(Object.keys(mod.TEMPLATES)).toEqual(
-      ["probe", "tip-alert-bot", "paywall-link", "clip-poster", "dm-autoresponder", "webhook-relay"],
+      ["probe", "tip-alert-bot", "paywall-link", "clip-poster", "dm-autoresponder", "webhook-relay", "repo-app", "builder"],
     );
     expect(mod.CAPS.length).toBe(25);
     expect(mod.CAPS.slice(20)).toEqual(["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references"]);
@@ -95,7 +95,7 @@ describe("2. route table", () => {
   test("/.well-known/creator-os.json", async () => {
     const r = await req("GET", "/.well-known/creator-os.json");
     expect(r.status).toBe(200);
-    expect(r.json.version).toBe("0.3.2");
+    expect(r.json.version).toBe("0.3.3");
     expect(r.json.caps).toEqual(mod.CAPS);
     expect(r.json.templates.probe).toEqual({ desc: "Tiny HTTP responder that proves the deploy path", needs: [], estCents: 25 });
   });
@@ -136,7 +136,7 @@ describe("3. OAuth 2.1 + PKCE client flow", () => {
       grant_types_supported: ["authorization_code", "refresh_token"],
       code_challenge_methods_supported: ["S256"],
       token_endpoint_auth_methods_supported: ["none"],
-      scopes_supported: ["grant.issue", "grant.read", "cog.plan", "ledger.read"],
+      scopes_supported: ["grant.issue", "grant.read", "cog.plan", "ledger.read", "deploy.worker", "worker.status", "cog.execute", "lsp.diagnose"],
     });
     const p = await req("GET", "/.well-known/oauth-protected-resource/mcp");
     expect(p.json.resource).toBe(BASE + "/mcp");
@@ -212,7 +212,7 @@ describe("3. OAuth 2.1 + PKCE client flow", () => {
     expect(ok.json.token_type).toBe("Bearer");
     expect(ok.json.access_token).toMatch(/^cog1\./);
     expect(ok.json.refresh_token.length).toBeGreaterThan(20);
-    expect(ok.json.scope).toBe("memory.read memory.write ledger.read tenant.read");
+    expect(ok.json.scope).toBe("memory.read memory.write ledger.read tenant.read deploy.worker worker.status");
     expect(ok.json.expires_in).toBeGreaterThan(80000);
     access = ok.json.access_token;
     refresh = ok.json.refresh_token;
@@ -228,7 +228,7 @@ describe("3. OAuth 2.1 + PKCE client flow", () => {
     const r = await req("GET", "/api/grants/verify", { token: access });
     expect(r.status).toBe(200);
     expect(r.json.sub).toBe("product:devdesk");
-    expect(r.json.caps).toEqual(["memory.read", "memory.write", "ledger.read", "tenant.read"]);
+    expect(r.json.caps).toEqual(["memory.read", "memory.write", "ledger.read", "tenant.read", "deploy.worker", "worker.status"]);
     expect(r.json.scope.memory.partitions).toEqual(["agent:", "product:devdesk"]);
     expect(r.json.tenant).toBe(tenant.id);
     expect(r.json.depth).toBe(1);
@@ -283,9 +283,9 @@ describe("3. OAuth 2.1 + PKCE client flow", () => {
     expect(ref.status).toBe(200);
     const g2 = await req("GET", "/api/grants/verify", { token: ref.json.access_token });
     expect(g2.json.sub).toBe("product:devdesk");
-    expect(g2.json.caps).toEqual(["memory.read", "memory.write", "ledger.read", "tenant.read"]);
+    expect(g2.json.caps).toEqual(["memory.read", "memory.write", "ledger.read", "tenant.read", "deploy.worker", "worker.status"]);
     expect(g2.json.caps).not.toContain("grant.issue");
-    expect(ref.json.scope).toBe("memory.read memory.write ledger.read tenant.read");
+    expect(ref.json.scope).toBe("memory.read memory.write ledger.read tenant.read deploy.worker worker.status");
   });
 });
 
@@ -304,7 +304,7 @@ describe("4. MCP", () => {
 
   test("initialize + tools/list + ping + unknown method", async () => {
     const i = await mcp(t.token, "initialize", { protocolVersion: "2025-06-18" });
-    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.2" });
+    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.3" });
     expect(i.json.result.protocolVersion).toBe("2025-06-18");
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
@@ -349,7 +349,7 @@ describe("4. MCP", () => {
 
   test("runtime_health + grant_verify tools", async () => {
     const h = await mcp(t.token, "tools/call", { name: "runtime_health" });
-    expect(h.json.result.structuredContent.version).toBe("0.3.2");
+    expect(h.json.result.structuredContent.version).toBe("0.3.3");
     const v = await mcp(t.token, "tools/call", { name: "grant_verify" });
     expect(v.json.result.structuredContent.sub).toBe("tenant:root");
   });
@@ -701,7 +701,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("status report runs; every outbound call was blocked and is a known probe", async () => {
     const s = await req("GET", "/status.json");
     expect(s.status).toBe(200);
-    expect(s.json.version).toBe("0.3.2");
+    expect(s.json.version).toBe("0.3.3");
     expect(s.json.bodies.map((b) => b.up)).toEqual([false, false, false]);
     const allowed = new Set([
       "https://devdesk.meshtool.ai/health", "https://market.meshtool.ai/api/health",
