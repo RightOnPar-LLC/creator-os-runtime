@@ -111,6 +111,12 @@ export async function issueChildGrant(e, t, a, w = {}) {
       memory: {
         partitions: t.scope?.memory?.partitions ?? memoryPartitions(s),
       },
+      // a worker-template allow-list. A child inherits the parent's list when it
+      // omits one (fail-closed inheritance); absent entirely == wildcard, so every
+      // existing grant is unaffected. attenuationViolations enforces it as a ceiling.
+      ...(Array.isArray(t.scope?.templates ?? s.templates)
+        ? { templates: [...new Set((t.scope?.templates ?? s.templates).map(String))] }
+        : {}),
       ...(w?.codeWrite?.filesSha256 ? { code: { filesSha256: String(w.codeWrite.filesSha256) } } : {}),
     },
     T = normalizeUsage(t.budget ?? zeroUsage()),

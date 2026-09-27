@@ -1301,3 +1301,53 @@ describe("12b. public base URL host hardening (keyless surfaces)", () => {
     }
   });
 });
+
+describe("12c. probe-only deploy enforcement (scope.templates)", () => {
+  test("a guest grant carries scope.templates=['probe'] (the allow-list is on the grant, not just advertised)", async () => {
+    const g = await req("POST", "/api/guest");
+    const v = await req("GET", "/api/grants/verify", { token: g.json.grant });
+    expect(v.json.scope.templates).toEqual(["probe"]);
+  });
+
+  test("a guest is refused a paid template with a clean 403 — not charged, not planned — even with confirm:true", async () => {
+    const g = await req("POST", "/api/guest");
+    const paid = await req("POST", "/api/deploys", { token: g.json.grant, body: { name: "g-paid2", template: "tip-alert-bot", confirm: true } });
+    expect(paid.status).toBe(403);
+    expect(paid.json.error).toBe("template_not_allowed");
+    expect(paid.json.detail.allowed).toContain("probe");
+    expect(paid.json.detail.template).toBe("tip-alert-bot");
+    // not charged
+    expect((await req("GET", "/api/grants/verify", { token: g.json.grant })).json.remaining.usd_cents).toBe(500);
+    // not planned (no deploys row written)
+    expect((await dbQuery("SELECT count(*)::int AS n FROM deploys WHERE name = $1", ["g-paid2"])).rows[0].n).toBe(0);
+  });
+
+  test("a guest CAN still deploy the allowed probe (the allow-list does not over-block)", async () => {
+    const g = await req("POST", "/api/guest");
+    const probe = await req("POST", "/api/deploys", { token: g.json.grant, body: { name: "g-probe3", template: "probe" } });
+    expect(probe.json.error).not.toBe("template_not_allowed");
+    if (probe.status === 201) expect(probe.json.executed).not.toBe(true); // still gated by empty project scope
+  });
+
+  test("negative control: a restricted templates list cannot be widened, and a child inherits it when it omits one", async () => {
+    const root = await newTenant("tmpl-neg", "pro");
+    const A = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:a", caps: ["deploy.worker", "grant.issue"], scope: { templates: ["probe"] }, ttlSec: 600, budget: { usd_cents: 100, calls: 5, deploys: 2 } } });
+    expect(A.status).toBe(201);
+    expect((await req("GET", "/api/grants/verify", { token: A.json.token })).json.scope.templates).toEqual(["probe"]);
+    // widen attempt from A -> rejected (THE paired control: goes RED if the subset check is removed/inverted)
+    const bad = await req("POST", "/api/grants", { token: A.json.token, body: { sub: "agent:b", caps: ["deploy.worker"], scope: { templates: ["tip-alert-bot"] }, ttlSec: 300, budget: { usd_cents: 50, calls: 2, deploys: 1 } } });
+    expect(bad.status).toBe(403);
+    expect(bad.json.error).toBe("attenuation_violation");
+    expect(bad.json.detail).toContain("scope_templates_widened");
+    // omitting the scope inherits A's list (fail-closed) — it does NOT silently become wildcard
+    const C = await req("POST", "/api/grants", { token: A.json.token, body: { sub: "agent:c", caps: ["deploy.worker"], ttlSec: 300, budget: { usd_cents: 50, calls: 2, deploys: 1 } } });
+    expect(C.status).toBe(201);
+    expect((await req("GET", "/api/grants/verify", { token: C.json.token })).json.scope.templates).toEqual(["probe"]);
+  });
+
+  test("backward-compat: a wildcard grant (no scope.templates) is unrestricted — existing tenants keep full template access", async () => {
+    const t = await newTenant("tmpl-compat", "pro");
+    const dep = await req("POST", "/api/deploys", { token: t.token, body: { name: "compat-tip-1", template: "tip-alert-bot" } });
+    expect(dep.json.error).not.toBe("template_not_allowed"); // a non-probe template is fine for a wildcard grant
+  });
+});

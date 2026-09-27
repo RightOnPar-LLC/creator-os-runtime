@@ -23,13 +23,13 @@ import { SERVICE_NAME, VERSION } from "./config.js";
 import { TEMPLATES } from "./railway.js";
 
 /**
- * The one worker template a guest may deploy — the free probe. NOTE: probe-only
- * is NOT enforced at deploy yet (step 4). What actually stops a guest doing a
- * LIVE deploy today is the guest-pool tenant's EMPTY allowed_targets → empty
- * railway project scope → deployWorker refuses (no_target_project). requireDryRun
- * on the guest grant is a bypassable preview flag ({confirm:true} clears it), NOT
- * the guard. Step 4 must enforce this template allow-list at deploy and must not
- * rely on empty project scope (a future allowed_target would open real deploys).
+ * The one worker template a guest may deploy — the free probe. ENFORCED at deploy
+ * via the grant's scope.templates allow-list: deployWorker rejects any other
+ * template with 403 template_not_allowed BEFORE any charge or plan-insert, and
+ * attenuationViolations treats a parent's list as a ceiling (a child cannot widen
+ * it or drop back to wildcard). Two independent backstops remain: the guest-pool
+ * tenant's EMPTY project scope (no_target_project) and requireDryRun — so
+ * probe-only no longer rests on empty scope alone.
  */
 export var GUEST_TEMPLATE = "probe";
 
@@ -88,7 +88,7 @@ export async function issueGuestGrant({ agentName = "", homeUrl = "" } = {}) {
       ttlSec: g.maxTtlSec,
       budget: { usd_cents: g.usdCents, calls: g.deploysPerPeriod * 20, deploys: g.deploysPerPeriod },
       constraints: { maxWorkers: g.maxWorkers, maxReplicas: g.maxReplicas, allowDelete: false, requireDryRun: true },
-      scope: { memory: { partitions: ["guest/" + key] } },
+      scope: { memory: { partitions: ["guest/" + key] }, templates: [GUEST_TEMPLATE] },
     },
     "guest-welcome",
   );
