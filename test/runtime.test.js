@@ -1130,7 +1130,7 @@ describe("12. creator-worker deploy guard", () => {
 
 describe("12. guest-welcome (Phase 1)", () => {
   test("POST /api/guest issues a working grant + welcome package in one keyless call", async () => {
-    const r = await req("POST", "/api/guest", { body: { agent_name: "Wanderer" } });
+    const r = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.1.1" }, body: { agent_name: "Wanderer" } });
     expect(r.status).toBe(201);
     expect(typeof r.json.grant).toBe("string");
     expect(r.json.budget.total).toBe(500);
@@ -1156,17 +1156,17 @@ describe("12. guest-welcome (Phase 1)", () => {
   });
 
   test("a bodyless POST issues an anon guest; two guests get isolated memory partitions", async () => {
-    const a = await req("POST", "/api/guest");
+    const a = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.2.1" } });
     expect(a.status).toBe(201);
     const va = await req("GET", "/api/grants/verify", { token: a.json.grant });
     expect(va.json.sub.startsWith("guest:anon:")).toBe(true);
-    const b = await req("POST", "/api/guest");
+    const b = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.3.1" } });
     const vb = await req("GET", "/api/grants/verify", { token: b.json.grant });
     expect(va.json.scope.memory.partitions[0]).not.toBe(vb.json.scope.memory.partitions[0]);
   });
 
   test("a guest cannot issue grants or execute — those caps are absent, so it fails closed", async () => {
-    const g = await req("POST", "/api/guest");
+    const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.4.1" } });
     const issue = await req("POST", "/api/grants", { token: g.json.grant, body: { sub: "child", caps: ["grant.read"] } });
     expect(issue.status).toBe(403);
     const exec = await req("POST", "/api/cog/execute", { token: g.json.grant, body: { proposal: {} } });
@@ -1178,8 +1178,8 @@ describe("12. guest-welcome (Phase 1)", () => {
   });
 
   test("guests share ONE depth-0 pool parent — verified via admin, not inferred (the economic breaker seam)", async () => {
-    const a = await req("POST", "/api/guest");
-    const b = await req("POST", "/api/guest");
+    const a = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.5.1" } });
+    const b = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.6.1" } });
     const va = await req("GET", "/api/grants/verify", { token: a.json.grant });
     const vb = await req("GET", "/api/grants/verify", { token: b.json.grant });
     // a guest is a leaf: grant.read shows it only its own subtree, which is just itself
@@ -1197,7 +1197,7 @@ describe("12. guest-welcome (Phase 1)", () => {
   });
 
   test("a guest cannot do a LIVE deploy today — empty project scope refuses it (the real backstop, not requireDryRun)", async () => {
-    const g = await req("POST", "/api/guest");
+    const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.7.1" } });
     // probe with no target: guest-pool has empty allowed_targets, so no project is in scope → never a live worker
     const probe = await req("POST", "/api/deploys", { token: g.json.grant, body: { name: "g-probe", template: "probe" } });
     if (probe.status === 201) expect(probe.json.executed).not.toBe(true);
@@ -1237,7 +1237,7 @@ describe("12. guest-welcome (Phase 1)", () => {
   });
 
   test("the welcome package's directory URL actually resolves — no dangling promise", async () => {
-    const g = await req("POST", "/api/guest");
+    const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.8.1" } });
     const d = await req("GET", new URL(g.json.directory).pathname);
     expect(d.status).toBe(200);
     expect(Array.isArray(d.json.capabilities)).toBe(true);
@@ -1247,7 +1247,7 @@ describe("12. guest-welcome (Phase 1)", () => {
 
 describe("12b. public base URL host hardening (keyless surfaces)", () => {
   test("PUBLIC_URL wins over a forged X-Forwarded-Host in the welcome package", async () => {
-    const r = await req("POST", "/api/guest", { headers: { "x-forwarded-host": "evil.com" } });
+    const r = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.9.1",  "x-forwarded-host": "evil.com" } });
     expect(r.status).toBe(201);
     expect(r.json.directory.startsWith(BASE + "/")).toBe(true);
     expect(r.json.directory).not.toContain("evil.com");
@@ -1264,7 +1264,7 @@ describe("12b. public base URL host hardening (keyless surfaces)", () => {
     const saved = process.env.PUBLIC_URL;
     delete process.env.PUBLIC_URL;
     try {
-      const g = await req("POST", "/api/guest", { headers: { "x-forwarded-host": "evil.com" } });
+      const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.10.1",  "x-forwarded-host": "evil.com" } });
       expect(g.status).toBe(503);
       expect(g.json.error).toBe("public_url_unset");
       expect(g.json.detail).toEqual({ needs: "PUBLIC_URL" });
@@ -1280,7 +1280,7 @@ describe("12b. public base URL host hardening (keyless surfaces)", () => {
     const saved = process.env.PUBLIC_URL;
     delete process.env.PUBLIC_URL;
     try {
-      const r = await req("POST", "/api/guest");
+      const r = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.11.1" } });
       expect(r.status).toBe(201);
       expect(r.json.directory).toContain("127.0.0.1");
       expect(r.json.directory.endsWith("/directory")).toBe(true);
@@ -1304,13 +1304,13 @@ describe("12b. public base URL host hardening (keyless surfaces)", () => {
 
 describe("12c. probe-only deploy enforcement (scope.templates)", () => {
   test("a guest grant carries scope.templates=['probe'] (the allow-list is on the grant, not just advertised)", async () => {
-    const g = await req("POST", "/api/guest");
+    const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.12.1" } });
     const v = await req("GET", "/api/grants/verify", { token: g.json.grant });
     expect(v.json.scope.templates).toEqual(["probe"]);
   });
 
   test("a guest is refused a paid template with a clean 403 — not charged, not planned — even with confirm:true", async () => {
-    const g = await req("POST", "/api/guest");
+    const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.13.1" } });
     const paid = await req("POST", "/api/deploys", { token: g.json.grant, body: { name: "g-paid2", template: "tip-alert-bot", confirm: true } });
     expect(paid.status).toBe(403);
     expect(paid.json.error).toBe("template_not_allowed");
@@ -1323,7 +1323,7 @@ describe("12c. probe-only deploy enforcement (scope.templates)", () => {
   });
 
   test("a guest CAN still deploy the allowed probe (the allow-list does not over-block)", async () => {
-    const g = await req("POST", "/api/guest");
+    const g = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.14.1" } });
     const probe = await req("POST", "/api/deploys", { token: g.json.grant, body: { name: "g-probe3", template: "probe" } });
     expect(probe.json.error).not.toBe("template_not_allowed");
     if (probe.status === 201) expect(probe.json.executed).not.toBe(true); // still gated by empty project scope
@@ -1349,5 +1349,65 @@ describe("12c. probe-only deploy enforcement (scope.templates)", () => {
     const t = await newTenant("tmpl-compat", "pro");
     const dep = await req("POST", "/api/deploys", { token: t.token, body: { name: "compat-tip-1", template: "tip-alert-bot" } });
     expect(dep.json.error).not.toBe("template_not_allowed"); // a non-probe template is fine for a wildcard grant
+  });
+});
+
+describe("13. guest sybil defence (per-fingerprint, keyed on X-Real-IP)", () => {
+  const fpOf = async (token) => {
+    const id = (await req("GET", "/api/grants/verify", { token })).json.id;
+    return (await dbQuery("SELECT fp FROM guest_fingerprints WHERE grant_id = $1", [id])).rows[0].fp;
+  };
+
+  test("one active grant per fingerprint: a second mint from the SAME X-Real-IP is refused; a different IP is independent", async () => {
+    const ip = "10.13.1.1";
+    const first = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+    expect(first.status).toBe(201);
+    const second = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+    expect(second.status).toBe(409);
+    expect(second.json.error).toBe("guest_grant_active");
+    const other = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.13.1.2" } });
+    expect(other.status).toBe(201); // per-fingerprint isolation
+  });
+
+  test("rate limit: GUEST_MAX_PER_HOUR (3) mints per window per fingerprint, then 429", async () => {
+    const ip = "10.13.2.1";
+    const m1 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+    expect(m1.status).toBe(201);
+    const fp = await fpOf(m1.json.grant);
+    // clear the active-lock between mints so the RATE cap (not one-active) is what governs
+    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+    expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 2
+    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+    expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 3
+    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+    const m4 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+    expect(m4.status).toBe(429);
+    expect(m4.json.error).toBe("guest_rate_limited");
+  });
+
+  test("privacy: no raw IP is ever stored — only the salted HMAC fingerprint", async () => {
+    const ip = "203.0.113.77";
+    await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+    const rows = (await dbQuery("SELECT * FROM guest_fingerprints")).rows;
+    expect(JSON.stringify(rows)).not.toContain(ip); // the raw IP appears nowhere
+    expect(rows.every((r) => /^[0-9a-f]{64}$/.test(r.fp))).toBe(true); // every fp is a 64-hex hash
+  });
+
+  test("the salt salts AND rotates: the same IP yields a different fingerprint after rotation (old fingerprints unlinkable)", async () => {
+    const ip = "10.13.4.1";
+    const a = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+    expect(a.status).toBe(201);
+    const fp1 = await fpOf(a.json.grant);
+    await dbQuery("UPDATE settings SET updated_at = now() - interval '30 days' WHERE key = 'guest_fp_salt'"); // force rotation
+    const b = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } }); // rotated salt -> new fp -> not one-active-blocked
+    expect(b.status).toBe(201);
+    const fp2 = await fpOf(b.json.grant);
+    expect(fp2).not.toBe(fp1);
+  });
+
+  test("Law 5 — the directory advertises exactly what is enforced", async () => {
+    const r = await req("GET", "/directory", { headers: { "x-real-ip": "10.13.5.1" } });
+    expect(r.json.rules.issuance.per_fingerprint_per_hour).toBe(3); // GUEST_MAX_PER_HOUR default
+    expect(r.json.rules.issuance.one_active_grant_per_fingerprint).toBe(true);
   });
 });

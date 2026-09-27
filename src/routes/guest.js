@@ -8,7 +8,12 @@ import { HttpError } from "../util.js";
 import { isKillSwitchOn } from "../db.js";
 import { app, readJsonBody } from "../http.js";
 import { publicBaseUrl } from "../oauth.js";
-import { directory, issueGuestGrant, welcomePackage } from "../guest.js";
+import { directory, issueGuestGrantGuarded, welcomePackage } from "../guest.js";
+
+// The visitor's client IP for the sybil fingerprint. On Railway, X-Real-IP is the
+// edge-set client IP (docs: "for identifying client's remote IP") and is trusted;
+// X-Forwarded-For is client-appendable there, so it is only a dev/test fallback.
+const clientIp = (e) => e.req.header("x-real-ip") || (e.req.header("x-forwarded-for") || "").split(",")[0].trim() || "noip";
 
 // The public capability shopfront + house rules. No grant needed — this is what
 // a guest reads to decide what to buy, and where the welcome package's
@@ -25,6 +30,7 @@ app.post("/api/guest", async (e) => {
     a = {};
   }
   if (typeof a !== "object" || Array.isArray(a)) throw new HttpError(400, "bad_body");
-  let r = await issueGuestGrant({ agentName: a.agent_name, homeUrl: a.home_url });
+  // sybil-gated: one active guest per fingerprint + a per-window mint cap (409/429).
+  let r = await issueGuestGrantGuarded({ ip: clientIp(e), agentName: a.agent_name, homeUrl: a.home_url });
   return e.json(welcomePackage(r.row, r.token, publicBaseUrl(e)), 201);
 });

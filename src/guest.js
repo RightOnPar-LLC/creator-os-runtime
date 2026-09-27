@@ -15,11 +15,12 @@
 // capped to the guest ENVELOPE (TIERS.guest: 500 usdCents, 3600s, one worker,
 // depth 1), not the pool tenant's tier — the deploy path binds the grant's own
 // constraints and budget, only deploysPerPeriod reads the tenant tier.
-import { getTenant, sql } from "./db.js";
-import { nowSec, newId, parseJson } from "./util.js";
+import { randomBytes } from "crypto";
+import { getTenant, getSetting, setSetting, sql } from "./db.js";
+import { nowSec, newId, parseJson, hmacSha256, HttpError } from "./util.js";
 import { issueChildGrant, mintRootGrant } from "./grants.js";
 import { TIERS } from "./policy.js";
-import { SERVICE_NAME, VERSION } from "./config.js";
+import { SERVICE_NAME, VERSION, GUEST_MAX_PER_HOUR, GUEST_FP_WINDOW_SEC, GUEST_FP_SALT_TTL_SEC } from "./config.js";
 import { TEMPLATES } from "./railway.js";
 
 /**
@@ -94,6 +95,64 @@ export async function issueGuestGrant({ agentName = "", homeUrl = "" } = {}) {
   );
 }
 
+// ── sybil defence (step 4) ────────────────────────────────────────────────────
+// A per-visitor fingerprint gates the keyless mint: one active guest grant per
+// fingerprint + GUEST_MAX_PER_HOUR mints per window. The fingerprint is
+// HMAC(salt, clientIp) — only a 64-hex hash is stored, never a raw IP — and the
+// salt self-rotates so old fingerprints become unlinkable. The route passes
+// Railway's TRUSTED X-Real-IP (docs: Railway sets it as the client's remote IP);
+// X-Forwarded-For is NOT trusted on Railway (client-appendable). This is a speed
+// bump, not the breaker — the pool budget + reaper is the real economic limit.
+async function currentSalt() {
+  let row = (await sql`SELECT value, extract(epoch from updated_at)::bigint AS ts FROM settings WHERE key = 'guest_fp_salt'`)[0];
+  if (row && row.value && nowSec() - Number(row.ts) < GUEST_FP_SALT_TTL_SEC) return row.value;
+  let salt = randomBytes(32).toString("hex");
+  await setSetting("guest_fp_salt", salt); // self-init + self-rotate; no cron, no index.js change
+  return salt;
+}
+// IP ONLY. Folding agent_name in would let one IP mint unlimited grants by varying the name.
+export async function guestFingerprint(ip) {
+  return hmacSha256(await currentSalt(), String(ip || "noip"));
+}
+// ONE atomic upsert enforces BOTH invariants (one-active via grant_exp<=now, rate
+// via count<max in-window); an empty RETURNING means denied, then one SELECT classifies.
+async function claimGuestFingerprint(fp, predictedExp) {
+  let now = nowSec(),
+    win = Math.floor(now / GUEST_FP_WINDOW_SEC) * GUEST_FP_WINDOW_SEC,
+    rows = await sql`
+      INSERT INTO guest_fingerprints (fp, grant_id, grant_exp, window_start, count, updated_at)
+      VALUES (${fp}, ${null}, ${predictedExp}, ${win}, 1, ${now})
+      ON CONFLICT (fp) DO UPDATE SET
+        count = CASE WHEN guest_fingerprints.window_start = ${win} THEN guest_fingerprints.count + 1 ELSE 1 END,
+        window_start = ${win}, grant_exp = ${predictedExp}, updated_at = ${now}
+      WHERE guest_fingerprints.grant_exp <= ${now}
+        AND (guest_fingerprints.window_start <> ${win} OR guest_fingerprints.count < ${GUEST_MAX_PER_HOUR})
+      RETURNING count`;
+  if (Math.random() < 0.01)
+    await sql`DELETE FROM guest_fingerprints WHERE grant_exp <= ${now} AND window_start < ${now - GUEST_FP_WINDOW_SEC}`;
+  if (!rows.length) {
+    let cur = (await sql`SELECT grant_exp FROM guest_fingerprints WHERE fp = ${fp}`)[0];
+    if (cur && Number(cur.grant_exp) > now) throw new HttpError(409, "guest_grant_active");
+    throw new HttpError(429, "guest_rate_limited");
+  }
+}
+// The guarded entrypoint the route calls: fingerprint-gate, mint, then bind the
+// real grant id/exp. A mint failure releases the active-lock (grant_exp=0) so a
+// failed attempt can't lock a fingerprint for a window.
+export async function issueGuestGrantGuarded({ ip = "noip", agentName = "", homeUrl = "" } = {}) {
+  let fp = await guestFingerprint(ip),
+    predictedExp = nowSec() + TIERS.guest.maxTtlSec;
+  await claimGuestFingerprint(fp, predictedExp);
+  try {
+    let r = await issueGuestGrant({ agentName, homeUrl });
+    await sql`UPDATE guest_fingerprints SET grant_id = ${r.row.id}, grant_exp = ${Number(r.row.exp)} WHERE fp = ${fp}`;
+    return r;
+  } catch (e) {
+    await sql`UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = ${fp} AND grant_id IS NULL`;
+    throw e;
+  }
+}
+
 /**
  * The published guest policy — ONE source of truth. The directory serves it as
  * the #rules section, and step 4's sybil enforcement reads the SAME constants,
@@ -101,7 +160,7 @@ export async function issueGuestGrant({ agentName = "", homeUrl = "" } = {}) {
  * here is enforced until step 4; nothing is deployed until step 4 either.
  */
 export var GUEST_POLICY = {
-  issuance: { per_fingerprint_per_hour: 3, one_active_grant_per_fingerprint: true },
+  issuance: { per_fingerprint_per_hour: GUEST_MAX_PER_HOUR, one_active_grant_per_fingerprint: true },
   guest_grant: {
     budget_usd_cents: TIERS.guest.usdCents,
     ttl_sec: TIERS.guest.maxTtlSec,

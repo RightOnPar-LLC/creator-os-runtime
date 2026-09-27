@@ -56,3 +56,9 @@ export var armedIntegrations = () => ({
   lspMcp: !!env.LSP_MCP_URL,
 });
 export var RATE_LIMIT_MAX_PER_MIN = Number(env.RATE_LIMIT_PER_MIN || 120);
+// Guest sybil defence knobs (step 4). Per-fingerprint: one active guest grant at
+// a time + this many mints per window. Salt rotates so old fingerprints become
+// unlinkable. Tune from real traffic — start strict.
+export var GUEST_MAX_PER_HOUR = Number(env.GUEST_MAX_PER_HOUR || 3);
+export var GUEST_FP_WINDOW_SEC = Number(env.GUEST_FP_WINDOW_SEC || 3600);
+export var GUEST_FP_SALT_TTL_SEC = Number(env.GUEST_FP_SALT_TTL_SEC || 604800);
