@@ -1,5 +1,5 @@
 {
-  "count": 140,
+  "count": 141,
   "appRoutes": [
     "GET /health",
     "GET /api/admin/fingerprints",
@@ -131,6 +131,7 @@
     "POST /oauth/approve",
     "POST /oauth/approve",
     "POST /oauth/token",
+    "GET /.well-known/agent.json",
     "GET /",
     "GET /cockpit/:page",
     "GET /status.json",
@@ -217,6 +218,7 @@
     "GET /oauth/authorize :: public(consent page)",
     "POST /oauth/approve :: admin",
     "POST /oauth/token :: public(pkce/refresh)",
+    "GET /.well-known/agent.json :: public",
     "GET / :: public",
     "GET /cockpit/:page :: public(page)+admin(data)",
     "GET /status.json :: public",
