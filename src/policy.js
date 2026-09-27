@@ -31,6 +31,10 @@ export var CAPS = [
   "lsp.hover",
   "lsp.definition",
   "lsp.references",
+  // escrow keystone: the ONE capability an escrow custodian grant carries. It is a
+  // no-op marker (the custodian holds value and does nothing), present only so the
+  // custodian passes the no_caps floor; a payer must hold it to open an escrow.
+  "escrow.hold",
 ];
 var CAP_SET = new Set(CAPS);
 export var TIERS = {

@@ -118,6 +118,10 @@ export async function issueChildGrant(e, t, a, w = {}) {
         ? { templates: [...new Set((t.scope?.templates ?? s.templates).map(String))] }
         : {}),
       ...(w?.codeWrite?.filesSha256 ? { code: { filesSha256: String(w.codeWrite.filesSha256) } } : {}),
+      // escrow keystone: a validated escrow resolution block rides in scope. It is a
+      // data annotation, not authority (attenuationViolations ignores it and the
+      // custodian's only cap is the no-op escrow.hold), so it never widens the child.
+      ...(w?.escrow ? { escrow: w.escrow } : {}),
     },
     T = normalizeUsage(t.budget ?? zeroUsage()),
     R = clampConstraints(t.constraints ?? {}, i),
