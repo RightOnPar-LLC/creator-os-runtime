@@ -22,7 +22,15 @@ import { TIERS } from "./policy.js";
 import { SERVICE_NAME, VERSION } from "./config.js";
 import { TEMPLATES } from "./railway.js";
 
-/** The one worker template a guest may deploy — the free probe. Enforced at deploy in step 4; published in the directory now. */
+/**
+ * The one worker template a guest may deploy — the free probe. NOTE: probe-only
+ * is NOT enforced at deploy yet (step 4). What actually stops a guest doing a
+ * LIVE deploy today is the guest-pool tenant's EMPTY allowed_targets → empty
+ * railway project scope → deployWorker refuses (no_target_project). requireDryRun
+ * on the guest grant is a bypassable preview flag ({confirm:true} clears it), NOT
+ * the guard. Step 4 must enforce this template allow-list at deploy and must not
+ * rely on empty project scope (a future allowed_target would open real deploys).
+ */
 export var GUEST_TEMPLATE = "probe";
 
 /** The tenant every guest grant is a child of. Its root grant is the pool. */
@@ -33,8 +41,15 @@ export var GUEST_POOL_TIER = "house";
  * What a guest may do. NOT grant.issue, code.write, cog.execute, or any paid
  * surface. The public directory needs no capability, so there is no directory
  * cap here — a guest reads the shopfront like anyone.
+ *
+ * ledger.read is deliberately OMITTED (security review, 2026-09-27): /api/ledger
+ * and the ledger_query MCP tool are tenant-wide, and every guest shares the
+ * guest-pool tenant, so ledger.read would leak other guests' spend metadata
+ * (their sub/agent_name, refs, timestamps) — that is not "your own spend". A
+ * guest sees its own remaining budget via /api/grants/verify. Subtree-scoped
+ * own-ledger for pooled guests is a step-4 follow-up.
  */
-export var GUEST_CAPS = ["grant.read", "cog.plan", "memory.write", "ledger.read", "deploy.worker"];
+export var GUEST_CAPS = ["grant.read", "cog.plan", "memory.write", "deploy.worker"];
 
 /** Ensure the guest-pool tenant and an active, funded root grant exist; return the root grant row. */
 export async function ensureGuestPool() {
@@ -142,7 +157,7 @@ export function welcomePackage(row, token, baseUrl) {
     budget: { total: b.usd_cents, unit: "usdCents", renews_in_sec: Math.max(0, Number(row.exp) - nowSec()) },
     directory: baseUrl + "/directory",
     house_rules: baseUrl + "/directory#rules",
-    ledger: "query your own spend via ledger_query, or GET /api/ledger with this grant",
+    ledger: "your remaining budget is on your grant — GET /api/grants/verify with this grant",
     graduation: "settle 10 successful calls → resident grant (higher budget, longer TTL)",
   };
 }

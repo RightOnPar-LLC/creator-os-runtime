@@ -1143,7 +1143,8 @@ describe("12. guest-welcome (Phase 1)", () => {
     // the grant verifies and carries exactly the guest envelope
     const v = await req("GET", "/api/grants/verify", { token: r.json.grant });
     expect(v.status).toBe(200);
-    expect(v.json.caps).toEqual(["grant.read", "cog.plan", "memory.write", "ledger.read", "deploy.worker"]);
+    expect(v.json.caps).toEqual(["grant.read", "cog.plan", "memory.write", "deploy.worker"]);
+    expect(v.json.caps).not.toContain("ledger.read"); // tenant-wide ledger would leak other guests (security review)
     expect(v.json.depth).toBe(1);
     expect(v.json.tenant).toBe("guest-pool");
     expect(v.json.sub.startsWith("guest:Wanderer:")).toBe(true);
@@ -1176,13 +1177,35 @@ describe("12. guest-welcome (Phase 1)", () => {
     }
   });
 
-  test("guests share one depth-0 pool parent (its remaining budget is the economic breaker seam)", async () => {
+  test("guests share ONE depth-0 pool parent — verified via admin, not inferred (the economic breaker seam)", async () => {
     const a = await req("POST", "/api/guest");
-    const list = await req("GET", "/api/grants", { token: a.json.grant });
-    expect(list.status).toBe(200);
+    const b = await req("POST", "/api/guest");
+    const va = await req("GET", "/api/grants/verify", { token: a.json.grant });
+    const vb = await req("GET", "/api/grants/verify", { token: b.json.grant });
     // a guest is a leaf: grant.read shows it only its own subtree, which is just itself
-    expect(list.json.grants.length).toBe(1);
-    expect(list.json.grants[0].depth).toBe(1);
+    const own = await req("GET", "/api/grants", { token: a.json.grant });
+    expect(own.json.grants.length).toBe(1);
+    expect(own.json.grants[0].depth).toBe(1);
+    // the shared parent is real and depth-0 — checked with admin so the "shared pool" claim can't pass under a two-pool bug
+    const all = (await admin("GET", "/api/admin/grants")).json.grants;
+    const ga = all.find((g) => g.id === va.json.id), gb = all.find((g) => g.id === vb.json.id);
+    expect(ga.parent).toBeTruthy();
+    expect(ga.parent).toBe(gb.parent); // both descend from the SAME pool root
+    const parent = all.find((g) => g.id === ga.parent);
+    expect(parent.depth).toBe(0);
+    expect(parent.tenant).toBe("guest-pool");
+  });
+
+  test("a guest cannot do a LIVE deploy today — empty project scope refuses it (the real backstop, not requireDryRun)", async () => {
+    const g = await req("POST", "/api/guest");
+    // probe with no target: guest-pool has empty allowed_targets, so no project is in scope → never a live worker
+    const probe = await req("POST", "/api/deploys", { token: g.json.grant, body: { name: "g-probe", template: "probe" } });
+    if (probe.status === 201) expect(probe.json.executed).not.toBe(true);
+    else expect(probe.status).toBeGreaterThanOrEqual(400);
+    // a PAID template with confirm:true (which bypasses requireDryRun) is ALSO not executed — scope is the guard, not the flag
+    const paid = await req("POST", "/api/deploys", { token: g.json.grant, body: { name: "g-paid", template: "tip-alert-bot", confirm: true } });
+    if (paid.status === 201) expect(paid.json.executed).not.toBe(true);
+    else expect(paid.status).toBeGreaterThanOrEqual(400);
   });
 
   test("GET /directory is public and lists priced capabilities with an honest reliability sample", async () => {
@@ -1207,7 +1230,7 @@ describe("12. guest-welcome (Phase 1)", () => {
   test("the directory carries the house rules the welcome package points at (graduation, guest envelope)", async () => {
     const r = await req("GET", "/directory");
     expect(r.json.rules.graduation.settle_calls).toBe(10);
-    expect(r.json.rules.guest_grant.caps).toEqual(["grant.read", "cog.plan", "memory.write", "ledger.read", "deploy.worker"]);
+    expect(r.json.rules.guest_grant.caps).toEqual(["grant.read", "cog.plan", "memory.write", "deploy.worker"]);
     expect(r.json.rules.guest_grant.worker_template).toBe("probe");
     expect(r.json.rules.guest_grant.budget_usd_cents).toBe(500);
     expect(r.json.guest.grant_via.endsWith("/api/guest")).toBe(true);
