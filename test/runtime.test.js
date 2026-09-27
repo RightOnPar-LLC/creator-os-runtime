@@ -21,7 +21,7 @@ describe("1. /health", () => {
     const h = r.json;
     expect(h.ok).toBe(true);
     expect(h.service).toBe("creator-os-runtime");
-    expect(h.version).toBe("0.3.3");
+    expect(h.version).toBe("0.3.4");
     expect(h.policy).toBe("p1");
     expect(h.db).toBe(true);
     expect(h.killSwitch).toBe(false);
@@ -55,7 +55,7 @@ describe("1. /health", () => {
   });
 
   test("exports", () => {
-    expect(mod.VERSION).toBe("0.3.3");
+    expect(mod.VERSION).toBe("0.3.4");
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
@@ -95,7 +95,7 @@ describe("2. route table", () => {
   test("/.well-known/creator-os.json", async () => {
     const r = await req("GET", "/.well-known/creator-os.json");
     expect(r.status).toBe(200);
-    expect(r.json.version).toBe("0.3.3");
+    expect(r.json.version).toBe("0.3.4");
     expect(r.json.caps).toEqual(mod.CAPS);
     expect(r.json.templates.probe).toEqual({ desc: "Tiny HTTP responder that proves the deploy path", needs: [], estCents: 25 });
   });
@@ -304,7 +304,7 @@ describe("4. MCP", () => {
 
   test("initialize + tools/list + ping + unknown method", async () => {
     const i = await mcp(t.token, "initialize", { protocolVersion: "2025-06-18" });
-    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.3" });
+    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.4" });
     expect(i.json.result.protocolVersion).toBe("2025-06-18");
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
@@ -349,7 +349,7 @@ describe("4. MCP", () => {
 
   test("runtime_health + grant_verify tools", async () => {
     const h = await mcp(t.token, "tools/call", { name: "runtime_health" });
-    expect(h.json.result.structuredContent.version).toBe("0.3.3");
+    expect(h.json.result.structuredContent.version).toBe("0.3.4");
     const v = await mcp(t.token, "tools/call", { name: "grant_verify" });
     expect(v.json.result.structuredContent.sub).toBe("tenant:root");
   });
@@ -701,7 +701,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("status report runs; every outbound call was blocked and is a known probe", async () => {
     const s = await req("GET", "/status.json");
     expect(s.status).toBe(200);
-    expect(s.json.version).toBe("0.3.3");
+    expect(s.json.version).toBe("0.3.4");
     expect(s.json.bodies.map((b) => b.up)).toEqual([false, false, false]);
     const allowed = new Set([
       "https://devdesk.meshtool.ai/health", "https://market.meshtool.ai/api/health",
@@ -1091,5 +1091,39 @@ describe("11. diagnostics gate — refute round", () => {
     const all = (await req("GET", "/api/grants", { token: t.token })).json.grants;
     expect(all.filter((g) => g.status === "active").map((g) => g.sub).sort()).toEqual(["agent:tight", "tenant:root"]);
     expect(all.find((g) => g.parent === tight.json.id).status).toBe("revoked");
+  });
+});
+
+// ------------------------------------------------------------------------------------
+// 0.3.4: the creator-worker templates are refused until the repo is populated.
+describe("12. creator-worker deploy guard", () => {
+  test("creator-worker templates -> 409 until CREATOR_WORKER_READY; probe/repo-app unaffected; flag lifts it", async () => {
+    const prior = process.env.CREATOR_WORKER_READY; // harness default is "1"
+    const t = await newTenant("cw-guard");
+    const prefix = (await req("GET", "/api/grants/verify", { token: t.token })).json.scope.workers.namePrefix;
+    delete process.env.CREATOR_WORKER_READY; // the shipped default: guarded
+    try {
+      const r = await req("POST", "/api/deploys", { token: t.token, body: { name: prefix + "tip-1", template: "tip-alert-bot" } });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toBe("creator_worker_repo_unpopulated");
+      expect(r.json.detail.repo).toBe("RightOnPar-LLC/creator-worker");
+      // builder also builds from creator-worker -> guarded
+      expect((await req("POST", "/api/deploys", { token: t.token, body: { name: prefix + "b-1", template: "builder" } })).status).toBe(409);
+      // probe is image-based, never touches the repo
+      const p = await req("POST", "/api/deploys", { token: t.token, body: { name: prefix + "probe-1", template: "probe" } });
+      expect(p.status).toBe(201);
+      expect(p.json.status).toBe("dry_run");
+      // repo-app pointed at a different populated org repo is unaffected by the guard
+      const other = await req("POST", "/api/deploys", { token: t.token, body: { name: prefix + "app-1", template: "repo-app", repo: "RightOnPar-LLC/lsp-mcp" } });
+      expect(other.status).toBe(201);
+      // with the readiness flag the guard lifts (falls through to the normal dry run)
+      process.env.CREATOR_WORKER_READY = "1";
+      const ok = await req("POST", "/api/deploys", { token: t.token, body: { name: prefix + "tip-2", template: "tip-alert-bot" } });
+      expect(ok.status).toBe(201);
+      expect(ok.json.status).toBe("dry_run");
+    } finally {
+      if (prior === undefined) delete process.env.CREATOR_WORKER_READY;
+      else process.env.CREATOR_WORKER_READY = prior;
+    }
   });
 });
