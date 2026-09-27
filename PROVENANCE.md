@@ -186,3 +186,35 @@ retryable codes `-32801`/`-32802` with linear backoff (hover/definition/referenc
 to `main`, so there is no runtime bundle change here — recorded because the gate's
 correctness rides on this service. Both runtime services re-smoked ALL GREEN afterward
 (runtime.meshtool.ai and the Function), hover-on-hot-session included.
+
+## 0.3.3 — reconcile the label to the code, and put both services on it (2026-09-26)
+
+Three feature PRs shipped under one version string: #9 (the lsp-mcp diagnostics gate),
+#19 (the `operator_lsp_caps` toggle), #20 (autonomous deploys, `repo-app`/`builder`
+templates, `deploy.worker`+`worker.status` on the OAuth operator/devdesk profiles). Live
+had drifted three ways: runtime-svc auto-deployed each merge (last hash `e5f7a0bb`), the
+Function was still on the first 0.3.2 bundle (`2a305897`, no #19/#20), and the repo's saved
+`live/runtime-0.3.2.bundle.js` matched neither — all three labelled "0.3.2". #19 and #20 also
+merged with their characterisation tests not updated, so `master` was red (7 failures).
+
+0.3.3 closes it: the tests were reconciled to the intended behaviour of #19/#20 (new
+templates, the operator-lsp-caps routes in the snapshot, `scopes_supported` = the full
+operator caps, devdesk/operator profiles carrying `deploy.worker`+`worker.status`) — the
+7 failures were stale expectations, and the OAuth 401/400 were cascades from the scope
+assertion throwing before `access` was set, not issuance bugs. Suite 64/64 on source and on
+the bundle.
+
+- **File:** `live/runtime-0.3.3.bundle.js` — 95,580 bytes, sha256
+  `af1a52707e9434755b556e818ebc95048c21fdcc124a6eeaa6beb78bbd2a765e`. `npm run build` of this
+  commit; the Dockerfile builds the same bytes in-image (same pinned bun 1.4.2, same flags),
+  so runtime-svc's `/health` reports this hash after the merge deploy.
+- **runtime-svc** (runtime.meshtool.ai): deploys on push to master — 0.3.3 lands on the merge.
+- **Function `runtime`** (runtime-production-9d95): deployed to the SAME bundle via the
+  startCommand API so both services finally run identical bytes under an accurate label.
+- **Released deliberately** (DW: "yes, #20 is intended, release it"): #20 lets the OAuth
+  operator (claude.ai connector) and devdesk profiles deploy workers, and `AUTONOMOUS_DEPLOYS=1`
+  skips the first-run dry-run gate (budget/scope/limits still apply). `operator_lsp_caps` stays
+  a runtime toggle (on in production as of 2026-09-26).
+- **Verify:** `node live/verify.mjs --url https://runtime.meshtool.ai` and
+  `--url https://runtime-production-9d95.up.railway.app` both exit 0;
+  `lsp-mcp/test/smoke-live.mjs` green against both.
