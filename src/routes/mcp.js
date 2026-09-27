@@ -10,6 +10,7 @@ import { cogExecute, cogPlan } from "../cog.js";
 import { app, bearerToken, readJsonBody } from "../http.js";
 import { jsonRpcResponse, MCP_TOOLS } from "../mcp.js";
 import { publicBaseUrl } from "../oauth.js";
+import { issueGuestGrantGuarded, welcomePackage } from "../guest.js";
 
 app.get("/mcp", (e) =>
   e.json({
@@ -20,6 +21,24 @@ app.get("/mcp", (e) =>
   }),
 );
 app.post("/mcp", async (e) => {
+  let n = await readJsonBody(e),
+    r = n.id ?? null,
+    o = (l) =>
+      jsonRpcResponse(r, {
+        content: [{ type: "text", text: JSON.stringify(l) }],
+        structuredContent: l,
+      });
+  // THE ONE pre-grant door: keyless guest_welcome mints the SAME guest grant as the
+  // public POST /api/guest — same sybil gate, same GUEST_CAPS envelope, same pool
+  // breaker — and returns the welcome package. It never calls verifyGrant and always
+  // returns, so control never reaches the grant gate below; every other method and
+  // every other tools/call name falls through to the unchanged gate.
+  if (n.method === "tools/call" && n.params?.name === "guest_welcome") {
+    if (await isKillSwitchOn()) throw new HttpError(503, "runtime_paused");
+    let ip = e.req.header("x-real-ip") || (e.req.header("x-forwarded-for") || "").split(",")[0].trim() || "noip",
+      g = await issueGuestGrantGuarded({ ip, agentName: n.params?.arguments?.agent_name, homeUrl: n.params?.arguments?.home_url });
+    return e.json(o(welcomePackage(g.row, g.token, publicBaseUrl(e))));
+  }
   let t = bearerToken(e),
     a = (l) =>
       e.json(
@@ -55,8 +74,7 @@ app.post("/mcp", async (e) => {
     }
     throw l;
   }
-  let n = await readJsonBody(e),
-    r = n.id ?? null;
+  // n / r were read at the top (before the gate) so the keyless branch could see the method
   if (n.method === "notifications/initialized") return e.body(null, 202);
   if (n.method === "initialize")
     return e.json(
@@ -86,17 +104,7 @@ app.post("/mcp", async (e) => {
       }),
     );
   let s = n.params?.name,
-    i = n.params?.arguments || {},
-    o = (l) =>
-      jsonRpcResponse(r, {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(l),
-          },
-        ],
-        structuredContent: l,
-      });
+    i = n.params?.arguments || {};
   try {
     if (s === "runtime_health") {
       let E = !1;
@@ -216,8 +224,10 @@ app.post("/mcp", async (e) => {
       case "ledger_query":
         return e.json(
           o({
+            // subtree-scoped, mirroring GET /api/ledger — a pooled guest sees only its own rows
             ledger:
-              await sql`SELECT * FROM ledger WHERE tenant = ${c.tenant.id} ORDER BY id DESC LIMIT ${Math.min(200, Math.max(1, +i.limit || 50))}`,
+              await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${c.row.id} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
+              SELECT * FROM ledger WHERE tenant = ${c.tenant.id} AND grant_id IN (SELECT id FROM sub) ORDER BY id DESC LIMIT ${Math.min(200, Math.max(1, +i.limit || 50))}`,
           }),
         );
       case "memory_search": {
@@ -242,6 +252,7 @@ app.post("/mcp", async (e) => {
               String(i.content).slice(0, 20000),
               Array.isArray(i.tags) ? i.tags.map(String) : [],
               c.row.sub,
+              c, // auth → guest write cap + brain-sync quarantine
             ),
           }),
         );
@@ -254,7 +265,7 @@ app.post("/mcp", async (e) => {
           assertMemoryScope(c, E[0].partition),
           e.json(
             o({
-              memory: await forgetMemory(c.tenant.id, String(i.id)),
+              memory: await forgetMemory(c.tenant.id, String(i.id), c),
             }),
           )
         );
