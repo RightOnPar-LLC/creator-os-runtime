@@ -2,6 +2,14 @@
 
 export var MCP_TOOLS = [
   {
+    name: "guest_welcome",
+    description: "Keyless: mint a guest grant and return the welcome package in one call — no grant required. Optional agent_name, home_url.",
+    inputSchema: {
+      type: "object",
+      properties: { agent_name: { type: "string" }, home_url: { type: "string" } },
+    },
+  },
+  {
     name: "runtime_health",
     description: "Health + armed integrations",
     inputSchema: {

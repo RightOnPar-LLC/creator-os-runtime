@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS breakglass (
 CREATE TABLE IF NOT EXISTS rate_limits (
   grant_id TEXT NOT NULL, window_start BIGINT NOT NULL, count INT NOT NULL DEFAULT 0,
   PRIMARY KEY (grant_id, window_start));
+CREATE TABLE IF NOT EXISTS guest_fingerprints (
+  fp TEXT PRIMARY KEY, grant_id TEXT, grant_exp BIGINT NOT NULL DEFAULT 0,
+  window_start BIGINT NOT NULL, count INT NOT NULL DEFAULT 0, updated_at BIGINT NOT NULL DEFAULT 0);
 `;
 export async function migrateSchema() {
   for (let e of SCHEMA_SQL.split(";")

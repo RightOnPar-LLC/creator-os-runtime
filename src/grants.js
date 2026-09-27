@@ -111,6 +111,12 @@ export async function issueChildGrant(e, t, a, w = {}) {
       memory: {
         partitions: t.scope?.memory?.partitions ?? memoryPartitions(s),
       },
+      // a worker-template allow-list. A child inherits the parent's list when it
+      // omits one (fail-closed inheritance); absent entirely == wildcard, so every
+      // existing grant is unaffected. attenuationViolations enforces it as a ceiling.
+      ...(Array.isArray(t.scope?.templates ?? s.templates)
+        ? { templates: [...new Set((t.scope?.templates ?? s.templates).map(String))] }
+        : {}),
       ...(w?.codeWrite?.filesSha256 ? { code: { filesSha256: String(w.codeWrite.filesSha256) } } : {}),
     },
     T = normalizeUsage(t.budget ?? zeroUsage()),
@@ -305,14 +311,20 @@ export async function reapExpiredGrants({ limit = 500 } = {}) {
 // Postgres-backed (fixed 60s window keyed by grant id), not a process-local
 // Map: the runtime scales to multiple replicas and a replica-local bucket let
 // each replica give the same grant its own fresh budget (2026-09-25 fix).
-async function checkRateLimit(e) {
+// The fixed-60s-window limiter, keyed by an arbitrary string — the grant id for
+// the generic per-grant limit, or a namespaced key like `mw:<grant>` for the
+// guest memory-write meter. Returns true while under `max`.
+export async function checkNamedRateLimit(key, max) {
   let t = Math.floor(Date.now() / 60000) * 60000,
     a = (
-      await sql`INSERT INTO rate_limits (grant_id, window_start, count) VALUES (${e}, ${t}, 1)
+      await sql`INSERT INTO rate_limits (grant_id, window_start, count) VALUES (${key}, ${t}, 1)
       ON CONFLICT (grant_id, window_start) DO UPDATE SET count = rate_limits.count + 1 RETURNING count`
     )[0];
   if (Math.random() < 0.01) await sql`DELETE FROM rate_limits WHERE window_start < ${t - 300000}`;
-  return a.count <= RATE_LIMIT_MAX_PER_MIN;
+  return a.count <= max;
+}
+async function checkRateLimit(e) {
+  return checkNamedRateLimit(e, RATE_LIMIT_MAX_PER_MIN);
 }
 export async function verifyGrant(e, t, a, countRate = !0) {
   try {

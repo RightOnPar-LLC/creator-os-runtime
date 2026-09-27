@@ -12,6 +12,7 @@ import { app, recordSource } from "./http.js";
 import "./routes/core.js";
 import "./routes/admin.js";
 import "./routes/grants.js";
+import "./routes/guest.js";
 import "./routes/memory.js";
 import "./routes/railway-auth.js";
 import "./routes/webhooks.js";

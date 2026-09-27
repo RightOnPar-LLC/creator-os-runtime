@@ -178,6 +178,12 @@ export async function deployWorker(e, t, a, n) {
     o = t.target?.project || i.railway?.projects?.[0] || null,
     l = t.target?.environment || i.railway?.environments?.[0] || "production",
     c = String(t.name || "").toLowerCase();
+  // probe-only for guests (any template-restricted grant): reject a template not on
+  // the grant's allow-list BEFORE any plan-insert or settle, so a refused deploy is
+  // neither charged nor planned — and before the project checks, so it holds even if
+  // a project scope is ever opened. Absent list == wildcard (existing grants).
+  if (Array.isArray(i.templates) && !i.templates.includes(t.template))
+    throw new HttpError(403, "template_not_allowed", { template: t.template, allowed: i.templates });
   if (!/^[a-z0-9-]{3,48}$/.test(c)) throw new HttpError(400, "bad_worker_name");
   if (!c.startsWith(i.workers?.namePrefix || "\x00"))
     throw new HttpError(403, "out_of_scope", {

@@ -5,6 +5,7 @@ import { getGrant, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEv
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
 import { mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
+import { readGuestPool, guestPoolStatus } from "../guest.js";
 import { TEMPLATES } from "../railway.js";
 import { app, readJsonBody, requireAdmin } from "../http.js";
 
@@ -217,12 +218,14 @@ app.get("/api/admin/overview", requireAdmin, async (e) => {
     sql`SELECT source, count(*)::int n FROM webhook_events GROUP BY source`,
     sql`SELECT kind, sum(usd_cents)::int usd_cents, sum(deploys)::int deploys FROM ledger GROUP BY kind`,
   ]);
+  let gp = await readGuestPool();
   return e.json({
     tenants: t,
     grants: a,
     deploys: n,
     webhooks: r,
     ledger: s,
+    guest_pool: gp ? guestPoolStatus(gp) : { open: true, remaining_slots: null, note: "not initialized" },
     killSwitch: await isKillSwitchOn(),
     operatorLspCaps: await isOperatorLspCapsEnabled(),
     armed: armedIntegrations(),

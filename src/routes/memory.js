@@ -29,6 +29,7 @@ app.post("/api/memory", requireGrant("memory.write"), async (e) => {
         a.content.slice(0, 20000),
         Array.isArray(a.tags) ? a.tags.slice(0, 20).map(String) : [],
         t.row.sub,
+        t, // auth → guest write cap + brain-sync quarantine
       ),
     },
     201,
@@ -60,7 +61,7 @@ app.delete("/api/memory/:id", requireGrant("memory.write"), async (e) => {
   return (
     assertMemoryScope(t, a[0].partition),
     e.json({
-      memory: await forgetMemory(t.tenant.id, e.req.param("id")),
+      memory: await forgetMemory(t.tenant.id, e.req.param("id"), t),
     })
   );
 });
