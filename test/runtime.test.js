@@ -63,8 +63,8 @@ describe("1. /health", () => {
     expect(Object.keys(mod.TEMPLATES)).toEqual(
       ["probe", "tip-alert-bot", "paywall-link", "clip-poster", "dm-autoresponder", "webhook-relay", "repo-app", "builder"],
     );
-    expect(mod.CAPS.length).toBe(25);
-    expect(mod.CAPS.slice(20)).toEqual(["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references"]);
+    expect(mod.CAPS.length).toBe(26);
+    expect(mod.CAPS.slice(20)).toEqual(["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references", "escrow.hold"]);
     expect(mod.default.port).toBe(3000);
     expect(mod.default.fetch).toBe(mod.app.fetch);
     expect(Object.keys(mod).sort()).toEqual(
@@ -1125,5 +1125,90 @@ describe("12. creator-worker deploy guard", () => {
       if (prior === undefined) delete process.env.CREATOR_WORKER_READY;
       else process.env.CREATOR_WORKER_READY = prior;
     }
+  });
+});
+
+describe("13. escrow keystone (stage 1: open + read)", () => {
+  const remainingOf = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
+  const openBody = (over = {}) => ({ amount: 500, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+
+  test("open HOLDS value: the amount is reserved off the payer and the escrow reads back open", async () => {
+    const root = await newTenant("escrow-a", "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const open = await req("POST", "/api/escrow", { token: root.token, body: openBody() });
+    expect(open.status).toBe(201);
+    expect(open.json.escrow.state).toBe("open");
+    expect(open.json.escrow.amount).toBe(500);
+    expect(open.json.escrow.denom).toBe("mesh");
+    expect(open.json.escrow.payee_tenant).toBe("t_payee");
+    expect(typeof open.json.token).toBe("string"); // the custodian's own grant token
+    // the HOLD: the payer's remaining dropped by exactly the committed amount
+    expect((await remainingOf(root.token)).usd_cents).toBe(before - 500);
+    // and it reads back by its grant id
+    const got = await req("GET", "/api/escrow/" + open.json.escrow.grant_id, { token: root.token });
+    expect(got.status).toBe(200);
+    expect(got.json.escrow.state).toBe("open");
+    expect(got.json.escrow.amount).toBe(500);
+  });
+
+  test("CONTROL: a usd (real-money) escrow is refused at the door — money-out is a hard floor", async () => {
+    const root = await newTenant("escrow-usd", "pro");
+    const r = await req("POST", "/api/escrow", { token: root.token, body: openBody({ denom: "usd" }) });
+    expect(r.status).toBe(403);
+    expect(r.json.error).toBe("escrow_usd_gated");
+  });
+
+  test("CONTROL: an unknown condition kind is refused (no un-satisfiable escrow can be opened)", async () => {
+    const root = await newTenant("escrow-cond", "pro");
+    const r = await req("POST", "/api/escrow", { token: root.token, body: openBody({ condition: { kind: "whenever" } }) });
+    expect(r.status).toBe(400);
+    expect(r.json.error).toBe("escrow_condition_unknown");
+  });
+
+  test("CONTROL: amount and payee_tenant are required", async () => {
+    const root = await newTenant("escrow-req", "pro");
+    expect((await req("POST", "/api/escrow", { token: root.token, body: openBody({ amount: 0 }) })).json.error).toBe("escrow_amount_required");
+    expect((await req("POST", "/api/escrow", { token: root.token, body: openBody({ payee_tenant: "" }) })).json.error).toBe("escrow_payee_tenant_required");
+  });
+
+  test("CONTROL: held value is un-spendable while escrowed — the payer cannot spend it elsewhere", async () => {
+    const root = await newTenant("escrow-lock", "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const open = await req("POST", "/api/escrow", { token: root.token, body: openBody({ amount: before }) }); // hold ALL usd
+    expect(open.status).toBe(201);
+    expect((await remainingOf(root.token)).usd_cents).toBe(0);
+    // now a child needing even 1 cent must be refused — the value is locked in the escrow.
+    // (the attenuation gate catches the over-budget child first, at 403, with the reason in detail)
+    const child = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:x", caps: ["grant.read"], ttlSec: 3600, budget: { usd_cents: 1, calls: 1, deploys: 0 } } });
+    expect(child.status).toBe(403);
+    expect(child.json.detail).toContain("budget_exceeds_parent_remaining");
+  });
+
+  test("refund via revoke returns the held value to the payer and flips the escrow to refunded", async () => {
+    const root = await newTenant("escrow-refund", "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const open = await req("POST", "/api/escrow", { token: root.token, body: openBody() });
+    expect((await remainingOf(root.token)).usd_cents).toBe(before - 500);
+    // revoke the custodian grant -> release-to-parent (the refund path; timed auto-refund lands with the reaper, PR #24)
+    const rev = await req("POST", "/api/grants/" + open.json.escrow.grant_id + "/revoke", { token: root.token, body: { reason: "test refund" } });
+    expect(rev.status).toBe(200);
+    expect((await remainingOf(root.token)).usd_cents).toBe(before); // held value back in full
+    const got = await req("GET", "/api/escrow/" + open.json.escrow.grant_id, { token: root.token });
+    expect(got.json.escrow.state).toBe("refunded");
+  });
+
+  test("CONTROL: opening an escrow requires the escrow.hold cap", async () => {
+    const root = await newTenant("escrow-cap", "pro");
+    // a child WITHOUT escrow.hold cannot open an escrow
+    const child = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:noesc", caps: ["grant.read"], ttlSec: 3600, budget: { usd_cents: 1000, calls: 2, deploys: 0 } } });
+    expect(child.status).toBe(201);
+    const r = await req("POST", "/api/escrow", { token: child.json.token, body: openBody({ amount: 100 }) });
+    expect(r.status).toBe(403);
+  });
+
+  test("CONTROL: a plain grant is not an escrow; an unknown id is not found", async () => {
+    const root = await newTenant("escrow-notesc", "pro");
+    expect((await req("GET", "/api/escrow/" + root.grantId, { token: root.token })).status).toBe(404); // the root grant is not an escrow
+    expect((await req("GET", "/api/escrow/gr_nope", { token: root.token })).status).toBe(404);
   });
 });
