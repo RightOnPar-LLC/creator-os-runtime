@@ -1,5 +1,5 @@
 {
-  "count": 132,
+  "count": 133,
   "appRoutes": [
     "GET /health",
     "GET /api/admin/fingerprints",
@@ -85,6 +85,7 @@
     "POST /api/events",
     "GET /api/tenant",
     "GET /api/tenant",
+    "POST /api/guest",
     "POST /api/memory",
     "POST /api/memory",
     "GET /api/memory",
@@ -178,6 +179,7 @@
     "GET /api/events :: grant:tenant.read",
     "POST /api/events :: grant:webhook.emit",
     "GET /api/tenant :: grant:tenant.read",
+    "POST /api/guest :: public",
     "POST /api/memory :: grant:memory.write",
     "GET /api/memory :: grant:memory.read",
     "GET /api/memory/:id :: grant:memory.read",

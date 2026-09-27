@@ -1127,3 +1127,61 @@ describe("12. creator-worker deploy guard", () => {
     }
   });
 });
+
+describe("12. guest-welcome (Phase 1)", () => {
+  test("POST /api/guest issues a working grant + welcome package in one keyless call", async () => {
+    const r = await req("POST", "/api/guest", { body: { agent_name: "Wanderer" } });
+    expect(r.status).toBe(201);
+    expect(typeof r.json.grant).toBe("string");
+    expect(r.json.budget.total).toBe(500);
+    expect(r.json.budget.unit).toBe("usdCents");
+    expect(r.json.budget.renews_in_sec).toBeGreaterThan(0);
+    expect(r.json.budget.renews_in_sec).toBeLessThanOrEqual(3600);
+    expect(r.json.directory.endsWith("/directory")).toBe(true);
+    expect(r.json.house_rules.endsWith("/directory#rules")).toBe(true);
+    expect(typeof r.json.graduation).toBe("string");
+    // the grant verifies and carries exactly the guest envelope
+    const v = await req("GET", "/api/grants/verify", { token: r.json.grant });
+    expect(v.status).toBe(200);
+    expect(v.json.caps).toEqual(["grant.read", "cog.plan", "memory.write", "ledger.read", "deploy.worker"]);
+    expect(v.json.depth).toBe(1);
+    expect(v.json.tenant).toBe("guest-pool");
+    expect(v.json.sub.startsWith("guest:Wanderer:")).toBe(true);
+    expect(v.json.budget.usd_cents).toBe(500);
+    expect(v.json.constraints.maxWorkers).toBe(1);
+    expect(v.json.constraints.requireDryRun).toBe(true);
+    expect(v.json.scope.memory.partitions.length).toBe(1);
+    expect(v.json.scope.memory.partitions[0].startsWith("guest/")).toBe(true);
+  });
+
+  test("a bodyless POST issues an anon guest; two guests get isolated memory partitions", async () => {
+    const a = await req("POST", "/api/guest");
+    expect(a.status).toBe(201);
+    const va = await req("GET", "/api/grants/verify", { token: a.json.grant });
+    expect(va.json.sub.startsWith("guest:anon:")).toBe(true);
+    const b = await req("POST", "/api/guest");
+    const vb = await req("GET", "/api/grants/verify", { token: b.json.grant });
+    expect(va.json.scope.memory.partitions[0]).not.toBe(vb.json.scope.memory.partitions[0]);
+  });
+
+  test("a guest cannot issue grants or execute — those caps are absent, so it fails closed", async () => {
+    const g = await req("POST", "/api/guest");
+    const issue = await req("POST", "/api/grants", { token: g.json.grant, body: { sub: "child", caps: ["grant.read"] } });
+    expect(issue.status).toBe(403);
+    const exec = await req("POST", "/api/cog/execute", { token: g.json.grant, body: { proposal: {} } });
+    expect(exec.status).toBe(403);
+    const v = await req("GET", "/api/grants/verify", { token: g.json.grant });
+    for (const forbidden of ["grant.issue", "code.write", "cog.execute", "store.clips.publish"]) {
+      expect(v.json.caps.includes(forbidden)).toBe(false);
+    }
+  });
+
+  test("guests share one depth-0 pool parent (its remaining budget is the economic breaker seam)", async () => {
+    const a = await req("POST", "/api/guest");
+    const list = await req("GET", "/api/grants", { token: a.json.grant });
+    expect(list.status).toBe(200);
+    // a guest is a leaf: grant.read shows it only its own subtree, which is just itself
+    expect(list.json.grants.length).toBe(1);
+    expect(list.json.grants[0].depth).toBe(1);
+  });
+});
