@@ -43,14 +43,13 @@ export var GUEST_POOL_TIER = "house";
  * surface. The public directory needs no capability, so there is no directory
  * cap here — a guest reads the shopfront like anyone.
  *
- * ledger.read is deliberately OMITTED (security review, 2026-09-27): /api/ledger
- * and the ledger_query MCP tool are tenant-wide, and every guest shares the
- * guest-pool tenant, so ledger.read would leak other guests' spend metadata
- * (their sub/agent_name, refs, timestamps) — that is not "your own spend". A
- * guest sees its own remaining budget via /api/grants/verify. Subtree-scoped
- * own-ledger for pooled guests is a step-4 follow-up.
+ * ledger.read is RESTORED (step 4, 2026-09-27): /api/ledger and the ledger_query
+ * MCP tool are now SUBTREE-scoped (rows for the caller's own grant + descendants),
+ * and a pooled guest is a depth-1 leaf, so it reads only its own reserve/self-settle
+ * rows — never a sibling guest's or the pool root's. That is a real "your own spend"
+ * receipt, so a guest can spend and leave with one.
  */
-export var GUEST_CAPS = ["grant.read", "cog.plan", "memory.write", "deploy.worker"];
+export var GUEST_CAPS = ["grant.read", "cog.plan", "memory.write", "deploy.worker", "ledger.read"];
 
 /** Ensure the guest-pool tenant and an active, funded root grant exist; return the root grant row. */
 export async function ensureGuestPool() {
@@ -216,7 +215,7 @@ export function welcomePackage(row, token, baseUrl) {
     budget: { total: b.usd_cents, unit: "usdCents", renews_in_sec: Math.max(0, Number(row.exp) - nowSec()) },
     directory: baseUrl + "/directory",
     house_rules: baseUrl + "/directory#rules",
-    ledger: "your remaining budget is on your grant — GET /api/grants/verify with this grant",
+    ledger: baseUrl + "/api/ledger — your own subtree receipt; GET with this grant",
     graduation: "settle 10 successful calls → resident grant (higher budget, longer TTL)",
   };
 }

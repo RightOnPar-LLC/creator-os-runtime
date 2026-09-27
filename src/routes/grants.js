@@ -166,8 +166,15 @@ app.delete("/api/deploys/:id", requireGrant("worker.delete"), async (e) => {
 });
 app.get("/api/ledger", requireGrant("ledger.read"), async (e) => {
   let t = e.get("auth");
+  // SUBTREE-scoped, not tenant-wide: a caller sees only the ledger rows for its own
+  // grant and its descendants (same recursive CTE /api/grants uses). For a normal
+  // single-root tenant read by its root this is every row in the tenant (unchanged);
+  // for a pooled leaf guest it is only the guest's own reserve/self-settle rows, so
+  // one guest never sees another's spend. This is what lets ledger.read be a guest cap.
   return e.json({
-    ledger: await sql`SELECT * FROM ledger WHERE tenant = ${t.tenant.id} ORDER BY id DESC LIMIT 200`,
+    ledger:
+      await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${t.row.id} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
+      SELECT * FROM ledger WHERE tenant = ${t.tenant.id} AND grant_id IN (SELECT id FROM sub) ORDER BY id DESC LIMIT 200`,
   });
 });
 app.get("/api/events", requireGrant("tenant.read"), async (e) => {

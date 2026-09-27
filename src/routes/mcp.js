@@ -216,8 +216,10 @@ app.post("/mcp", async (e) => {
       case "ledger_query":
         return e.json(
           o({
+            // subtree-scoped, mirroring GET /api/ledger — a pooled guest sees only its own rows
             ledger:
-              await sql`SELECT * FROM ledger WHERE tenant = ${c.tenant.id} ORDER BY id DESC LIMIT ${Math.min(200, Math.max(1, +i.limit || 50))}`,
+              await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${c.row.id} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
+              SELECT * FROM ledger WHERE tenant = ${c.tenant.id} AND grant_id IN (SELECT id FROM sub) ORDER BY id DESC LIMIT ${Math.min(200, Math.max(1, +i.limit || 50))}`,
           }),
         );
       case "memory_search": {

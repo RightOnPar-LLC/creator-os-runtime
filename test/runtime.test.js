@@ -1143,8 +1143,7 @@ describe("12. guest-welcome (Phase 1)", () => {
     // the grant verifies and carries exactly the guest envelope
     const v = await req("GET", "/api/grants/verify", { token: r.json.grant });
     expect(v.status).toBe(200);
-    expect(v.json.caps).toEqual(["grant.read", "cog.plan", "memory.write", "deploy.worker"]);
-    expect(v.json.caps).not.toContain("ledger.read"); // tenant-wide ledger would leak other guests (security review)
+    expect(v.json.caps).toEqual(["grant.read", "cog.plan", "memory.write", "deploy.worker", "ledger.read"]);
     expect(v.json.depth).toBe(1);
     expect(v.json.tenant).toBe("guest-pool");
     expect(v.json.sub.startsWith("guest:Wanderer:")).toBe(true);
@@ -1230,7 +1229,7 @@ describe("12. guest-welcome (Phase 1)", () => {
   test("the directory carries the house rules the welcome package points at (graduation, guest envelope)", async () => {
     const r = await req("GET", "/directory");
     expect(r.json.rules.graduation.settle_calls).toBe(10);
-    expect(r.json.rules.guest_grant.caps).toEqual(["grant.read", "cog.plan", "memory.write", "deploy.worker"]);
+    expect(r.json.rules.guest_grant.caps).toEqual(["grant.read", "cog.plan", "memory.write", "deploy.worker", "ledger.read"]);
     expect(r.json.rules.guest_grant.worker_template).toBe("probe");
     expect(r.json.rules.guest_grant.budget_usd_cents).toBe(500);
     expect(r.json.guest.grant_via.endsWith("/api/guest")).toBe(true);
@@ -1409,5 +1408,44 @@ describe("13. guest sybil defence (per-fingerprint, keyed on X-Real-IP)", () => 
     const r = await req("GET", "/directory", { headers: { "x-real-ip": "10.13.5.1" } });
     expect(r.json.rules.issuance.per_fingerprint_per_hour).toBe(3); // GUEST_MAX_PER_HOUR default
     expect(r.json.rules.issuance.one_active_grant_per_fingerprint).toBe(true);
+  });
+});
+
+describe("14. guest own-ledger (subtree-scoped)", () => {
+  test("a guest reads ONLY its own ledger — never a sibling guest's or the pool root's", async () => {
+    const a = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.14.1.1" } });
+    const b = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.14.1.2" } });
+    const va = await req("GET", "/api/grants/verify", { token: a.json.grant });
+    const vb = await req("GET", "/api/grants/verify", { token: b.json.grant });
+    const led = await req("GET", "/api/ledger", { token: a.json.grant });
+    expect(led.status).toBe(200);
+    expect(led.json.ledger.length).toBeGreaterThanOrEqual(1); // its own 'reserve' row
+    expect(led.json.ledger.every((l) => l.grant_id === va.json.id)).toBe(true);
+    expect(led.json.ledger.some((l) => l.grant_id === vb.json.id)).toBe(false); // never a sibling's
+    expect(led.json.ledger.some((l) => l.kind === "root")).toBe(false); // never the pool root's
+  });
+
+  test("the isolation holds over the MCP ledger_query tool too", async () => {
+    const a = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.14.2.1" } });
+    const b = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.14.2.2" } });
+    const va = await req("GET", "/api/grants/verify", { token: a.json.grant });
+    const vb = await req("GET", "/api/grants/verify", { token: b.json.grant });
+    const r = await mcp(a.json.grant, "tools/call", { name: "ledger_query", arguments: { limit: 200 } });
+    const rows = r.json.result.structuredContent.ledger;
+    expect(rows.every((l) => l.grant_id === va.json.id)).toBe(true);
+    expect(rows.some((l) => l.grant_id === vb.json.id)).toBe(false);
+  });
+
+  test("normal tenant preserved: the root sees its whole subtree; a delegated child sees only its own rows", async () => {
+    const root = await newTenant("led-sub", "pro");
+    const child = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:led", caps: ["ledger.read", "deploy.worker"], ttlSec: 600, budget: { usd_cents: 50, calls: 3, deploys: 1 } } });
+    expect(child.status).toBe(201);
+    const vc = await req("GET", "/api/grants/verify", { token: child.json.token });
+    const rootLed = await req("GET", "/api/ledger", { token: root.token });
+    expect(rootLed.json.ledger.some((l) => l.grant_id === vc.json.id)).toBe(true); // subtree includes the child
+    expect(rootLed.json.ledger.some((l) => l.kind === "root")).toBe(true); // and its own root row
+    const childLed = await req("GET", "/api/ledger", { token: child.json.token });
+    expect(childLed.json.ledger.every((l) => l.grant_id === vc.json.id)).toBe(true); // only its own
+    expect(childLed.json.ledger.some((l) => l.kind === "root")).toBe(false); // not the root's
   });
 });
