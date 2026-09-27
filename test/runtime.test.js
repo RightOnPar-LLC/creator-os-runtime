@@ -1684,3 +1684,92 @@ describe("18. step-4 double-loop fixes (regression controls)", () => {
     expect(over.json.error).toBe("memory_partition_bytes");
   });
 });
+
+describe("reservation reaper (runtime-wide)", () => {
+  const past = Math.floor(Date.now() / 1000) - 60;
+  const remainingOf = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
+
+  test("drain -> reap -> recover: an expired child's unspent reservation returns to its parent, idempotently", async () => {
+    const root = await newTenant("reaper-a", "pro");
+    // intermediate parent P: small calls budget + the right to issue children
+    const P = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:P", caps: ["grant.issue", "deploy.worker"], ttlSec: 3600, budget: { usd_cents: 100, calls: 4, deploys: 2 } } });
+    expect(P.status).toBe(201);
+    const c1 = await req("POST", "/api/grants", { token: P.json.token, body: { sub: "agent:c1", caps: ["deploy.worker"], ttlSec: 3600, budget: { usd_cents: 10, calls: 2, deploys: 1 } } });
+    const c2 = await req("POST", "/api/grants", { token: P.json.token, body: { sub: "agent:c2", caps: ["deploy.worker"], ttlSec: 3600, budget: { usd_cents: 10, calls: 2, deploys: 1 } } });
+    expect(c1.status).toBe(201);
+    expect(c2.status).toBe(201);
+    // CONTROL: P is drained (this assertion FAILS if the reaper is a no-op later)
+    expect((await remainingOf(P.json.token)).calls).toBe(0);
+    const denied = await req("POST", "/api/grants", { token: P.json.token, body: { sub: "agent:c3", caps: ["deploy.worker"], ttlSec: 3600, budget: { usd_cents: 10, calls: 1, deploys: 1 } } });
+    expect(denied.status).toBeGreaterThanOrEqual(400); // budget_exceeds_parent_remaining
+    // expire both children, sweep
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = ANY($2)", [past, [c1.json.id, c2.json.id]]);
+    const reaped = (await admin("POST", "/api/admin/grants/reap")).json.reaped;
+    expect(reaped).toContain(c1.json.id);
+    expect(reaped).toContain(c2.json.id);
+    // recovered: P's calls back to the full 4
+    expect((await remainingOf(P.json.token)).calls).toBe(4);
+    // idempotency: a second sweep releases nothing and does NOT over-credit (still 4, not 8)
+    const again = (await admin("POST", "/api/admin/grants/reap")).json.reaped;
+    expect(again).not.toContain(c1.json.id);
+    expect((await remainingOf(P.json.token)).calls).toBe(4);
+    // and issuance works again
+    const c4 = await req("POST", "/api/grants", { token: P.json.token, body: { sub: "agent:c4", caps: ["deploy.worker"], ttlSec: 3600, budget: { usd_cents: 10, calls: 1, deploys: 1 } } });
+    expect(c4.status).toBe(201);
+  });
+
+  test("no double-release across paths: revoking an already-reaped grant does not credit its parent a second time", async () => {
+    const root = await newTenant("reaper-b", "pro");
+    const P = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:P2", caps: ["grant.issue", "deploy.worker"], ttlSec: 3600, budget: { usd_cents: 100, calls: 3, deploys: 2 } } });
+    const c = await req("POST", "/api/grants", { token: P.json.token, body: { sub: "agent:cR", caps: ["deploy.worker"], ttlSec: 3600, budget: { usd_cents: 10, calls: 2, deploys: 1 } } });
+    expect(c.status).toBe(201);
+    expect((await remainingOf(P.json.token)).calls).toBe(1); // 3 - 2 reserved
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, c.json.id]);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).toContain(c.json.id);
+    expect((await remainingOf(P.json.token)).calls).toBe(3); // released once by the sweep
+    // now revoke the already-expired grant: it must be skipped, NOT release again
+    const rev = await req("POST", "/api/grants/" + c.json.id + "/revoke", { token: P.json.token, body: { reason: "post-reap" } });
+    expect(rev.status).toBe(200);
+    expect(rev.json.revoked).not.toContain(c.json.id); // already expired -> revoke skips it
+    expect((await remainingOf(P.json.token)).calls).toBe(3); // still 3, never 5
+  });
+
+  test("a root grant reaped safely: it flips to expired, releases nothing upward, and the sweep does not throw", async () => {
+    const root = await newTenant("reaper-root", "starter");
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, root.grantId]);
+    const reaped = (await admin("POST", "/api/admin/grants/reap")).json.reaped;
+    expect(Array.isArray(reaped)).toBe(true);
+    expect(reaped).toContain(root.grantId);
+    const grants = (await admin("GET", "/api/admin/grants")).json.grants;
+    expect(grants.find((g) => g.id === root.grantId).status).toBe("expired");
+  });
+
+  // Guards the deadlock fix's refactor: the sweep is now one txn PER GRANT over an
+  // unlocked, depth-DESC candidate scan (not one batch txn). This proves a full
+  // multi-level chain is still reaped in a single sweep and each parent is credited
+  // its child's unspent reservation at every level. (The deadlock itself is a
+  // lock-ordering invariant — single-grant child→parent txns cannot cycle in a tree —
+  // not a behavior this single-connection PGlite harness can exercise; see the PR.)
+  test("multi-level: a 3-deep expired chain is fully reaped in one sweep, crediting every parent", async () => {
+    const root = await newTenant("reaper-deep", "pro");
+    const P = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:dP", caps: ["grant.issue", "deploy.worker"], ttlSec: 3600, budget: { usd_cents: 100, calls: 6, deploys: 3 } } });
+    const C = await req("POST", "/api/grants", { token: P.json.token, body: { sub: "agent:dC", caps: ["grant.issue", "deploy.worker"], ttlSec: 3600, budget: { usd_cents: 50, calls: 4, deploys: 2 } } });
+    const GC = await req("POST", "/api/grants", { token: C.json.token, body: { sub: "agent:dGC", caps: ["deploy.worker"], ttlSec: 3600, budget: { usd_cents: 20, calls: 2, deploys: 1 } } });
+    expect(GC.status).toBe(201);
+    // reservations flowed up: C holds 2 of its 4 for GC; P holds 4 of its 6 for C
+    expect((await remainingOf(C.json.token)).calls).toBe(2);
+    expect((await remainingOf(P.json.token)).calls).toBe(2);
+    // expire the entire chain and sweep ONCE
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = ANY($2)", [past, [GC.json.id, C.json.id, P.json.id]]);
+    const reaped = (await admin("POST", "/api/admin/grants/reap")).json.reaped;
+    expect(reaped).toContain(GC.json.id);
+    expect(reaped).toContain(C.json.id);
+    expect(reaped).toContain(P.json.id);
+    // every level flipped and root got P's full unspent back (P used nothing → 6 calls returned)
+    const grants = (await admin("GET", "/api/admin/grants")).json.grants;
+    for (const id of [GC.json.id, C.json.id, P.json.id]) expect(grants.find((g) => g.id === id).status).toBe("expired");
+    const rootRow = grants.find((g) => g.id === root.grantId);
+    const reserved = typeof rootRow.reserved === "string" ? JSON.parse(rootRow.reserved) : rootRow.reserved || {};
+    expect(reserved.calls || 0).toBe(0); // P's reservation (6 calls) fully returned to root — chain released top-to-bottom
+  });
+});

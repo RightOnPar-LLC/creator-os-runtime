@@ -4,7 +4,7 @@ import { HttpError, newId } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
-import { mintRootGrant, revokeGrantTree } from "../grants.js";
+import { mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
 import { readGuestPool, guestPoolStatus } from "../guest.js";
 import { TEMPLATES } from "../railway.js";
 import { app, readJsonBody, requireAdmin } from "../http.js";
@@ -189,6 +189,10 @@ app.post("/api/admin/breakglass", requireAdmin, async (e) => {
     })
   );
 });
+// Static 4-segment path — distinct from the 5-segment /:id/{revoke,token}, so it
+// runs the sweep on demand for ops and for deterministic tests (the background
+// timer is disabled under test).
+app.post("/api/admin/grants/reap", requireAdmin, async (e) => e.json({ reaped: await reapExpiredGrants() }));
 app.post("/api/admin/grants/:id/revoke", requireAdmin, async (e) =>
   e.json({
     revoked: await revokeGrantTree(

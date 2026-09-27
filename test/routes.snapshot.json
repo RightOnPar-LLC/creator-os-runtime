@@ -1,5 +1,5 @@
 {
-  "count": 134,
+  "count": 136,
   "appRoutes": [
     "GET /health",
     "GET /api/admin/fingerprints",
@@ -33,6 +33,8 @@
     "GET /api/admin/policy",
     "POST /api/admin/breakglass",
     "POST /api/admin/breakglass",
+    "POST /api/admin/grants/reap",
+    "POST /api/admin/grants/reap",
     "POST /api/admin/grants/:id/revoke",
     "POST /api/admin/grants/:id/revoke",
     "POST /api/admin/grants/:id/token",
@@ -154,6 +156,7 @@
     "POST /api/admin/operator-lsp-caps/off :: admin",
     "GET /api/admin/policy :: admin",
     "POST /api/admin/breakglass :: admin",
+    "POST /api/admin/grants/reap :: admin",
     "POST /api/admin/grants/:id/revoke :: admin",
     "POST /api/admin/grants/:id/token :: admin",
     "GET /api/admin/overview :: admin",

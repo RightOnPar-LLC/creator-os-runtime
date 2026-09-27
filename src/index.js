@@ -5,6 +5,7 @@
 import { armedIntegrations, env, POLICY_VERSION, SERVICE_NAME, VERSION } from "./config.js";
 import { getSetting, migrateSchema, setSetting } from "./db.js";
 import { loadGrantSigningKey } from "./tokens.js";
+import { reapExpiredGrants } from "./grants.js";
 import { attenuationViolations, CAPS, gatehouseEvaluate, TIERS } from "./policy.js";
 import { TEMPLATES } from "./railway.js";
 import { app, recordSource } from "./http.js";
@@ -30,6 +31,19 @@ if (!(await getSetting("operator_lsp_caps"))) await setSetting("operator_lsp_cap
 console.log(
   `[${SERVICE_NAME} v${VERSION}] policy=${POLICY_VERSION} signingKey=${signingKeySource} armed=${JSON.stringify(armedIntegrations())}`,
 );
+// The reservation reaper: releases the unspent reservation of any EXPIRED grant
+// back to its parent (grants.js), so a pooling parent's budget stops draining to a
+// permanent 402. Default-on (no config needed); "0" disables. unref'd so it never
+// keeps the process alive; the manual trigger is POST /api/admin/grants/reap.
+var REAP_INTERVAL_MS = Number(env.REAP_INTERVAL_MS ?? 60000);
+if (REAP_INTERVAL_MS > 0) {
+  var reapTimer = setInterval(
+    () => reapExpiredGrants().catch((e) => console.error("[reaper]", e?.message || e)),
+    REAP_INTERVAL_MS,
+  );
+  reapTimer.unref?.();
+  console.log(`[${SERVICE_NAME}] reaper: every ${REAP_INTERVAL_MS}ms`);
+} else console.log(`[${SERVICE_NAME}] reaper: disabled (REAP_INTERVAL_MS=0)`);
 var LISTEN_PORT = Number(env.PORT || 3000);
 var serverConfig = {
   port: LISTEN_PORT,
