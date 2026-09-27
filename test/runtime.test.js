@@ -1449,3 +1449,81 @@ describe("14. guest own-ledger (subtree-scoped)", () => {
     expect(childLed.json.ledger.some((l) => l.kind === "root")).toBe(false); // not the root's
   });
 });
+
+describe("15. guest memory-write cap + brain-sync quarantine", () => {
+  const freshGuest = async (ip) => {
+    const g = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+    const v = await req("GET", "/api/grants/verify", { token: g.json.grant });
+    return { token: g.json.grant, base: v.json.scope.memory.partitions[0] };
+  };
+
+  test("guest writes are rate-capped tighter than the generic limit (10/min, own meter)", async () => {
+    const { token, base } = await freshGuest("10.15.1.1");
+    for (let i = 0; i < 10; i++) {
+      const w = await req("POST", "/api/memory", { token, body: { partition: base, key: "k" + i, content: "x" } });
+      expect(w.status).toBe(201);
+    }
+    const over = await req("POST", "/api/memory", { token, body: { partition: base, key: "k10", content: "x" } });
+    expect(over.status).toBe(429);
+    expect(over.json.error).toBe("memory_write_rate_limited"); // dedicated meter, not the generic 'rate_limited'
+  });
+
+  test("per-guest row cap, with updates to an existing key exempt", async () => {
+    const { token, base } = await freshGuest("10.15.2.1");
+    await dbQuery(
+      "INSERT INTO memories (id, tenant, partition, key, content, tags, version, deleted, actor, updated_at) SELECT 'seed_'||g, 'guest-pool', $1, 'seedkey_'||g, 'x', '[]'::jsonb, 1, false, 'seed', now() FROM generate_series(1,100) g",
+      [base],
+    );
+    const over = await req("POST", "/api/memory", { token, body: { partition: base, key: "newk", content: "x" } });
+    expect(over.status).toBe(429);
+    expect(over.json.error).toBe("memory_partition_full");
+    const upd = await req("POST", "/api/memory", { token, body: { partition: base, key: "seedkey_1", content: "updated" } });
+    expect(upd.status).toBe(201); // updating an existing key does not grow storage -> exempt
+  });
+
+  test("per-guest byte cap on a new row", async () => {
+    const { token, base } = await freshGuest("10.15.3.1");
+    await dbQuery(
+      "INSERT INTO memories (id, tenant, partition, key, content, tags, version, deleted, actor, updated_at) VALUES ('bigseed', 'guest-pool', $1, 'big', $2, '[]'::jsonb, 1, false, 'seed', now())",
+      [base, "z".repeat(262044)],
+    );
+    const over = await req("POST", "/api/memory", { token, body: { partition: base, key: "morebytes", content: "y".repeat(200) } });
+    expect(over.status).toBe(413);
+    expect(over.json.error).toBe("memory_partition_bytes");
+  });
+
+  test("QUARANTINE: a guest write enqueues NO brain sync; a normal tenant write does", async () => {
+    const savedUrl = process.env.COG_BRIDGE_URL, savedTok = process.env.COG_BRIDGE_TOKEN;
+    process.env.COG_BRIDGE_URL = "http://127.0.0.1:1"; // arm the bridge so enqueueOutbox writes a row (drain fails silently)
+    process.env.COG_BRIDGE_TOKEN = "x";
+    try {
+      const cnt = async () => (await dbQuery("SELECT count(*)::int AS n FROM outbox WHERE kind = 'memory.sync'")).rows[0].n;
+      const before = await cnt();
+      const { token, base } = await freshGuest("10.15.4.1");
+      await req("POST", "/api/memory", { token, body: { partition: base, key: "q", content: "guest" } });
+      expect(await cnt()).toBe(before); // guest write is quarantined — nothing enqueued
+      const t = await newTenant("mem-sync", "pro");
+      await req("POST", "/api/memory", { token: t.token, body: { partition: "tenant", key: "n", content: "normal" } });
+      expect(await cnt()).toBe(before + 1); // a normal tenant write DOES sync
+    } finally {
+      if (savedUrl === undefined) delete process.env.COG_BRIDGE_URL; else process.env.COG_BRIDGE_URL = savedUrl;
+      if (savedTok === undefined) delete process.env.COG_BRIDGE_TOKEN; else process.env.COG_BRIDGE_TOKEN = savedTok;
+    }
+  });
+
+  test("normal tenants are unaffected — many writes, no guest caps trip", async () => {
+    const t = await newTenant("mem-normal", "pro");
+    for (let i = 0; i < 12; i++) {
+      const w = await req("POST", "/api/memory", { token: t.token, body: { partition: "tenant", key: "n" + i, content: "x" } });
+      expect(w.status).toBe(201); // 12 > the guest 10/min cap but under the generic limit; normal tenants aren't guest-capped
+    }
+  });
+
+  test("Law 5 — the directory advertises the enforced memory limits", async () => {
+    const r = await req("GET", "/directory", { headers: { "x-real-ip": "10.15.9.1" } });
+    expect(r.json.rules.memory.writes_per_min).toBe(10);
+    expect(r.json.rules.memory.max_memories).toBe(100);
+    expect(r.json.rules.memory.max_bytes).toBe(262144);
+    expect(r.json.rules.memory.brain_sync).toBe("quarantined");
+  });
+});

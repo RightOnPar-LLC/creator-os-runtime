@@ -29,6 +29,7 @@ app.post("/api/memory", requireGrant("memory.write"), async (e) => {
         a.content.slice(0, 20000),
         Array.isArray(a.tags) ? a.tags.slice(0, 20).map(String) : [],
         t.row.sub,
+        t, // auth → guest write cap + brain-sync quarantine
       ),
     },
     201,

@@ -19,7 +19,7 @@ import { randomBytes } from "crypto";
 import { getTenant, getSetting, setSetting, sql } from "./db.js";
 import { nowSec, newId, parseJson, hmacSha256, HttpError } from "./util.js";
 import { issueChildGrant, mintRootGrant } from "./grants.js";
-import { TIERS } from "./policy.js";
+import { TIERS, memoryPartitions } from "./policy.js";
 import { SERVICE_NAME, VERSION, GUEST_MAX_PER_HOUR, GUEST_FP_WINDOW_SEC, GUEST_FP_SALT_TTL_SEC } from "./config.js";
 import { TEMPLATES } from "./railway.js";
 
@@ -50,6 +50,30 @@ export var GUEST_POOL_TIER = "house";
  * receipt, so a guest can spend and leave with one.
  */
 export var GUEST_CAPS = ["grant.read", "cog.plan", "memory.write", "deploy.worker", "ledger.read"];
+
+// Guest memory bounds (step 4). A guest write settles no budget and would fan a
+// sync to the cognitive brain, so it gets a tighter write meter than the generic
+// per-grant limit, a footprint cap over its own partition, AND is quarantined from
+// the brain sync entirely (see writeMemory). Numbers are published in GUEST_POLICY.memory.
+export var GUEST_MEMORY_WRITES_PER_MIN = 10;
+export var GUEST_MAX_MEMORIES = 100;
+export var GUEST_MEMORY_MAX_BYTES = 262144; // 256 KiB
+/**
+ * The guest write context, or null for every non-guest (so normal tenants are
+ * untouched — uncapped and synced as before). A guest is exactly a depth-1 child
+ * of the shared guest-pool tenant.
+ */
+export function guestWriteContext(auth) {
+  if (!auth || auth.tenant?.id !== GUEST_POOL_TENANT) return null;
+  return {
+    grantId: auth.row.id,
+    tenant: auth.tenant.id,
+    base: memoryPartitions(parseJson(auth.row.scope))[0] || "",
+    ratePerMin: GUEST_MEMORY_WRITES_PER_MIN,
+    maxRows: GUEST_MAX_MEMORIES,
+    maxBytes: GUEST_MEMORY_MAX_BYTES,
+  };
+}
 
 /** Ensure the guest-pool tenant and an active, funded root grant exist; return the root grant row. */
 export async function ensureGuestPool() {
@@ -160,6 +184,7 @@ export async function issueGuestGrantGuarded({ ip = "noip", agentName = "", home
  */
 export var GUEST_POLICY = {
   issuance: { per_fingerprint_per_hour: GUEST_MAX_PER_HOUR, one_active_grant_per_fingerprint: true },
+  memory: { writes_per_min: GUEST_MEMORY_WRITES_PER_MIN, max_memories: GUEST_MAX_MEMORIES, max_bytes: GUEST_MEMORY_MAX_BYTES, brain_sync: "quarantined" },
   guest_grant: {
     budget_usd_cents: TIERS.guest.usdCents,
     ttl_sec: TIERS.guest.maxTtlSec,

@@ -244,6 +244,7 @@ app.post("/mcp", async (e) => {
               String(i.content).slice(0, 20000),
               Array.isArray(i.tags) ? i.tags.map(String) : [],
               c.row.sub,
+              c, // auth → guest write cap + brain-sync quarantine
             ),
           }),
         );

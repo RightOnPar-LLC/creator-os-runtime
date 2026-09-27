@@ -4,6 +4,8 @@ import { HttpError, newId, parseJson, sha256Hex } from "./util.js";
 import { getSetting, setSetting, sql } from "./db.js";
 import { cogBridgeUrl, enqueueOutbox } from "./outbox.js";
 import { memoryPartitions, partitionCovers } from "./policy.js";
+import { guestWriteContext } from "./guest.js";
+import { checkNamedRateLimit } from "./grants.js";
 
 export var serializeMemory = (e) => ({
   id: e.id,
@@ -26,13 +28,40 @@ export var toSyncRecord = (e) => ({
   deleted: !!e.deleted,
   updated_at: e.updated_at,
 });
-export async function writeMemory(e, t, a, n, r, s) {
+// A guest write is bounded (rate + footprint) before it lands, and it enqueues NO
+// brain sync: a guest cannot flood or poison shared cognitive memory. `auth` is the
+// grant/tenant of the caller (null for internal/system writes, which stay uncapped
+// and synced as before).
+async function enforceGuestWriteLimits(gx, partition, key, content) {
+  // (1) a dedicated write meter, tighter than the generic per-grant limit and on its own key
+  if (!(await checkNamedRateLimit(`mw:${gx.grantId}`, gx.ratePerMin)))
+    throw new HttpError(429, "memory_write_rate_limited", { limit: gx.ratePerMin });
+  // (2) a footprint cap over the guest's own partition subtree — enforced only when the
+  // write would create a NEW (partition,key) row; updating an existing key never grows storage.
+  let effKey = key || sha256Hex(content).slice(0, 16),
+    pat = gx.base.replace(/([\\%_])/g, "\\$1") + "%",
+    agg = (
+      await sql`SELECT count(*)::int AS n, coalesce(sum(length(content)),0)::bigint AS bytes,
+        bool_or(partition = ${partition} AND key = ${effKey}) AS present
+        FROM memories WHERE tenant = ${gx.tenant} AND deleted = false AND partition LIKE ${pat} ESCAPE '\\'`
+    )[0];
+  if (!agg.present) {
+    if (Number(agg.n) >= gx.maxRows) throw new HttpError(429, "memory_partition_full", { memories: Number(agg.n), max: gx.maxRows });
+    if (Number(agg.bytes) + Buffer.byteLength(content, "utf8") > gx.maxBytes)
+      throw new HttpError(413, "memory_partition_bytes", { bytes: Number(agg.bytes), max: gx.maxBytes });
+  }
+}
+export async function writeMemory(e, t, a, n, r, s, auth = null) {
+  let gx = guestWriteContext(auth);
+  if (gx) await enforceGuestWriteLimits(gx, t, a, n);
   let i =
       await sql`INSERT INTO memories (id, tenant, partition, key, content, tags, version, deleted, actor, updated_at)
     VALUES (${newId("m")}, ${e}, ${t}, ${a || sha256Hex(n).slice(0, 16)}, ${n}, ${r}::jsonb, ${Date.now()}, false, ${s}, now())
     ON CONFLICT (tenant, partition, key) DO UPDATE SET content = EXCLUDED.content, tags = EXCLUDED.tags, version = EXCLUDED.version, deleted = false, actor = EXCLUDED.actor, updated_at = now() RETURNING *`,
     o = serializeMemory(i[0]);
-  return (await enqueueOutbox("memory.sync", toSyncRecord(i[0])), o);
+  // QUARANTINE: a guest's writes stay LOCAL — never synced to the cognitive brain.
+  if (!gx) await enqueueOutbox("memory.sync", toSyncRecord(i[0]));
+  return o;
 }
 export async function searchMemories(e, t, a, n) {
   let r = Math.min(50, Math.max(1, Math.floor(n || 10))),
