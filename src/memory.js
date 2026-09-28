@@ -6,6 +6,7 @@ import { cogBridgeUrl, enqueueOutbox } from "./outbox.js";
 import { memoryPartitions, partitionCovers } from "./policy.js";
 import { guestWriteContext } from "./guest.js";
 import { checkNamedRateLimit } from "./grants.js";
+import { fromBridgeChange } from "./bridgewire.js";
 
 export var serializeMemory = (e) => ({
   id: e.id,
@@ -132,9 +133,14 @@ export async function pullMemoryFromBridge() {
       },
     });
   if (!t.ok) throw new HttpError(502, "bridge_error", t.status);
+  // The bridge answers { changes, watermark } (see bridgewire.js); reading
+  // { records, next } here found nothing and never advanced the cursor.
   let a = await t.json(),
-    n = await applySyncRecords(Array.isArray(a.records) ? a.records : []),
-    r = Number(a.next) || e;
+    changes = Array.isArray(a.changes) ? a.changes : [],
+    records = changes.map((c) => fromBridgeChange(c)).filter(Boolean),
+    n = await applySyncRecords(records),
+    r = Number(a.watermark) || e;
+  n.foreign = changes.length - records.length;
   if (r > e) await setSetting("memory_pull_cursor", String(r));
   return {
     ...n,

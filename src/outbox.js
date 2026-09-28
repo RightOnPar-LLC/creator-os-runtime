@@ -2,6 +2,7 @@
 import { env, SERVICE_NAME } from "./config.js";
 import { hmacSha256, parseJson } from "./util.js";
 import { sql } from "./db.js";
+import { toBridgeChange } from "./bridgewire.js";
 
 export var cogBridgeUrl = () => (env.COG_BRIDGE_URL || "").replace(/\/$/, "");
 export async function enqueueOutbox(e, t) {
@@ -35,14 +36,18 @@ async function deliverOutboxItem(e, t) {
     return;
   }
   if (e === "memory.sync") {
+    let change = toBridgeChange(t);
+    if (!change) throw Error("bad_sync_record");
     let a = await fetch(cogBridgeUrl() + "/sync/apply", {
       method: "POST",
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${env.COG_BRIDGE_TOKEN}`,
       },
+      // The bridge takes { changes: [Change] } — see bridgewire.js. Sending the
+      // runtime's own record shape here was accepted with 200 and applied nothing.
       body: JSON.stringify({
-        records: [t],
+        changes: [change],
       }),
     });
     if (!a.ok) throw Error("bridge " + a.status);
