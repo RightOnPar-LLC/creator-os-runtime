@@ -1,7 +1,20 @@
 # Agent-host — a machine where an agent hires sub-agents
 
-Status: **design**, not built. Depends on the autonomy dial (PR #29).
-Owner decision points are marked **DECIDE**.
+Status: **v1 control plane built** (this PR). The owner's decisions were taken with the
+recommended defaults:
+
+| Decision | Chosen |
+|---|---|
+| Ceilings per host | 10 live sub-agents, 2 levels below the host (owner may set 1–50 and 1–3). Spend is capped by the host's budget; a per-hour spend rate is not built yet. |
+| Default dial for a new host | `ask` |
+| Where the host page lives | DevDesk (the page is the next step; `GET /api/hosts/:id` is its data) |
+| Which tiers may create hosts | `pro`, `studio`, `house` |
+
+Built: `POST /api/hosts` (owner's root only), `GET /api/hosts/:id` (the hiring tree),
+the ceilings and hire naming in `issueChildGrant`, the `agent-host` worker template,
+`src/hostpolicy.js`. **Not built:** the agent program that runs inside the machine —
+it lives in `RightOnPar-LLC/creator-worker`, which is still empty, so deploying the
+`agent-host` template is refused (`creator_worker_repo_unpopulated`) until it exists.
 
 ## The idea in one paragraph
 

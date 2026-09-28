@@ -3,6 +3,8 @@ import { HttpError, nowSec, parseJson } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "../db.js";
 import { normalizeUsage, remainingBudget, TIERS } from "../policy.js";
 import { issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
+import { HOST_DEFAULT_BUDGET, HOST_DEFAULT_CAPS, HOST_DEFAULTS, HOST_TIERS, hostLimits, hostName } from "../hostpolicy.js";
+import { AUTONOMY_LEVELS, autonomyOf } from "../autonomy.js";
 import { openEscrow, serializeEscrow } from "../escrow.js";
 import { deleteDeploy, deployWorker, refreshDeployStatus, restartDeploy, TEMPLATES } from "../railway.js";
 import { cogExecute, cogPlan } from "../cog.js";
@@ -275,4 +277,92 @@ app.post("/api/grants/:id/autonomy", requireGrant(null), async (e) => {
   let t = e.get("auth"),
     a = await readJsonBody(e);
   return e.json(await lowerGrantAutonomy(t.row, e.req.param("id"), a?.level));
+});
+
+// --- Agent-hosts (docs/specs/agent-host.md, src/hostpolicy.js) -----------------------
+// The OWNER mints a host: a grant (root -> host) an agent runs under and hires sub-agents
+// from. Defaults: dial `ask`, 10 live sub-agents, 2 levels below the host, pro tier and up.
+// Every hire is a child grant of the host — capped by its budget, caps, depth, dial and
+// ceilings, and named agent:<host-id>/<role>. Revoking the host stops all of them.
+app.post("/api/hosts", requireGrant("grant.issue"), async (e) => {
+  let t = e.get("auth"),
+    a = await readJsonBody(e);
+  if (Number(t.row.depth) !== 0) throw new HttpError(403, "owner_required", { hint: "create hosts with the tenant's root grant" });
+  if (!HOST_TIERS.includes(t.tenant.tier)) throw new HttpError(403, "host_tier_too_low", { tier: t.tenant.tier, allowed: HOST_TIERS });
+  let name = hostName(a?.name);
+  if (!name) throw new HttpError(400, "bad_host_name", { hint: "2-32 chars: a-z, 0-9, -" });
+  let limits = hostLimits(a ?? {});
+  if (!limits) throw new HttpError(400, "bad_host_limits");
+  let rootCaps = parseJson(t.row.caps),
+    caps = Array.isArray(a?.caps) ? a.caps : HOST_DEFAULT_CAPS.filter((c) => rootCaps.includes(c)),
+    r = await issueChildGrant(
+      t.row,
+      {
+        sub: `host:${name}`,
+        caps,
+        budget: a?.budget ?? HOST_DEFAULT_BUDGET,
+        ttlSec: a?.ttlSec ?? 86400,
+        scope: a?.scope,
+        constraints: { ...(a?.constraints ?? {}), autonomy: a?.autonomy ?? HOST_DEFAULTS.autonomy },
+      },
+      t.row.sub,
+      { host: limits },
+    );
+  await recordEvent("host.created", { id: r.row.id, name, limits }, t.tenant.id, t.row.sub);
+  return e.json(
+    {
+      host: {
+        id: r.row.id,
+        name,
+        sub: r.row.sub,
+        autonomy: AUTONOMY_LEVELS[autonomyOf(parseJson(r.row.constraints))],
+        limits,
+        caps: parseJson(r.row.caps),
+        budget: parseJson(r.row.budget),
+        exp: Number(r.row.exp),
+      },
+      token: r.token,
+      // To give the host a machine: POST /api/deploys with this template and the host
+      // token as COS_GRANT_TOKEN (never the root token).
+      machine: { template: "agent-host", env: { COS_GRANT_TOKEN: "<the host token above>" } },
+    },
+    201,
+  );
+});
+// The hiring tree: the host and everything below it, with each grant's dial and books.
+// Readable by the host itself or anything above it (e.g. the owner's root).
+app.get("/api/hosts/:id", requireGrant(null), async (e) => {
+  let t = e.get("auth"),
+    id = e.req.param("id"),
+    host = await getGrant(id);
+  if (!host || host.tenant !== t.tenant.id || parseJson(host.constraints)?.host == null) throw new HttpError(404, "host_not_found");
+  let reach =
+    await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${t.row.id} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
+    SELECT 1 FROM sub WHERE id = ${id} LIMIT 1`;
+  if (!reach.length) throw new HttpError(403, "not_in_your_subtree");
+  let rows =
+    await sql`WITH RECURSIVE sub AS (SELECT * FROM grants WHERE id = ${id} UNION ALL SELECT g.* FROM grants g JOIN sub ON g.parent = sub.id)
+    SELECT * FROM sub ORDER BY depth, iat`;
+  let now = nowSec(),
+    view = (g) => ({
+      id: g.id,
+      parent: g.parent,
+      sub: g.sub,
+      depth: Number(g.depth),
+      status: g.status === "active" && Number(g.exp) <= now ? "expired" : g.status,
+      autonomy: AUTONOMY_LEVELS[autonomyOf(parseJson(g.constraints))],
+      budget: parseJson(g.budget),
+      settled: parseJson(g.settled),
+      remaining: remainingBudget(g),
+    }),
+    pending =
+      await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${id} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
+      SELECT id, grant_id, action, created_at FROM approvals WHERE tenant = ${t.tenant.id} AND status = 'pending'
+      AND grant_id IN (SELECT id FROM sub)`;
+  return e.json({
+    host: { ...view(rows[0]), limits: parseJson(rows[0].constraints).host },
+    hires: rows.slice(1).map(view),
+    live: rows.slice(1).filter((g) => g.status === "active" && Number(g.exp) > now).length,
+    pendingApprovals: pending,
+  });
 });

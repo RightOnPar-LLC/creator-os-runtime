@@ -1,5 +1,5 @@
 {
-  "count": 147,
+  "count": 151,
   "appRoutes": [
     "GET /health",
     "GET /api/admin/fingerprints",
@@ -93,6 +93,10 @@
     "POST /api/approvals/:id",
     "POST /api/grants/:id/autonomy",
     "POST /api/grants/:id/autonomy",
+    "POST /api/hosts",
+    "POST /api/hosts",
+    "GET /api/hosts/:id",
+    "GET /api/hosts/:id",
     "POST /api/escrow",
     "POST /api/escrow",
     "GET /api/escrow/:id",
@@ -197,6 +201,8 @@
     "GET /api/approvals :: grant",
     "POST /api/approvals/:id :: grant",
     "POST /api/grants/:id/autonomy :: grant",
+    "POST /api/hosts :: grant:grant.issue",
+    "GET /api/hosts/:id :: grant",
     "POST /api/escrow :: grant:escrow.hold",
     "GET /api/escrow/:id :: grant:grant.read",
     "GET /directory :: public",

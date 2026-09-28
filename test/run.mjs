@@ -34,5 +34,5 @@ const arg = process.argv[2];
 const env = { ...process.env };
 if (arg === "dist") env.RUNTIME_ENTRY = join(root, "dist", "runtime.js");
 else if (arg) env.RUNTIME_ENTRY = resolve(root, arg);
-const r = spawnSync(bun, ["test", "runtime.test.js", "bridgewire.test.js", "autonomy.test.js"], { cwd: here, env, stdio: "inherit" });
+const r = spawnSync(bun, ["test", "runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "hostpolicy.test.js"], { cwd: here, env, stdio: "inherit" });
 process.exit(r.status ?? 1);
