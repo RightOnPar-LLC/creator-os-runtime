@@ -2,6 +2,7 @@
 import { createHash } from "crypto";
 import { HttpError, nowSec, parseJson, sha256Hex } from "./util.js";
 import { TEMPLATES } from "./railway.js";
+import { autonomyViolation, requestedAutonomy } from "./autonomy.js";
 
 export var CAPS = [
   "grant.issue",
@@ -129,6 +130,9 @@ export var clampConstraints = (e, t) => ({
   maxReplicas: Math.min(t.maxReplicas, Math.max(1, Math.floor(numberOr(e?.maxReplicas, t.maxReplicas)))),
   allowDelete: t.allowDelete && e?.allowDelete === !0,
   requireDryRun: e?.requireDryRun === !1 ? t.requireDryRun && !1 : !0,
+  // the autonomy dial (autonomy.js): omitted inherits the parent's level; an explicit
+  // request is kept as asked so attenuationViolations can REFUSE a widening.
+  autonomy: requestedAutonomy(e?.autonomy, t),
 });
 var isSubset = (e, t) => (e || []).every((a) => (t || []).includes(a));
 export function attenuationViolations(e, t, a, w = {}) {
@@ -168,6 +172,8 @@ export function attenuationViolations(e, t, a, w = {}) {
     if (t.constraints.maxReplicas > o.maxReplicas) n.push("maxReplicas_widened");
     if (t.constraints.allowDelete && !o.allowDelete) n.push("allowDelete_widened");
     if (t.constraints.requireDryRun === !1 && o.requireDryRun) n.push("requireDryRun_loosened");
+    let av = autonomyViolation(t.constraints, o);
+    if (av) n.push(av);
     if (t.depth !== Number(e.depth) + 1) n.push("bad_depth");
     if (t.depth > r.maxDepth) n.push("depth_exceeds_tier");
     if (e.status !== "active") n.push("parent_not_active");

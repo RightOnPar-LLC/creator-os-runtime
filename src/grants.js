@@ -4,6 +4,7 @@ import { POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN, SERVICE_NAME } from "./config.j
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "./db.js";
 import { parseGrantToken, signGrantToken } from "./tokens.js";
+import { AUTONOMY_LEVELS, DEFAULT_AUTONOMY, autonomyOf, lowerCheck, parseAutonomy } from "./autonomy.js";
 import {
   addUsage,
   attenuationViolations,
@@ -236,7 +237,8 @@ export async function revokeGrantTree(e, t, a) {
 // `k` is the ledger kind: 'settle' for charges the runtime itself makes (deploys),
 // 'self-settle' for a holder settling its own grant via POST /api/grants/settle,
 // so the two can never be confused in the ledger.
-export async function settleGrantUsage(e, t, a, n, k = "settle") {
+// `m` carries the autonomy dial's record for the charge: { autonomy, decision, approver }.
+export async function settleGrantUsage(e, t, a, n, k = "settle", m = {}) {
   await sql.begin(async (r) => {
     let s = (await r`SELECT * FROM grants WHERE id = ${e} FOR UPDATE`)[0];
     if (!s || s.status !== "active")
@@ -248,9 +250,47 @@ export async function settleGrantUsage(e, t, a, n, k = "settle") {
         status: 402,
       });
     (await r`UPDATE grants SET settled = ${addUsage(normalizeUsage(parseJson(s.settled)), t)}::jsonb WHERE id = ${e}`,
-      await r`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
-      VALUES (${s.tenant}, ${e}, ${s.parent}, ${k}, ${t.usd_cents}, ${t.calls}, ${t.deploys}, ${a}, ${n})`);
+      await r`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note, autonomy, decision, approver)
+      VALUES (${s.tenant}, ${e}, ${s.parent}, ${k}, ${t.usd_cents}, ${t.calls}, ${t.deploys}, ${a}, ${n},
+              ${m.autonomy ?? null}, ${m.decision ?? null}, ${m.approver ?? null})`);
   });
+}
+// A zero-amount ledger row that records what the autonomy dial did with a value
+// action that did NOT settle: asked a human (autonomy-ask), was refused
+// (autonomy-refused), was denied (autonomy-denied) or had the dial lowered
+// (autonomy-set). Refusals are recorded, never swallowed.
+export async function recordAutonomyRow(row, kind, ref, note, m = {}) {
+  await sql`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note, autonomy, decision, approver)
+    VALUES (${row.tenant}, ${row.id}, ${row.parent}, ${kind}, 0, 0, 0, ${ref}, ${String(note).slice(0, 200)},
+            ${m.autonomy ?? null}, ${m.decision ?? null}, ${m.approver ?? null})`;
+}
+// Turn a grant's dial DOWN (never up — raising takes a new grant from the issuer).
+// Cascades: every descendant above the new level comes down with it, so the
+// child <= parent invariant holds for the whole subtree. The caller must be the
+// target itself or an ancestor of it.
+export async function lowerGrantAutonomy(caller, targetId, level) {
+  let t = await getGrant(targetId);
+  if (!t || t.tenant !== caller.tenant) throw new HttpError(404, "grant_not_found");
+  let inSubtree =
+    await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${caller.id} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
+    SELECT 1 FROM sub WHERE id = ${targetId} LIMIT 1`;
+  if (!inSubtree.length) throw new HttpError(403, "not_in_your_subtree");
+  let current = autonomyOf(parseJson(t.constraints)),
+    fault = lowerCheck(current, level);
+  if (fault) throw new HttpError(fault === "autonomy_invalid" ? 400 : 403, fault, { current, levels: AUTONOMY_LEVELS });
+  let next = parseAutonomy(level),
+    changed =
+      await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${targetId} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
+      UPDATE grants SET constraints = jsonb_set(constraints, '{autonomy}', to_jsonb(${next}::int))
+      WHERE id IN (SELECT id FROM sub) AND COALESCE((constraints->>'autonomy')::int, ${DEFAULT_AUTONOMY}) > ${next}
+      RETURNING id`;
+  await recordAutonomyRow(t, "autonomy-set", targetId, `dial lowered to ${AUTONOMY_LEVELS[next]} by ${caller.sub}`, {
+    autonomy: next,
+    decision: "lowered",
+    approver: caller.id,
+  });
+  await recordEvent("grant.autonomy_lowered", { id: targetId, from: current, to: next, cascaded: changed.length }, t.tenant, caller.sub);
+  return { id: targetId, from: AUTONOMY_LEVELS[current], to: AUTONOMY_LEVELS[next], grantsChanged: changed.length };
 }
 // Release a child grant's UNSPENT reservation (budget - settled, the same amount
 // revokeGrantTree computes) back to its parent when it transitions active->expired.
