@@ -48,7 +48,7 @@ ships on green.
 
 | Service | Tests on PR | Deploys on merge | Gap |
 |---|---|---|---|
-| creator-os-runtime (runtime.meshtool.ai) | **Added now** (`.github/workflows/test.yml`) | No — it is a hand-pasted Railway Function; the repo's Dockerfile is unused | Switch the Railway service source to this repo with "wait for CI" |
+| creator-os-runtime (runtime.meshtool.ai) | **Added now** (`.github/workflows/test.yml`) | **Yes** — Railway service `runtime-svc` builds `master` from `deploy/Dockerfile`, serves runtime.meshtool.ai, and waits for check suites (`checkSuites: true`) | Until this CI existed there was nothing to wait on, so every merge deployed untested. The older `runtime` service is the rescued hand-pasted Function on its railway.app URL only — legacy, a candidate to retire. |
 | cognitive-mcp (memory.meshtool.ai) | Yes (Rust tests, Node CI) | No — the daemon runs on the owner's machine behind a tunnel | The Node `npm audit` job is red on existing advisories and would block every auto-merge; fix the lockfile or make audit non-blocking. Deploy needs a pull-updater on the box (later). |
 | meshmarket (market / wallet) | Yes (selftest in the deploy gate) | Button (`workflow_dispatch`) by design | Change the trigger to push-on-main, keeping the predeploy selftest and smoke |
 | the-foundry (DevDesk) | Yes (selftest) | Button by design | Same as meshmarket |
@@ -57,12 +57,8 @@ ships on green.
 
 1. **GitHub, per repo:** Settings → General → *Allow auto-merge*; and a branch rule
    on the default branch requiring the CI checks to pass.
-2. **Railway, runtime service:** connect the service to `RightOnPar-LLC/creator-os-runtime`
-   (branch `master`, `deploy/Dockerfile`) and turn on *Wait for CI*. The health check
-   (`/health`) is already configured in `railway.json`.
-   - Do this only after the CI below is green on `master`, and ideally first in a
-     staging environment: moving from a pasted Function to a built image changes
-     the Bun version (1.4.0 → 1.4.2) and is a production change.
+2. **Railway, runtime:** already done — `runtime-svc` deploys `master` after CI passes,
+   with the `/health` check. Nothing to switch; the new CI is what it now waits on.
 3. **meshmarket / the-foundry:** approve changing `deploy.yml` from a button to
    push-on-main (the gates stay the same).
 

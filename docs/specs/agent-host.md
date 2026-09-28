@@ -98,8 +98,8 @@ sub-agents gets thicker. That is why it is safe to start at v1.
 ## What must be true before it ships
 
 1. **PR #29 merged and its full test suite green** (the dial and approvals).
-2. **The runtime deploys from the repo on green** (see `ship-on-green.md`).
-   Today it is a hand-pasted Railway Function.
+2. **The runtime deploys from the repo on green** (see `ship-on-green.md`) — true
+   once this repo's CI is on `master`: `runtime-svc` already waits for it.
 3. **A test that proves the ceilings:** a host tries to hire past its sub-agent
    limit, past its depth, and above its own dial — all three refused and recorded.
 4. **Revoke drill:** revoking a host with live sub-agents stops all of them and

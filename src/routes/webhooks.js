@@ -1,7 +1,7 @@
 // Routes: inbound webhooks: stripe, railway, github, brain, mesh. Registration order is significant.
 import { env } from "../config.js";
 import { hmacSha256, HttpError, safeEqual, sha256Hex } from "../util.js";
-import { getSetting, recordEvent, sql } from "../db.js";
+import { getSetting, isKillSwitchOn, recordEvent, sql } from "../db.js";
 import {
   handleRailwayEvent,
   handleStripeEvent,
@@ -9,6 +9,7 @@ import {
   recordWebhookEvent,
   verifyTimestampedSignature,
 } from "../webhooks.js";
+import { captureFromMeshReceipt } from "../escrow.js";
 import { app, readJsonBody } from "../http.js";
 
 app.post("/webhooks/stripe", async (e) => {
@@ -168,12 +169,22 @@ app.post("/webhooks/mesh", async (e) => {
   let t = await e.req.text();
   if (!safeEqual(e.req.header("x-mesh-signature") || "", hmacSha256(env.MESH_RECEIPT_SECRET, t)))
     throw new HttpError(401, "bad_signature");
-  let a = JSON.parse(t || "{}"),
+  let a = JSON.parse(t || "{}");
+  // A receipt naming an escrow is a delivery proof: capture (release the held value to the payee).
+  // Capture is REAL value movement, so it is GATED \u2014 OFF unless an operator turns on the
+  // `escrow_capture` setting, and never while the kill switch is on (an operator off-switch that
+  // does not require rotating MESH_RECEIPT_SECRET). It is attempted BEFORE the replay
+  // short-circuit: captureEscrow is idempotent, so a retry after a transient capture failure
+  // re-attempts and completes instead of being dropped as a replay. captureFromMeshReceipt never
+  // throws for an unknown/mismatched escrow \u2014 it just declines (review 2026-09-27).
+  let captureOn = a.escrow_id && !(await isKillSwitchOn()) && (await getSetting("escrow_capture")) === "on",
+    cap = captureOn ? await captureFromMeshReceipt(a) : null,
     n = await recordWebhookEvent("mesh", String(a.receipt_id || sha256Hex(t)), "receipt", a);
   if (n === null)
     return e.json({
       received: !0,
       replay: !0,
+      escrow: cap,
     });
   let r = (await getSetting("receipt_grants")) === "on";
   return (
@@ -183,6 +194,7 @@ app.post("/webhooks/mesh", async (e) => {
         amount: a.amount,
         capability: a.capability,
         minted: r,
+        escrowCaptured: cap?.captured ?? !1,
       },
       a.tenant || null,
       "mesh",
@@ -191,12 +203,14 @@ app.post("/webhooks/mesh", async (e) => {
       stored: !0,
       minted: !1,
       receiptGrants: r,
+      escrow: cap,
     }),
     e.json(
       {
         received: !0,
         stored: !0,
         minted: !1,
+        escrow: cap,
         note: r
           ? "receipt\u2192grant lane armed but minting not yet implemented"
           : "receipt stored; receipt\u2192grant lane is off",

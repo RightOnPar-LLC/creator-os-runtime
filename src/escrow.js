@@ -4,6 +4,8 @@
 // CAPTURE (resolving held value to the payee on a verified condition) is stage 2 and lives
 // nowhere yet. See docs/specs/escrow-keystone.md.
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
+import { getGrant, recordEvent, sql } from "./db.js";
+import { addUsage, normalizeUsage, subtractUsage } from "./policy.js";
 import { issueChildGrant } from "./grants.js";
 
 // Stage 1 accepts only MESH (closed-loop). A `usd` (real-money, withdrawable) capture would be
@@ -75,6 +77,7 @@ export function escrowBlock(grantRow) {
   return block && typeof block === "object" ? block : null;
 }
 export function escrowState(grantRow) {
+  if (grantRow.status === "captured") return "captured"; // terminal: value released to the payee
   if (grantRow.status === "expired" || grantRow.status === "revoked") return "refunded";
   return "open";
 }
@@ -94,4 +97,89 @@ export function serializeEscrow(grantRow) {
     opened_at: b?.opened_at ?? Number(grantRow.iat),
     deadline: Number(grantRow.exp),
   };
+}
+
+// Resolve either the custodian grant id (gr_...) OR the stable escrow id (es_...) to the escrow
+// grant row. Only try the grants PK lookup for a gr_ id — a receipt carries the es_ id, which can
+// never be a grant PK, so an unconditional getGrant was a wasted round-trip on every receipt. The
+// es_ path is indexed (grants_escrow_id on scope->'escrow'->>'escrow_id'), not a full scan.
+async function findEscrowGrant(idOrEscrowId) {
+  let id = String(idOrEscrowId);
+  if (id.startsWith("gr")) {
+    let byGrant = await getGrant(id);
+    if (byGrant && escrowBlock(byGrant)) return byGrant;
+  }
+  let r = await sql`SELECT * FROM grants WHERE scope->'escrow'->>'escrow_id' = ${id} LIMIT 1`;
+  return r[0] || null;
+}
+
+// CAPTURE — the one new primitive (stage 2). Resolve the held value to the payee on a verified
+// condition. The CALLER must have verified the condition; captureEscrow enforces the state machine
+// and the value movement, EXACTLY ONCE. The active->captured flip (RETURNING guard, under
+// FOR UPDATE) is the idempotency + mutual-exclusion lever: a replay, a second receipt, or a race
+// with the reaper/revoke credits the payee once and never double-settles the payer. Once captured,
+// the reaper and revoke (both status='active') can never touch it; a refunded/expired escrow
+// (status!='active') can never be captured. Locks child then parent — the order the reaper and
+// revokeGrantTree take — so it cannot deadlock against them.
+export async function captureEscrow(idOrEscrowId, { source = "capture", ref = null } = {}) {
+  let g0 = await findEscrowGrant(idOrEscrowId);
+  if (!g0) throw new HttpError(404, "escrow_not_found");
+  if (!escrowBlock(g0)) throw new HttpError(404, "not_escrow");
+  let b = escrowBlock(g0),
+    out = { captured: false, escrow_id: b.escrow_id, reason: null };
+  await sql.begin(async (tx) => {
+    let g = (await tx`SELECT * FROM grants WHERE id = ${g0.id} FOR UPDATE`)[0];
+    if (!g || g.status !== "active") return void (out.reason = "not_active:" + (g?.status || "gone"));
+    let flipped = await tx`UPDATE grants SET status = 'captured' WHERE id = ${g.id} AND status = 'active' RETURNING id`;
+    if (flipped.length !== 1) return void (out.reason = "already_resolved"); // someone else resolved it
+    let amount = normalizeUsage(parseJson(g.budget)).usd_cents,
+      d = { usd_cents: amount, calls: 0, deploys: 0 };
+    // The payer PAID: convert the held reservation into a settlement on the parent — reserved down
+    // (no longer held), settled up (spent). remaining is unchanged (the payer lost access at open);
+    // this is the OPPOSITE of refund, which returns reserved to the payer.
+    if (g.parent) {
+      let p = (await tx`SELECT reserved, settled FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0];
+      if (p) {
+        let rem = subtractUsage(normalizeUsage(parseJson(p.reserved)), d),
+          set = addUsage(normalizeUsage(parseJson(p.settled)), d);
+        await tx`UPDATE grants SET reserved = ${{ usd_cents: Math.max(0, rem.usd_cents), calls: Math.max(0, rem.calls), deploys: Math.max(0, rem.deploys) }}::jsonb, settled = ${set}::jsonb WHERE id = ${g.parent}`;
+      }
+    }
+    // Two ledger rows are the durable record of truth (not the generic outbox, whose env-guard would
+    // drop a cross-tenant credit and whose deliverer would reject the kind): the payer's spend, and
+    // the payee's owed MESH credit keyed by escrow id. MeshMarket reconciles the payee balance from
+    // the mesh-credit rows (actual balance delivery is the meshmarket side, a follow-up).
+    await tx`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
+      VALUES (${g.tenant}, ${g.id}, ${g.parent}, 'escrow-capture', ${amount}, 0, 0, ${b.escrow_id}, ${"captured for " + b.payee_tenant})`;
+    await tx`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
+      VALUES (${b.payee_tenant}, ${g.id}, ${g.parent}, 'mesh-credit', ${amount}, 0, 0, ${b.escrow_id}, ${"escrow delivered via " + source + (ref ? " receipt=" + ref : "")}) `;
+    ((out.captured = true), (out.amount = amount), (out.payee_tenant = b.payee_tenant), (out.receipt = ref));
+  });
+  if (out.captured)
+    // provenance: the triggering receipt id is recorded on the event so an auditor can trace a
+    // mesh-credit row back to the exact delivery receipt that authorized the value movement.
+    await recordEvent("escrow.captured", { escrow_id: out.escrow_id, amount: out.amount, payee_tenant: out.payee_tenant, source, receipt: ref }, g0.tenant, source);
+  return out;
+}
+
+// receipt:mesh condition — a signed MeshMarket delivery receipt (its HMAC already verified by the
+// webhook) is the external, non-repudiable delivery proof. Verify the escrow's condition kind and
+// (if set) its ref, then capture. Never throws for a receipt that names no/unknown/mismatched
+// escrow — it just declines, so a stray receipt can never error the webhook.
+export async function captureFromMeshReceipt(receipt) {
+  let id = String(receipt?.escrow_id || "");
+  if (!id) return { captured: false, reason: "no_escrow_id" };
+  let g = await findEscrowGrant(id);
+  if (!g) return { captured: false, reason: "escrow_not_found" };
+  let b = escrowBlock(g);
+  if (b?.condition?.kind !== "receipt:mesh") return { captured: false, reason: "condition_mismatch" };
+  if (b.condition.ref && String(receipt.capability ?? receipt.ref ?? "") !== b.condition.ref)
+    return { captured: false, reason: "ref_mismatch" };
+  // Defense: if the signed receipt names a payee, it MUST be this escrow's payee. The receipt is
+  // HMAC-signed by a trusted secret, but a mis-routed receipt (right escrow_id, wrong payee) must
+  // never settle to the escrow's fixed payee on the strength of the id alone (review 2026-09-27).
+  let receiptPayee = receipt.payee_tenant ?? receipt.payee ?? null;
+  if (receiptPayee != null && String(receiptPayee) !== b.payee_tenant)
+    return { captured: false, reason: "payee_mismatch" };
+  return captureEscrow(g.id, { source: "receipt:mesh", ref: String(receipt.receipt_id ?? "") });
 }

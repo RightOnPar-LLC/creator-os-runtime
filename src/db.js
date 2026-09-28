@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS grants (
 CREATE UNIQUE INDEX IF NOT EXISTS tenants_stripe_customer ON tenants(stripe_customer);
 CREATE INDEX IF NOT EXISTS grants_parent ON grants(parent);
 CREATE INDEX IF NOT EXISTS grants_tenant ON grants(tenant);
+CREATE INDEX IF NOT EXISTS grants_escrow_id ON grants((scope->'escrow'->>'escrow_id'));
 CREATE TABLE IF NOT EXISTS ledger (
   id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT now(), tenant TEXT NOT NULL, grant_id TEXT, parent TEXT,
   kind TEXT NOT NULL, usd_cents INT NOT NULL DEFAULT 0, calls INT NOT NULL DEFAULT 0, deploys INT NOT NULL DEFAULT 0,
