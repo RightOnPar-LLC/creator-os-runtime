@@ -5,6 +5,7 @@ import { HttpError, newId, nowSec, parseJson } from "./util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "./db.js";
 import { parseGrantToken, signGrantToken } from "./tokens.js";
 import { AUTONOMY_LEVELS, DEFAULT_AUTONOMY, autonomyOf, lowerCheck, parseAutonomy } from "./autonomy.js";
+import { hireSub, hireViolation } from "./hostpolicy.js";
 import {
   addUsage,
   attenuationViolations,
@@ -140,6 +141,26 @@ export async function issueChildGrant(e, t, a, w = {}) {
       status: 403,
       detail: B,
     });
+  // Agent-host (hostpolicy.js). The host grant itself carries its ceilings; a hire
+  // anywhere below a host is checked against them and renamed agent:<host>/<role>.
+  // An escrow custodian is not a hire, so it is exempt.
+  if (w?.host) R.host = w.host;
+  let hireName = null;
+  if (!w?.host && !w?.escrow) {
+    let host = await hostAbove(e.id);
+    if (host) {
+      let fault = hireViolation(parseJson(host.constraints).host, {
+        hostDepth: Number(host.depth),
+        childDepth: S.depth,
+        liveBelow: await liveBelowHost(host.id),
+      });
+      if (fault) {
+        await recordAutonomyRow(e, "host-refused", host.id, `hire under ${host.sub} refused: ${fault}`, { decision: "refuse" });
+        throw Object.assign(Error("attenuation_violation"), { status: 403, detail: [fault] });
+      }
+      hireName = hireSub(host.id, t.sub);
+    }
+  }
   let $ = newId("gr"),
     C = {
       v: 1,
@@ -147,7 +168,7 @@ export async function issueChildGrant(e, t, a, w = {}) {
       tenant: n.id,
       parent: e.id,
       depth: S.depth,
-      sub: String(t.sub || "agent:anon").slice(0, 80),
+      sub: hireName || String(t.sub || "agent:anon").slice(0, 80),
       iss: SERVICE_NAME,
       iat: l,
       exp: c,
@@ -254,6 +275,23 @@ export async function settleGrantUsage(e, t, a, n, k = "settle", m = {}) {
       VALUES (${s.tenant}, ${e}, ${s.parent}, ${k}, ${t.usd_cents}, ${t.calls}, ${t.deploys}, ${a}, ${n},
               ${m.autonomy ?? null}, ${m.decision ?? null}, ${m.approver ?? null})`);
   });
+}
+// The nearest agent-host at or above a grant (the grant whose constraints carry
+// `host`), or null. Walks up the parent chain.
+export async function hostAbove(grantId) {
+  return (
+    await sql`WITH RECURSIVE up AS (SELECT * FROM grants WHERE id = ${grantId}
+        UNION ALL SELECT g.* FROM grants g JOIN up ON g.id = up.parent)
+      SELECT * FROM up WHERE constraints->'host' IS NOT NULL ORDER BY depth DESC LIMIT 1`
+  )[0] || null;
+}
+// A host's live hires: active, unexpired grants anywhere below it.
+export async function liveBelowHost(hostId) {
+  return (
+    await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE parent = ${hostId}
+        UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
+      SELECT count(*)::int AS n FROM grants WHERE id IN (SELECT id FROM sub) AND status = 'active' AND exp > ${nowSec()}`
+  )[0].n;
 }
 // A zero-amount ledger row that records what the autonomy dial did with a value
 // action that did NOT settle: asked a human (autonomy-ask), was refused

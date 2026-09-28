@@ -21,6 +21,7 @@ file → these modules, byte for byte.
 | `policy.js` | 240 | Caps, tiers, usage arithmetic, attenuation rules, the gatehouse, memory-partition boundary check, source-overlay canon + the diagnostics check (0.3.2). |
 | `grants.js` | 295 | Mint root, issue child, revoke tree, settle usage, Postgres-backed rate limit, `verifyGrant`. |
 | `autonomy.js` | 90 | The autonomy dial: per-grant level (`observe` / `ask` / `act`, default `act`) in `constraints.autonomy`; attenuation refuses a child above its parent; `decide()` gates deploys and escrow opens; `ask` waits for the owner's root grant. |
+| `hostpolicy.js` | 70 | Agent-host rules: defaults (dial `ask`, 10 sub-agents, 2 levels, pro+), limits, hire naming `agent:<host>/<role>`, ceiling checks. |
 | `bridgewire.js` | 107 | Wire adapter to the cognitive-mcp bridge `/sync` routes: runtime record ↔ bridge `Change` (scope `tenant:mesh:runtime/…`, global `rt:` key). Pull ignores anything outside that prefix. |
 | `memory.js` | 110 | Memory write/search/forget, sync records, bridge pull, partition scope check. |
 | `railway.js` | 350 | Worker templates; Railway deploy, status, restart, delete (GraphQL). |

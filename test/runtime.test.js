@@ -61,7 +61,7 @@ describe("1. /health", () => {
     expect(typeof mod.attenuationViolations).toBe("function");
     expect(Object.keys(mod.TIERS)).toEqual(["guest", "starter", "pro", "studio", "house"]);
     expect(Object.keys(mod.TEMPLATES)).toEqual(
-      ["probe", "tip-alert-bot", "paywall-link", "clip-poster", "dm-autoresponder", "webhook-relay", "repo-app", "builder"],
+      ["probe", "tip-alert-bot", "paywall-link", "clip-poster", "dm-autoresponder", "webhook-relay", "repo-app", "builder", "agent-host"],
     );
     expect(mod.CAPS.length).toBe(26);
     expect(mod.CAPS.slice(20)).toEqual(["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references", "escrow.hold"]);
@@ -2200,5 +2200,104 @@ describe("22. the autonomy dial (src/autonomy.js)", () => {
     const r = await req("POST", `/api/grants/${bId}/autonomy`, { token: a.json.token, body: { level: "observe" } });
     expect(r.status).toBe(403);
     expect(r.json.error).toBe("not_in_your_subtree");
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("23. agent-host (docs/specs/agent-host.md)", () => {
+  const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
+  const mkHost = (rootToken, body = {}) => req("POST", "/api/hosts", { token: rootToken, body: { name: "desk", ...body } });
+  const hire = (hostToken, sub = "agent:worker", extra = {}) =>
+    req("POST", "/api/grants", { token: hostToken, body: { sub, caps: ["grant.read"], ttlSec: 3600, budget: { usd_cents: 10, calls: 5, deploys: 0 }, ...extra } });
+
+  test("only the owner's root grant, on pro and up, can create a host", async () => {
+    const starter = await newTenant("host-starter", "starter");
+    const s = await mkHost(starter.token);
+    expect(s.status).toBe(403);
+    expect(s.json.error).toBe("host_tier_too_low");
+    const pro = await newTenant("host-owner", "pro");
+    const child = await req("POST", "/api/grants", { token: pro.token, body: { sub: "agent:x", caps: ["grant.issue"], ttlSec: 600, budget: { usd_cents: 10, calls: 5, deploys: 0 } } });
+    const byChild = await mkHost(child.json.token);
+    expect(byChild.status).toBe(403);
+    expect(byChild.json.error).toBe("owner_required");
+    const bad = await mkHost(pro.token, { name: "has space" });
+    expect(bad.json.error).toBe("bad_host_name");
+  });
+
+  test("a new host defaults to dial `ask`, 10 sub-agents, 2 levels, and cannot spend on machines", async () => {
+    const root = await newTenant("host-defaults", "pro");
+    const h = await mkHost(root.token, { name: "research" });
+    expect(h.status).toBe(201);
+    expect(h.json.host).toMatchObject({ name: "research", sub: "host:research", autonomy: "ask", limits: { maxSubagents: 10, maxDepthBelow: 2 } });
+    expect(h.json.host.caps).toContain("grant.issue");
+    expect(h.json.host.caps).not.toContain("deploy.worker");
+    expect(h.json.machine.template).toBe("agent-host");
+  });
+
+  test("a hire is named agent:<host>/<role> and inherits the host's dial; it cannot ask for more", async () => {
+    const root = await newTenant("host-hire", "pro");
+    const h = await mkHost(root.token);
+    const w = await hire(h.json.token, "agent:scraper");
+    expect(w.status).toBe(201);
+    const v = await verify(w.json.token);
+    expect(v.sub).toBe(`agent:${h.json.host.id}/scraper`);
+    expect(v.constraints.autonomy).toBe(1); // `ask`, inherited
+    const up = await hire(h.json.token, "agent:bold", { constraints: { autonomy: "act" } });
+    expect(up.status).toBe(403);
+    expect(up.json.detail).toEqual(["autonomy_widened"]);
+  });
+
+  test("CONTROL: the sub-agent ceiling refuses one hire too many, records it, and frees up on revoke", async () => {
+    const root = await newTenant("host-cap", "pro");
+    const h = await mkHost(root.token, { maxSubagents: 2 });
+    const a = await hire(h.json.token, "agent:a");
+    const b = await hire(h.json.token, "agent:b");
+    expect([a.status, b.status]).toEqual([201, 201]);
+    const c = await hire(h.json.token, "agent:c");
+    expect(c.status).toBe(403);
+    expect(c.json).toEqual({ error: "attenuation_violation", detail: ["host_subagents_exceeded"] });
+    const led = (await req("GET", "/api/ledger", { token: root.token })).json.ledger;
+    expect(led.some((l) => l.kind === "host-refused" && l.decision === "refuse" && l.ref === h.json.host.id)).toBe(true);
+    // a revoked hire no longer counts: the slot opens up again
+    const aId = (await verify(a.json.token)).id;
+    await req("POST", `/api/grants/${aId}/revoke`, { token: root.token, body: {} });
+    expect((await hire(h.json.token, "agent:c")).status).toBe(201);
+  });
+
+  test("CONTROL: the depth ceiling refuses a hire one level too deep", async () => {
+    const root = await newTenant("host-depth", "pro");
+    const h = await mkHost(root.token, { maxDepthBelow: 1 });
+    const lead = await hire(h.json.token, "agent:lead", { caps: ["grant.issue", "grant.read"] });
+    expect(lead.status).toBe(201);
+    const deeper = await hire(lead.json.token, "agent:helper");
+    expect(deeper.status).toBe(403);
+    expect(deeper.json.detail).toEqual(["host_depth_exceeded"]);
+  });
+
+  test("the hiring tree shows the host, its hires and their dials — to the host and above only", async () => {
+    const root = await newTenant("host-tree", "pro");
+    const h = await mkHost(root.token);
+    const w = await hire(h.json.token, "agent:one");
+    await hire(h.json.token, "agent:two");
+    const tree = await req("GET", `/api/hosts/${h.json.host.id}`, { token: root.token });
+    expect(tree.status).toBe(200);
+    expect(tree.json.host.limits).toEqual({ maxSubagents: 10, maxDepthBelow: 2 });
+    expect(tree.json.hires.map((g) => g.autonomy)).toEqual(["ask", "ask"]);
+    expect(tree.json.live).toBe(2);
+    expect((await req("GET", `/api/hosts/${h.json.host.id}`, { token: h.json.token })).status).toBe(200);
+    expect((await req("GET", `/api/hosts/${h.json.host.id}`, { token: w.json.token })).json.error).toBe("not_in_your_subtree");
+    expect((await req("GET", `/api/hosts/gr_nope`, { token: root.token })).status).toBe(404);
+  });
+
+  test("revoke drill: revoking the host stops every hire and returns the budget to the owner", async () => {
+    const root = await newTenant("host-revoke", "pro");
+    const before = (await verify(root.token)).remaining;
+    const h = await mkHost(root.token);
+    const a = await hire(h.json.token, "agent:a");
+    const b = await hire(h.json.token, "agent:b");
+    const rv = await req("POST", `/api/grants/${h.json.host.id}/revoke`, { token: root.token, body: {} });
+    expect(rv.json.revoked.length).toBe(3); // the host and both hires
+    for (const tok of [h.json.token, a.json.token, b.json.token]) expect((await req("GET", "/api/grants/verify", { token: tok })).status).toBe(401);
+    expect((await verify(root.token)).remaining).toEqual(before);
   });
 });

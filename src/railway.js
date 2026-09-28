@@ -103,6 +103,20 @@ export var TEMPLATES = {
     needs: ["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "COS_GRANT_TOKEN", "BUILDER_TOKEN"],
     estCents: 120,
   },
+  // The agent-host (docs/specs/agent-host.md): a machine an agent runs in and hires
+  // sub-agents from. COS_GRANT_TOKEN is the HOST grant minted by POST /api/hosts —
+  // never the owner's root — so everything it hires is a child of the host, capped
+  // by the host's budget, ceilings and dial.
+  "agent-host": {
+    repo: WORKER_REPO,
+    kind: "agent-host",
+    desc: "A machine where one agent hires sub-agents under its own grant and dial",
+    env: {
+      WORKER_KIND: "agent-host",
+    },
+    needs: ["ANTHROPIC_API_KEY", "COS_GRANT_TOKEN"],
+    estCents: 120,
+  },
 };
 var REPO_RE = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
 function resolveSource(e, t) {
