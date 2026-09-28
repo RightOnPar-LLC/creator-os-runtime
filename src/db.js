@@ -67,6 +67,19 @@ CREATE TABLE IF NOT EXISTS rate_limits (
 CREATE TABLE IF NOT EXISTS guest_fingerprints (
   fp TEXT PRIMARY KEY, grant_id TEXT, grant_exp BIGINT NOT NULL DEFAULT 0,
   window_start BIGINT NOT NULL, count INT NOT NULL DEFAULT 0, updated_at BIGINT NOT NULL DEFAULT 0);
+-- The autonomy dial (autonomy.js). Every ledger row can say how much autonomy the
+-- actor had, what the gate decided, and which human approved it. Additive and
+-- nullable: rows written before the dial read as NULL, i.e. unrecorded.
+ALTER TABLE ledger ADD COLUMN IF NOT EXISTS autonomy INT;
+ALTER TABLE ledger ADD COLUMN IF NOT EXISTS decision TEXT;
+ALTER TABLE ledger ADD COLUMN IF NOT EXISTS approver TEXT;
+-- A value action an agent at autonomy "ask" requested: it waits here until the
+-- tenant root grant (the owner credential) approves or denies it.
+CREATE TABLE IF NOT EXISTS approvals (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL, grant_id TEXT NOT NULL, action TEXT NOT NULL, intent JSONB NOT NULL,
+  autonomy INT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', requested_by TEXT, approver TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(), decided_at TIMESTAMPTZ, result JSONB);
+CREATE INDEX IF NOT EXISTS approvals_tenant_status ON approvals(tenant, status);
 `;
 export async function migrateSchema() {
   for (let e of SCHEMA_SQL.split(";")

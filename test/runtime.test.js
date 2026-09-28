@@ -1923,3 +1923,138 @@ describe("20. A2A Agent Card (Phase 1: /.well-known/agent.json)", () => {
     }
   });
 });
+
+// ------------------------------------------------------------------------------------
+describe("22. the autonomy dial (src/autonomy.js)", () => {
+  const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
+  // A child of `parentToken` with the caps a dial test needs, at the given level (omit = inherit).
+  const childAt = (parentToken, autonomy, extra = {}) =>
+    req("POST", "/api/grants", {
+      token: parentToken,
+      body: {
+        sub: "agent:dial",
+        caps: ["grant.issue", "deploy.worker", "escrow.hold", "ledger.read", "grant.read"],
+        ttlSec: 3600,
+        budget: { usd_cents: 2000, calls: 10, deploys: 2 },
+        ...(autonomy === undefined ? {} : { constraints: { autonomy } }),
+        ...extra,
+      },
+    });
+  const escrowBody = { amount: 100, payee_tenant: "t_payee", condition: { kind: "attestation:self-settle" } };
+
+  test("a grant minted without a level is `act` — existing behaviour is unchanged", async () => {
+    const root = await newTenant("dial-legacy", "pro");
+    expect((await verify(root.token)).constraints.autonomy).toBeUndefined(); // the root row carries no level...
+    const c = await childAt(root.token, undefined);
+    expect(c.status).toBe(201);
+    expect((await verify(c.json.token)).constraints.autonomy).toBe(2); // ...and a child inherits `act`
+  });
+
+  test("CONTROL: a child asking for more autonomy than its parent is refused (autonomy_widened)", async () => {
+    const root = await newTenant("dial-widen", "pro");
+    const asker = await childAt(root.token, "ask");
+    expect(asker.status).toBe(201);
+    const up = await childAt(asker.json.token, "act");
+    expect(up.status).toBe(403);
+    expect(up.json).toEqual({ error: "attenuation_violation", detail: ["autonomy_widened"] });
+    const same = await childAt(asker.json.token, "ask");
+    expect(same.status).toBe(201);
+  });
+
+  test("CONTROL: at `ask`, the agent's own confirm:true does NOT deploy — it waits for the owner", async () => {
+    const root = await newTenant("dial-ask", "pro");
+    const c = await childAt(root.token, "ask");
+    const name = (await verify(c.json.token)).scope.workers.namePrefix + "dial-1";
+    const d = await req("POST", "/api/deploys", { token: c.json.token, body: { name, template: "probe", confirm: true } });
+    expect(d.status).toBe(201);
+    expect(d.json.status).toBe("awaiting_approval");
+    expect(d.json.executed).toBe(false);
+    expect((await req("GET", "/api/deploys", { token: root.token })).json.deploys.length).toBe(0); // nothing planned or run
+    const led = (await req("GET", "/api/ledger", { token: root.token })).json.ledger;
+    expect(led.some((l) => l.kind === "autonomy-ask" && l.decision === "ask" && l.autonomy === 1)).toBe(true);
+  });
+
+  test("CONTROL: only the owner's root grant can approve — a delegated grant cannot, even an `act` one", async () => {
+    const root = await newTenant("dial-who", "pro");
+    const boss = await childAt(root.token, "act");
+    const worker = await childAt(boss.json.token, "ask");
+    const d = await req("POST", "/api/escrow", { token: worker.json.token, body: escrowBody });
+    expect(d.status).toBe(202);
+    const byBoss = await req("POST", `/api/approvals/${d.json.approval.id}`, { token: boss.json.token, body: { decision: "approve" } });
+    expect(byBoss.status).toBe(403);
+    expect(byBoss.json.error).toBe("owner_approval_required");
+  });
+
+  test("the owner approves: the exact escrow opens, and the ledger names the approving human", async () => {
+    const root = await newTenant("dial-yes", "pro");
+    const rootId = (await verify(root.token)).id;
+    const c = await childAt(root.token, "ask");
+    const d = await req("POST", "/api/escrow", { token: c.json.token, body: escrowBody });
+    const ap = d.json.approval.id;
+    const ok = await req("POST", `/api/approvals/${ap}`, { token: root.token, body: { decision: "approve" } });
+    expect(ok.status).toBe(200);
+    expect(ok.json.status).toBe("executed");
+    expect(ok.json.result.escrow.amount).toBe(100);
+    const led = (await req("GET", "/api/ledger", { token: root.token })).json.ledger;
+    expect(led.some((l) => l.kind === "autonomy-approved" && l.approver === rootId && l.ref === ap)).toBe(true);
+    // approving twice is impossible: it is no longer pending
+    const again = await req("POST", `/api/approvals/${ap}`, { token: root.token, body: { decision: "approve" } });
+    expect(again.status).toBe(404);
+  });
+
+  test("the owner denies: nothing runs, and the denial is on the ledger", async () => {
+    const root = await newTenant("dial-no", "pro");
+    const c = await childAt(root.token, "ask");
+    const before = (await verify(c.json.token)).remaining.usd_cents;
+    const d = await req("POST", "/api/escrow", { token: c.json.token, body: escrowBody });
+    const no = await req("POST", `/api/approvals/${d.json.approval.id}`, { token: root.token, body: { decision: "deny" } });
+    expect(no.json.status).toBe("denied");
+    expect((await verify(c.json.token)).remaining.usd_cents).toBe(before); // no value held
+    const led = (await req("GET", "/api/ledger", { token: root.token })).json.ledger;
+    expect(led.some((l) => l.kind === "autonomy-denied" && l.decision === "denied")).toBe(true);
+  });
+
+  test("an approved deploy that cannot run says approved_not_run, never executed", async () => {
+    const root = await newTenant("dial-norun", "pro");
+    const c = await childAt(root.token, "ask");
+    const name = (await verify(c.json.token)).scope.workers.namePrefix + "dial-2";
+    const d = await req("POST", "/api/deploys", { token: c.json.token, body: { name, template: "probe" } });
+    const ok = await req("POST", `/api/approvals/${d.json.approval.id}`, { token: root.token, body: { decision: "approve" } });
+    expect(ok.status).toBe(200);
+    expect(ok.json.status).toBe("approved_not_run"); // Railway is unarmed under test
+  });
+
+  test("CONTROL: `observe` refuses value actions outright, and the refusal is recorded", async () => {
+    const root = await newTenant("dial-obs", "pro");
+    const c = await childAt(root.token, "observe");
+    const r = await req("POST", "/api/escrow", { token: c.json.token, body: escrowBody });
+    expect(r.status).toBe(403);
+    expect(r.json.error).toBe("autonomy_observe_only");
+    const led = (await req("GET", "/api/ledger", { token: root.token })).json.ledger;
+    expect(led.some((l) => l.kind === "autonomy-refused" && l.decision === "refuse" && l.autonomy === 0)).toBe(true);
+  });
+
+  test("turning the dial down cascades to the subtree; turning it up is refused", async () => {
+    const root = await newTenant("dial-down", "pro");
+    const mid = await childAt(root.token, "act");
+    const leaf = await childAt(mid.json.token, "act");
+    const midId = (await verify(mid.json.token)).id;
+    const down = await req("POST", `/api/grants/${midId}/autonomy`, { token: root.token, body: { level: "ask" } });
+    expect(down.status).toBe(200);
+    expect(down.json).toMatchObject({ from: "act", to: "ask", grantsChanged: 2 });
+    expect((await verify(leaf.json.token)).constraints.autonomy).toBe(1); // the leaf came down too
+    const up = await req("POST", `/api/grants/${midId}/autonomy`, { token: root.token, body: { level: "act" } });
+    expect(up.status).toBe(403);
+    expect(up.json.error).toBe("raise_requires_new_grant");
+  });
+
+  test("CONTROL: a grant cannot turn the dial of a grant outside its own subtree", async () => {
+    const root = await newTenant("dial-reach", "pro");
+    const a = await childAt(root.token, "act");
+    const b = await childAt(root.token, "act");
+    const bId = (await verify(b.json.token)).id;
+    const r = await req("POST", `/api/grants/${bId}/autonomy`, { token: a.json.token, body: { level: "observe" } });
+    expect(r.status).toBe(403);
+    expect(r.json.error).toBe("not_in_your_subtree");
+  });
+});

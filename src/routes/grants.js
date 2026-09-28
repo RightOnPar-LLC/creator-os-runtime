@@ -1,8 +1,9 @@
 // Routes: grant-holder API: grants, cog, deploys, ledger, events, tenant. Registration order is significant.
-import { HttpError, parseJson } from "../util.js";
-import { getGrant, recordEvent, sql } from "../db.js";
+import { HttpError, nowSec, parseJson } from "../util.js";
+import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "../db.js";
 import { normalizeUsage, remainingBudget, TIERS } from "../policy.js";
-import { issueChildGrant, revokeGrantTree, settleGrantUsage } from "../grants.js";
+import { issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
+import { openEscrow, serializeEscrow } from "../escrow.js";
 import { deleteDeploy, deployWorker, refreshDeployStatus, restartDeploy, TEMPLATES } from "../railway.js";
 import { cogExecute, cogPlan } from "../cog.js";
 import { app, readJsonBody, requireGrant } from "../http.js";
@@ -204,4 +205,74 @@ app.get("/api/tenant", requireGrant("tenant.read"), (e) => {
     tenant: r,
     tier: TIERS[r.tier],
   });
+});
+
+// --- The autonomy dial: approvals + turning it down (autonomy.js) -------------------
+// A value action requested at autonomy "ask" waits in `approvals`. Only the tenant's
+// ROOT grant (depth 0 — the owner's credential) may approve or deny it: an agent's own
+// `confirm: true` never counts at "ask". The approval is recorded on the ledger row
+// the action settles, so the book says which agent acted and which human said yes.
+app.get("/api/approvals", requireGrant(null), async (e) => {
+  let t = e.get("auth");
+  // Subtree-scoped like /api/ledger: a caller sees approvals for its own grant and
+  // its descendants; the root sees the whole tenant.
+  return e.json({
+    approvals:
+      await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${t.row.id} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
+      SELECT * FROM approvals WHERE tenant = ${t.tenant.id} AND grant_id IN (SELECT id FROM sub) ORDER BY created_at DESC LIMIT 100`,
+  });
+});
+app.post("/api/approvals/:id", requireGrant(null), async (e) => {
+  let t = e.get("auth"),
+    a = await readJsonBody(e),
+    id = e.req.param("id"),
+    verdict = a?.decision;
+  if (Number(t.row.depth) !== 0) throw new HttpError(403, "owner_approval_required", { hint: "approve with the tenant's root grant" });
+  if (verdict !== "approve" && verdict !== "deny") throw new HttpError(400, "decision_must_be_approve_or_deny");
+  // Claim the approval atomically: only one caller ever moves it out of pending.
+  let ap = (
+    await sql`UPDATE approvals SET status = ${verdict === "approve" ? "approved" : "denied"}, approver = ${t.row.id}, decided_at = now()
+    WHERE id = ${id} AND tenant = ${t.tenant.id} AND status = 'pending' RETURNING *`
+  )[0];
+  if (!ap) throw new HttpError(404, "approval_not_pending");
+  let g = await getGrant(ap.grant_id);
+  if (verdict === "deny") {
+    if (g) await recordAutonomyRow(g, "autonomy-denied", ap.id, `${ap.action} denied by the owner`, { autonomy: ap.autonomy, decision: "denied", approver: t.row.id });
+    await recordEvent("autonomy.denied", { approval: ap.id, action: ap.action }, t.tenant.id, t.row.sub);
+    return e.json({ id: ap.id, status: "denied" });
+  }
+  // Approved: run the exact intent the agent asked for, under the agent's own grant —
+  // which must still be live. The kill switch stops approved actions too.
+  let fail = async (reason) => {
+    await sql`UPDATE approvals SET status = 'failed', result = ${{ reason }}::jsonb WHERE id = ${ap.id}`;
+    throw new HttpError(409, reason);
+  };
+  if (await isKillSwitchOn()) await fail("kill_switch_on");
+  if (!g || g.status !== "active" || Number(g.exp) <= nowSec()) await fail("requesting_grant_not_active");
+  let tenant = await getTenant(g.tenant),
+    intent = parseJson(ap.intent),
+    result;
+  try {
+    if (ap.action === "deploy") result = await deployWorker({ row: g, tenant }, intent, !0, ap.requested_by, { approvedBy: t.row.id });
+    else if (ap.action === "escrow.open") {
+      let r = await openEscrow(g, intent, ap.requested_by);
+      await recordAutonomyRow(g, "autonomy-approved", ap.id, "escrow open approved by the owner", { autonomy: ap.autonomy, decision: "approved", approver: t.row.id });
+      result = { escrow: serializeEscrow(r.row), token: r.token };
+    } else await fail("unknown_action");
+  } catch (err) {
+    await sql`UPDATE approvals SET status = 'failed', result = ${{ reason: String(err?.message || err).slice(0, 200) }}::jsonb WHERE id = ${ap.id} AND status = 'approved'`;
+    throw err;
+  }
+  // A deploy can be approved yet not run (e.g. Railway unarmed): say so, never "executed".
+  let status = ap.action === "deploy" && !result?.executed ? "approved_not_run" : "executed";
+  await sql`UPDATE approvals SET status = ${status}, result = ${{ id: result?.id ?? result?.escrow?.id ?? null, reason: result?.reason ?? null }}::jsonb WHERE id = ${ap.id}`;
+  await recordEvent("autonomy.approved", { approval: ap.id, action: ap.action, status }, t.tenant.id, t.row.sub);
+  return e.json({ id: ap.id, status, result });
+});
+// Turn a grant's dial DOWN (cascades to its subtree). Raising is refused: it takes a
+// new grant from the issuer. The caller must be the grant itself or an ancestor.
+app.post("/api/grants/:id/autonomy", requireGrant(null), async (e) => {
+  let t = e.get("auth"),
+    a = await readJsonBody(e);
+  return e.json(await lowerGrantAutonomy(t.row, e.req.param("id"), a?.level));
 });
