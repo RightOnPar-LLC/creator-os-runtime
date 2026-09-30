@@ -2069,6 +2069,135 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
 });
 
 // ------------------------------------------------------------------------------------
+describe("21b. escrow capture (attestation:self-settle — payee attests delivery)", () => {
+  const remainingOf = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
+  const openSelfSettleEscrow = async (payerToken, payeeTenantId, over = {}) =>
+    req("POST", "/api/escrow", { token: payerToken, body: { amount: 500, payee_tenant: payeeTenantId, condition: { kind: "attestation:self-settle" }, ...over } });
+  const capture = (token, escrowGrantId) => req("POST", "/api/escrow/" + escrowGrantId + "/capture", { token });
+  const creditRows = async (payee, escrowId) => (await dbQuery("SELECT count(*)::int AS n, coalesce(sum(usd_cents),0)::int AS cents FROM ledger WHERE tenant=$1 AND kind='mesh-credit' AND ref=$2", [payee, escrowId])).rows[0];
+  const setSetting = (k, v) => dbQuery("INSERT INTO settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()", [k, v]);
+  beforeAll(() => setSetting("escrow_capture", "on"));
+  afterAll(async () => { await setSetting("escrow_capture", "off"); await setSetting("kill_switch", "off"); });
+
+  test("happy path: the payee self-settles — escrow->captured, payer settled, payee credited in MESH", async () => {
+    const payer = await newTenant("ss-payer", "pro");
+    const payee = await newTenant("ss-payee", "pro");
+    const before = (await remainingOf(payer.token)).usd_cents;
+    const open = await openSelfSettleEscrow(payer.token, payee.id);
+    expect(open.status).toBe(201);
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    expect((await remainingOf(payer.token)).usd_cents).toBe(before - 500);
+    const r = await capture(payee.token, gid);
+    expect(r.status).toBe(200);
+    expect(r.json.captured).toBe(true);
+    expect(r.json.payee_tenant).toBe(payee.id);
+    expect((await req("GET", "/api/escrow/" + gid, { token: payer.token })).json.escrow.state).toBe("captured");
+    expect((await remainingOf(payer.token)).usd_cents).toBe(before - 500);
+    expect(await creditRows(payee.id, esId)).toEqual({ n: 1, cents: 500 });
+    expect((await dbQuery("SELECT count(*)::int AS n FROM ledger WHERE grant_id=$1 AND kind='escrow-capture'", [gid])).rows[0].n).toBe(1);
+    expect((await dbQuery("SELECT note FROM ledger WHERE tenant=$1 AND kind='mesh-credit' AND ref=$2", [payee.id, esId])).rows[0].note).toContain("attestation:self-settle");
+  });
+
+  test("CONTROL: a non-payee cannot self-settle — the payer cannot capture their own escrow", async () => {
+    const payer = await newTenant("ss-notpayee", "pro");
+    const payee = await newTenant("ss-notpayee-target", "pro");
+    const open = await openSelfSettleEscrow(payer.token, payee.id);
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    const r = await capture(payer.token, gid);
+    expect(r.status).toBe(400);
+    expect(r.json.error).toBe("not_payee");
+    expect((await req("GET", "/api/escrow/" + gid, { token: payer.token })).json.escrow.state).toBe("open");
+    expect(await creditRows(payee.id, esId)).toEqual({ n: 0, cents: 0 });
+  });
+
+  test("CONTROL: a third tenant cannot self-settle — only the payee can attest", async () => {
+    const payer = await newTenant("ss-third-payer", "pro");
+    const payee = await newTenant("ss-third-payee", "pro");
+    const bystander = await newTenant("ss-third-bystander", "pro");
+    const open = await openSelfSettleEscrow(payer.token, payee.id);
+    const gid = open.json.escrow.grant_id;
+    const r = await capture(bystander.token, gid);
+    expect(r.status).toBe(400);
+    expect(r.json.error).toBe("not_payee");
+  });
+
+  test("CONTROL: a receipt:mesh escrow cannot be captured via self-settle (wrong condition)", async () => {
+    const payer = await newTenant("ss-wrongcond", "pro");
+    const payee = await newTenant("ss-wrongcond-payee", "pro");
+    const open = await req("POST", "/api/escrow", { token: payer.token, body: { amount: 500, payee_tenant: payee.id, condition: { kind: "receipt:mesh" } } });
+    const gid = open.json.escrow.grant_id;
+    const r = await capture(payee.token, gid);
+    expect(r.status).toBe(400);
+    expect(r.json.error).toBe("condition_mismatch");
+    expect((await req("GET", "/api/escrow/" + gid, { token: payer.token })).json.escrow.state).toBe("open");
+  });
+
+  test("CONTROL: double-capture is impossible — the payee is credited exactly once", async () => {
+    const payer = await newTenant("ss-dup", "pro");
+    const payee = await newTenant("ss-dup-payee", "pro");
+    const open = await openSelfSettleEscrow(payer.token, payee.id);
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    expect((await capture(payee.token, gid)).json.captured).toBe(true);
+    const second = await capture(payee.token, gid);
+    expect(second.status).toBe(400);
+    expect(second.json.error).toContain("not_active");
+    expect(await creditRows(payee.id, esId)).toEqual({ n: 1, cents: 500 });
+  });
+
+  test("CONTROL: capture and refund are mutually exclusive — a captured escrow cannot be refunded", async () => {
+    const payer = await newTenant("ss-cap-refund", "pro");
+    const payee = await newTenant("ss-cap-refund-payee", "pro");
+    const before = (await remainingOf(payer.token)).usd_cents;
+    const open = await openSelfSettleEscrow(payer.token, payee.id);
+    const gid = open.json.escrow.grant_id;
+    expect((await capture(payee.token, gid)).json.captured).toBe(true);
+    const rev = await req("POST", "/api/grants/" + gid + "/revoke", { token: payer.token, body: { reason: "late refund" } });
+    expect(rev.json.revoked).not.toContain(gid);
+    expect((await remainingOf(payer.token)).usd_cents).toBe(before - 500);
+  });
+
+  test("CONTROL: a refunded escrow cannot be captured — self-settle is refused", async () => {
+    const payer = await newTenant("ss-refund-cap", "pro");
+    const payee = await newTenant("ss-refund-cap-payee", "pro");
+    const before = (await remainingOf(payer.token)).usd_cents;
+    const open = await openSelfSettleEscrow(payer.token, payee.id);
+    const esId = open.json.escrow.id, gid = open.json.escrow.grant_id;
+    await req("POST", "/api/grants/" + gid + "/revoke", { token: payer.token, body: { reason: "failed" } });
+    expect((await remainingOf(payer.token)).usd_cents).toBe(before);
+    const r = await capture(payee.token, gid);
+    expect(r.status).toBe(400);
+    expect(r.json.error).toContain("not_active");
+    expect((await req("GET", "/api/escrow/" + gid, { token: payer.token })).json.escrow.state).toBe("refunded");
+    expect(await creditRows(payee.id, esId)).toEqual({ n: 0, cents: 0 });
+  });
+
+  test("CONTROL: capture is gated — escrow_capture must be on", async () => {
+    const payer = await newTenant("ss-gate", "pro");
+    const payee = await newTenant("ss-gate-payee", "pro");
+    const open = await openSelfSettleEscrow(payer.token, payee.id);
+    const gid = open.json.escrow.grant_id;
+    await setSetting("escrow_capture", "off");
+    const r = await capture(payee.token, gid);
+    expect(r.status).toBe(403);
+    expect(r.json.error).toBe("escrow_capture_gated");
+    expect((await req("GET", "/api/escrow/" + gid, { token: payer.token })).json.escrow.state).toBe("open");
+  });
+
+  test("CONTROL: kill switch stops capture — value movement halts with the runtime", async () => {
+    const payer = await newTenant("ss-kill", "pro");
+    const payee = await newTenant("ss-kill-payee", "pro");
+    const open = await openSelfSettleEscrow(payer.token, payee.id);
+    const gid = open.json.escrow.grant_id;
+    await setSetting("kill_switch", "on");
+    const r = await capture(payee.token, gid);
+    expect(r.status).toBe(503);
+    expect(r.json.error).toBe("runtime_paused");
+    await setSetting("kill_switch", "off");
+    expect((await req("GET", "/api/escrow/" + gid, { token: payer.token })).json.escrow.state).toBe("open");
+  });
+});
+
+// ------------------------------------------------------------------------------------
 describe("22. the autonomy dial (src/autonomy.js)", () => {
   const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
   // A child of `parentToken` with the caps a dial test needs, at the given level (omit = inherit).

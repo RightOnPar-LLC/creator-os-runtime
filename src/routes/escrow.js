@@ -1,11 +1,12 @@
-// Routes: escrow keystone (stage 1). POST /api/escrow opens a custodian hold (reserve on the
-// payer); GET /api/escrow/:id reads its state. Refund-on-deadline is the reaper's job — no route.
-// Capture is stage 2 and is condition-driven, never a party-callable free action. Registration
+// Routes: escrow keystone. POST /api/escrow opens a custodian hold (reserve on the payer);
+// GET /api/escrow/:id reads its state; POST /api/escrow/:id/capture is the attestation:self-settle
+// capture path (the payee attests delivery). Refund-on-deadline is the reaper's job — no route.
+// The receipt:mesh capture path is in routes/webhooks.js (POST /webhooks/mesh). Registration
 // order is significant.
 import { HttpError, newId, parseJson } from "../util.js";
-import { getGrant, recordEvent, sql } from "../db.js";
+import { getGrant, getSetting, isKillSwitchOn, recordEvent, sql } from "../db.js";
 import { app, readJsonBody, requireGrant } from "../http.js";
-import { buildEscrow, escrowBlock, openEscrow, serializeEscrow } from "../escrow.js";
+import { buildEscrow, captureFromSelfSettle, escrowBlock, openEscrow, serializeEscrow } from "../escrow.js";
 import { recordAutonomyRow } from "../grants.js";
 import { autonomyOf, decide } from "../autonomy.js";
 
@@ -46,4 +47,18 @@ app.get("/api/escrow/:id", requireGrant("grant.read"), async (e) => {
   if (!g || g.tenant !== t.tenant.id) throw new HttpError(404, "escrow_not_found");
   if (!escrowBlock(g)) throw new HttpError(404, "not_escrow"); // a plain grant is not an escrow
   return e.json({ escrow: serializeEscrow(g) });
+});
+
+// attestation:self-settle capture — the payee attests delivery by calling this endpoint with their
+// own grant token. This is condition-driven: the escrow must carry condition.kind = "attestation:self-settle"
+// and the caller's tenant must match the escrow's payee_tenant. Gated behind the same escrow_capture
+// operator switch + kill switch as the receipt:mesh webhook path — value movement never auto-fires.
+app.post("/api/escrow/:id/capture", requireGrant(null), async (e) => {
+  let t = e.get("auth"),
+    escrowId = e.req.param("id");
+  if (await isKillSwitchOn()) throw new HttpError(503, "runtime_paused");
+  if ((await getSetting("escrow_capture")) !== "on") throw new HttpError(403, "escrow_capture_gated", { needs: "escrow_capture=on" });
+  let r = await captureFromSelfSettle(t.row, escrowId);
+  if (!r.captured) throw new HttpError(400, r.reason || "capture_failed");
+  return e.json(r, 200);
 });

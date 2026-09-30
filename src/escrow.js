@@ -162,6 +162,23 @@ export async function captureEscrow(idOrEscrowId, { source = "capture", ref = nu
   return out;
 }
 
+// attestation:self-settle condition — the payee (authenticated via their own grant) attests
+// delivery by calling POST /api/escrow/:id/capture. The caller's tenant MUST match the escrow's
+// payee_tenant — this is the "self" in self-settle. The escrow_capture gate + kill switch guard
+// the same value movement as the receipt:mesh path. Returns { captured, reason?, ... } without
+// throwing for a wrong-condition or wrong-tenant escrow — the route translates the result.
+export async function captureFromSelfSettle(callerRow, escrowId) {
+  let g = await findEscrowGrant(escrowId);
+  if (!g) return { captured: false, reason: "escrow_not_found" };
+  let b = escrowBlock(g);
+  if (!b) return { captured: false, reason: "not_escrow" };
+  if (b.condition?.kind !== "attestation:self-settle") return { captured: false, reason: "condition_mismatch" };
+  // The payee tenant check: the caller must belong to the escrow's payee tenant. A payer, a
+  // bystander, or a different-tenant grant cannot self-settle — only the payee can attest delivery.
+  if (callerRow.tenant !== b.payee_tenant) return { captured: false, reason: "not_payee" };
+  return captureEscrow(g.id, { source: "attestation:self-settle" });
+}
+
 // receipt:mesh condition — a signed MeshMarket delivery receipt (its HMAC already verified by the
 // webhook) is the external, non-repudiable delivery proof. Verify the escrow's condition kind and
 // (if set) its ref, then capture. Never throws for a receipt that names no/unknown/mismatched
