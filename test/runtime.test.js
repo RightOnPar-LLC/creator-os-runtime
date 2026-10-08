@@ -27,7 +27,7 @@ describe("1. /health", () => {
     expect(h.killSwitch).toBe(false);
     expect(h.armed).toEqual({
       admin: true, vault: true, railway: false, railwayOAuth: false, stripe: false,
-      railwayWebhook: true, github: true, brain: true, mesh: true, anthropic: false,
+      railwayWebhook: true, github: true, brain: true, mesh: true, ollama: false,
       brainOut: false, cognitiveBridge: false, sync: false, lspMcp: true,
     });
     // 2026-09-25: fingerprints are no longer public.
