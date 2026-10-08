@@ -49,7 +49,10 @@ export var armedIntegrations = () => ({
   github: !!env.GITHUB_WEBHOOK_SECRET,
   brain: !!env.BRAIN_WEBHOOK_SECRET,
   mesh: !!env.MESH_RECEIPT_SECRET,
-  anthropic: !!env.ANTHROPIC_API_KEY,
+  // COG was rewired off Anthropic onto the Z-13's own Ollama instance (work
+  // order 14). ollama replaces anthropic here; OLLAMA_URL is the only thing
+  // cog.js checks before attempting an LLM-assisted plan.
+  ollama: !!env.OLLAMA_URL,
   brainOut: !!env.BRAIN_URL,
   cognitiveBridge: !!(env.COG_BRIDGE_URL && env.COG_BRIDGE_TOKEN),
   sync: !!env.COG_SYNC_TOKEN,
