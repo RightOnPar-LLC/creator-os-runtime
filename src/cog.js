@@ -118,23 +118,30 @@ function buildDeterministicPlan(
   };
 }
 async function planWithLlm(e, t, a, n, r) {
-  if (!env.ANTHROPIC_API_KEY) return null;
+  // Rewired off Anthropic onto the Z-13's own Ollama instance (work order 14:
+  // "cog_plan and cog_execute need to hit Ollama, not the Anthropic API").
+  // OLLAMA_URL is the Tailscale address of the Z-13's Ollama server (confirmed
+  // listening on :11435, not Ollama's usual default :11434, with gpt-oss:120b
+  // already pulled). No Anthropic key, no Anthropic network call, anywhere in
+  // this function.
+  if (!env.OLLAMA_URL) return null;
   try {
     let s = (
       (
         await (
-          await fetch("https://api.anthropic.com/v1/messages", {
+          await fetch(`${env.OLLAMA_URL.replace(/\/$/, "")}/api/chat`, {
             method: "POST",
             headers: {
               "content-type": "application/json",
-              "x-api-key": env.ANTHROPIC_API_KEY,
-              "anthropic-version": "2023-06-01",
             },
             body: JSON.stringify({
-              model: env.COG_MODEL || "claude-sonnet-4-5",
-              max_tokens: 300,
-              system: `You are the COG planner. Choose exactly one template from: ${Object.keys(TEMPLATES).join(", ")}. Reply ONLY with JSON {"template": string, "env": object, "why": string}. Never invent secrets.`,
+              model: env.COG_MODEL || "gpt-oss:120b",
+              stream: false,
               messages: [
+                {
+                  role: "system",
+                  content: `You are the COG planner. Choose exactly one template from: ${Object.keys(TEMPLATES).join(", ")}. Reply ONLY with JSON {"template": string, "env": object, "why": string}. Never invent secrets.`,
+                },
                 {
                   role: "user",
                   content: `Creator intent: ${a}
@@ -145,7 +152,7 @@ Evidence (prior memory): ${JSON.stringify(r.evidence.map((l) => l.snippet))}`,
             }),
           })
         ).json()
-      )?.content?.[0]?.text || ""
+      )?.message?.content || ""
     ).match(/\{[\s\S]*\}/);
     if (!s) return null;
     let i = JSON.parse(s[0]);
