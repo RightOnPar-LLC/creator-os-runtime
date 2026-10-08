@@ -63,8 +63,8 @@ describe("1. /health", () => {
     expect(Object.keys(mod.TEMPLATES)).toEqual(
       ["probe", "tip-alert-bot", "paywall-link", "clip-poster", "dm-autoresponder", "webhook-relay", "repo-app", "builder", "agent-host"],
     );
-    expect(mod.CAPS.length).toBe(26);
-    expect(mod.CAPS.slice(20)).toEqual(["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references", "escrow.hold"]);
+    expect(mod.CAPS.length).toBe(29);
+    expect(mod.CAPS.slice(20)).toEqual(["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references", "escrow.hold", "repo.read", "repo.diff", "repo.pr"]);
     expect(mod.default.port).toBe(3000);
     expect(mod.default.fetch).toBe(mod.app.fetch);
     expect(Object.keys(mod).sort()).toEqual(
