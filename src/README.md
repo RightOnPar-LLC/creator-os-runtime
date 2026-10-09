@@ -80,6 +80,24 @@ over the Postgres wire protocol by `@electric-sql/pglite-socket`), with every ou
 `fetch` blocked. Pinned tool versions live in `test/package.json`; the root
 `package.json` dependencies are unchanged.
 
+Three things the suite depends on that are easy to get wrong:
+
+- **The per-test time limit (30 s) is passed by `run.mjs`.** The pinned bun ignores a
+  `timeout` key in `bunfig.toml`; run a test file by hand and you get bun's own 5 s.
+- **The rate meters count in fixed wall-clock windows** (a minute; an hour for guest
+  mints). A test that fills a meter runs inside `inOneWindow` (`harness.js`), so its
+  result counts only if the window did not turn while it ran.
+  `node test/window-controls.mjs` breaks each rule on purpose and expects the test
+  named for it to go red.
+- **"Connection refused" to 127.0.0.1 is the machine, never the runtime**: every
+  listener the suite talks to is up for the whole run. The harness asks again and says
+  so at the end of the run. A connection the machine *resets* is never asked again (the
+  runtime may have acted on it): that run loses one test, with `ECONNRESET`, or with a
+  500 from a database connection that was reset (`Connection closed`, or `prepared
+  statement ... already exists` on the re-dialed one). Rerun. `node test/loopback-check.mjs`
+  says whether a machine is in that state; what was found on one is written at the top
+  of that file.
+
 ## 0.3.2 — the diagnostics gate (lsp-mcp)
 
 No `code.write` or `deploy.worker` grant signs while the source it is about to touch
