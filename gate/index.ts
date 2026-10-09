@@ -6,7 +6,7 @@ import { createHash, randomBytes } from "node:crypto";
 
 const env = Bun.env;
 const VERSION = "0.1.0";
-const RUNTIME = (env.RUNTIME_URL || "https://runtime-production-9d95.up.railway.app").replace(/\/$/, "");
+const RUNTIME = (env.RUNTIME_URL || "https://runtime.meshtool.ai").replace(/\/$/, "");
 const COCKPIT = (env.COCKPIT_URL || RUNTIME).replace(/\/$/, "");
 const VERIFY_TTL = Number(env.VERIFY_TTL_MS || 30_000);
 const SRC = await Bun.file(import.meta.path).text().catch(() => "");
