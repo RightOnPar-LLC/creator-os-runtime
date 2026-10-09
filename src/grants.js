@@ -258,9 +258,13 @@ export async function revokeGrantTree(e, t, a) {
   let n = [];
   if (
     (await sql.begin(async (r) => {
-      // Deepest first, so that by the time a grant is reached everything under it has let go. This is only the
-      // LIST: it locks nothing (the FOR UPDATE that used to sit here was on a WITH query, which Postgres does not
-      // lock), so each grant is taken and flipped below in ONE statement.
+      // Deepest first, so that by the time a grant is reached everything under it THAT WAS IN THIS LIST has let
+      // go. This is only the list: it locks nothing (the FOR UPDATE that used to sit here was on a WITH query,
+      // which Postgres does not lock), so each grant is taken and flipped below in ONE statement.
+      // KNOWN GAP, older than this note and now failing safe: a child issued under a grant AFTER the list was read
+      // and before that grant is flipped is not in the list. It stays live under a cancelled parent, and its whole
+      // budget stays held on the grant above for good (before 2026-10-09 it was handed out a second time instead).
+      // Closing it means re-listing a grant's children after its flip; see the follow-up on the pull request.
       let s = await r`WITH RECURSIVE sub AS (SELECT id, depth FROM grants WHERE id = ${e}
       UNION ALL SELECT g.id, g.depth FROM grants g JOIN sub ON g.parent = sub.id) SELECT id FROM sub ORDER BY depth DESC`;
       for (let { id } of s) {
@@ -376,16 +380,17 @@ export async function lowerGrantAutonomy(caller, targetId, level) {
 }
 // Release a grant's UNUSED reservation (unusedOf: budget - settled - what is still held on it for the keys
 // under it; the same amount revokeGrantTree computes) back to its parent when it transitions active->expired.
-// The `RETURNING id` length guard is the idempotency lever: only the call that
+// The `RETURNING` row-count guard is the idempotency lever: only the call that
 // actually flips the row releases, so a second sweep, the lazy verify path, and a
 // later revoke can never double-credit the parent. Mirrors revokeGrantTree's
 // release (same math, same 'release' ledger row).
 async function releaseExpiredGrant(tx, g) {
   // A grant lets go only AFTER everything under it has. Until then what is held on it is not yet "what the keys
   // under it used", so it waits: the sweep goes deepest first, and a child never outlives its parent, so anything
-  // still active under an expired grant is itself due in this same pass. This only LOOKS at the children; it never
-  // locks one. The transaction still holds one grant and then its parent and nothing else, so the lock order stays
-  // child-then-parent, as the note above reapExpiredGrants requires.
+  // still active under an expired grant is itself due for the sweep (this pass, or the next if another writer held
+  // it). This only LOOKS at the children; it never locks one. The transaction holds one grant and then its parent
+  // and nothing else: child, then parent. (revokeGrantTree is the one writer that does hold a parent while taking
+  // the next sibling; that is as it was, and a deadlock there aborts one side without changing any balance.)
   let waiting = await tx`SELECT 1 FROM grants WHERE parent = ${g.id} AND status = 'active' LIMIT 1`;
   if (waiting.length) return !1;
   let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING reserved`;
@@ -468,7 +473,8 @@ export async function verifyGrant(e, t, a, countRate = !0) {
     if (Number(r.exp) <= nowSec()) {
       // lazy release: a re-presented expired token frees its reservation now, via
       // the SAME helper the sweep uses (idempotent — the RETURNING guard means the
-      // sweep won't release it again).
+      // sweep won't release it again). If a key under it is still waiting for the
+      // sweep, nothing is freed here: the sweep takes both, lower one first.
       await sql.begin(async (tx) => {
         let g = (await tx`SELECT * FROM grants WHERE id = ${r.id} FOR UPDATE`)[0];
         if (g) await releaseExpiredGrant(tx, g);
