@@ -740,6 +740,101 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     expect(lead2.json.escrow.deadline).toBeLessThanOrEqual(now() + 3600);
   });
 
+  // A deadline that cannot be read, or has already passed, used to be swapped for the default
+  // hour with a 201: the payer got a hold it never asked for.
+  test("a hold deadline that is not a time, or has already passed, is refused, never swapped for the default hour", async () => {
+    const t = await newTenant("hold-deadline-odd", "pro");
+    const now = () => Math.floor(Date.now() / 1000);
+    const left = async () => (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining.usd_cents;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const before = await left();
+    for (const deadline of ["2026-12-25T00:00:00Z", "soon", "", "0", true, false, [], {}, [now() + 600], now() - 5, 1, -1]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline }) });
+      expect([JSON.stringify(deadline), r.status, r.json.error]).toEqual([JSON.stringify(deadline), 400, "escrow_deadline_invalid"]);
+    }
+    expect(await left()).toBe(before); // the refusals held nothing
+    // "Not given" is exactly: absent, null, or the number 0. Those still open the default hour.
+    for (const over of [{}, { deadline: null }, { deadline: 0 }]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body(over) });
+      expect(r.status).toBe(201);
+      expect(r.json.escrow.deadline).toBeGreaterThan(now() + 3500);
+      expect(r.json.escrow.deadline).toBeLessThanOrEqual(now() + 3600);
+    }
+    // A real deadline is kept, written as a number or as a string that reads as one.
+    for (const deadline of [now() + 600, String(now() + 600)]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline }) });
+      expect(r.status).toBe(201);
+      expect(Math.abs(r.json.escrow.deadline - Number(deadline))).toBeLessThanOrEqual(1);
+    }
+  });
+
+  // The owner's approval runs the request as it was asked. If its deadline has gone by while it
+  // waited, there is nothing left to honour: it used to open a fresh one-hour hold instead.
+  test("a hold whose deadline passes while it waits for the owner is refused at approval, not opened for a fresh hour", async () => {
+    const t = await newTenant("hold-deadline-late", "pro");
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const left = async () => (await req("GET", "/api/grants/verify", { token: asker.json.token })).json.remaining.usd_cents;
+    const intent = { amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, deadline: now() + 600 };
+    const d = await req("POST", "/api/escrow", { token: asker.json.token, body: intent });
+    expect(d.status).toBe(202);
+    // Time passes: the same request, its deadline now behind us.
+    await dbQuery("UPDATE approvals SET intent = $1::jsonb WHERE id = $2", [JSON.stringify({ ...intent, deadline: now() - 5 }), d.json.approval.id]);
+    const ok = await req("POST", `/api/approvals/${d.json.approval.id}`, { token: t.token, body: { decision: "approve" } });
+    expect(ok.status).toBe(400);
+    expect(ok.json.error).toBe("escrow_deadline_invalid");
+    expect(await left()).toBe(500); // nothing was held
+    const row = (await req("GET", "/api/approvals", { token: t.token })).json.approvals.find((a) => a.id === d.json.approval.id);
+    expect(row.status).toBe("failed");
+    expect((typeof row.result === "string" ? JSON.parse(row.result) : row.result).reason).toBe("escrow_deadline_invalid");
+  });
+
+  // A lifetime that is not a number was only refused when the hold was issued. For a payer whose
+  // dial says "ask" that is AFTER the approval was filed: the owner was asked to approve a hold
+  // that could never open.
+  test("a hold lifetime that is not a number is refused before anything is filed for the owner", async () => {
+    const t = await newTenant("hold-ttl-odd", "pro");
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const filed = async () => (await req("GET", "/api/approvals", { token: t.token })).json.approvals.length;
+    const left = async () => (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining.usd_cents;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const before = await left();
+    for (const ttlSec of ["abc", {}, "", true, []]) {
+      for (const token of [asker.json.token, t.token]) {
+        const r = await req("POST", "/api/escrow", { token, body: body({ ttlSec }) });
+        expect([JSON.stringify(ttlSec), r.status, r.json.error]).toEqual([JSON.stringify(ttlSec), 400, "ttl_invalid"]);
+      }
+    }
+    // It is refused even when a good deadline is given with it (the deadline would have won).
+    const both = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: now() + 600, ttlSec: "abc" }) });
+    expect([both.status, both.json.error]).toEqual([400, "ttl_invalid"]);
+    expect(await filed()).toBe(0); // the owner was never asked
+    expect(await left()).toBe(before); // and nothing was held
+    // A lifetime that is a number still works on both paths.
+    const opened = await req("POST", "/api/escrow", { token: t.token, body: body({ ttlSec: "600" }) });
+    expect(opened.status).toBe(201);
+    expect(opened.json.escrow.deadline).toBeLessThanOrEqual(now() + 600);
+    expect((await req("POST", "/api/escrow", { token: asker.json.token, body: body({ ttlSec: 600 }) })).status).toBe(202);
+    expect(await filed()).toBe(1);
+  });
+
+  // No request can give a payer key an unreadable end (the column is BIGINT NOT NULL), so the
+  // runtime proves this one on itself: /selftest calls the same check with such a key.
+  test("a hold is refused, not waved through, when the payer key's end cannot be read", async () => {
+    const r = await req("GET", "/selftest");
+    const check = r.json.results.find((c) => c.name === "payment hold refused when the payer key's end cannot be read");
+    expect(check).toEqual({ name: "payment hold refused when the payer key's end cannot be read", pass: true });
+  });
+
   test("a lifetime that is not a number is a clean 400, not a server error", async () => {
     const t = await newTenant("ttl-odd");
     for (const ttlSec of ["abc", {}]) {

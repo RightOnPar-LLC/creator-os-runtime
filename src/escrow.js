@@ -17,6 +17,10 @@ export const ESCROW_DENOMS = ["mesh"];
 export const ESCROW_CONDITION_KINDS = ["attestation:self-settle", "receipt:mesh"];
 export const ESCROW_CUSTODY_CAP = "escrow.hold";
 
+// A JSON number, or a string that reads as one. Number() alone would also read true as 1 and
+// "", false and [] as 0, so those are not numbers here.
+var numberFrom = (v) => (typeof v === "number" || (typeof v === "string" && v.trim() !== "") ? Number(v) : NaN);
+
 // Validate the open request and shape the custodian child spec + the scope.escrow block.
 // Throws HttpError on any bad input; never partially opens.
 export function buildEscrow(payerRow, params) {
@@ -34,18 +38,35 @@ export function buildEscrow(payerRow, params) {
   if (!ESCROW_CONDITION_KINDS.includes(kind))
     throw new HttpError(400, "escrow_condition_unknown", { kind, allowed: ESCROW_CONDITION_KINDS });
   let conditionRef = p.condition?.ref != null ? String(p.condition.ref).slice(0, 200) : null;
-  // Deadline drives the child's ttl; issueChildGrant clamps it to the tier max, so an
-  // over-long deadline is capped, never widened. Default 1h if none given.
+  // How long the hold lasts. The payer gives `deadline` (unix seconds) or `ttlSec`; with both,
+  // the deadline wins. `deadline` absent, null or the number 0 means "not given". Anything else
+  // must be a time later than now, and a `ttlSec` that is given must be a number, or the open is
+  // refused here, before a hold is opened or an approval is filed for the owner. A deadline
+  // that could not be read, or had already passed, used to fall back to the default hour and
+  // answer 201: a hold the payer never asked for.
+  // With nothing asked the hold lasts an hour. That default is not a promise: issueChildGrant
+  // still ends it at the payer key's own end and at the tier's longest lifetime, whichever
+  // comes first, and the answer carries the deadline it really got. An ASKED-for time past the
+  // tier's longest lifetime is still cut to it by issueChildGrant (never widened).
   let now = nowSec();
-  let deadline = Math.floor(Number(p.deadline ?? 0));
-  let ttlSec = deadline > now ? deadline - now : Math.floor(Number(p.ttlSec ?? 3600));
+  let deadline = 0;
+  if (p.deadline != null && p.deadline !== 0) {
+    deadline = Math.floor(numberFrom(p.deadline));
+    if (!(Number.isFinite(deadline) && deadline > now))
+      throw new HttpError(400, "escrow_deadline_invalid", { now, hint: "unix seconds, later than now" });
+  }
+  let ttlAsked = p.ttlSec == null ? null : Math.floor(numberFrom(p.ttlSec));
+  if (ttlAsked !== null && !Number.isFinite(ttlAsked)) throw new HttpError(400, "ttl_invalid");
+  let ttlSec = deadline ? deadline - now : (ttlAsked ?? 3600);
   // A hold never outlives the key that pays for it (a child never outlives its parent). When
   // the payer ASKS for a deadline past its own key's end, refuse and say why: quietly cutting
   // it would refund the payer early and leave a later, valid delivery unpaid. A key an agent
   // was handed lives a day at most (policy.js), so a longer hold needs a longer-lived payer.
+  // Written to fail closed: if the payer key's end cannot be read as a number, nothing opens.
+  // With nothing asked, `asked` is 0 and passes.
   let payerExp = Number(payerRow.exp);
-  let asked = deadline > now ? deadline : p.ttlSec != null && Number.isFinite(ttlSec) ? now + ttlSec : 0;
-  if (asked > payerExp) throw new HttpError(409, "escrow_deadline_exceeds_payer_key", { payer_exp: payerExp });
+  let asked = deadline ? deadline : ttlAsked !== null ? now + ttlAsked : 0;
+  if (!(asked <= payerExp)) throw new HttpError(409, "escrow_deadline_exceeds_payer_key", { payer_exp: payerExp });
   let escrowId = newId("es");
   let escrow = {
     escrow_id: escrowId,

@@ -7,6 +7,7 @@ import { verifyTimestampedSignature } from "../webhooks.js";
 import { app, routeInventory } from "../http.js";
 import { MCP_TOOLS } from "../mcp.js";
 import { buildAgentCard, validateAgentCard } from "../a2a.js";
+import { buildEscrow } from "../escrow.js";
 
 app.get("/routes", (e) => {
   let t = routeInventory();
@@ -295,7 +296,22 @@ app.get("/selftest", async (e) => {
           },
           "starter",
         ).length === 0,
-    ));
+    ),
+    // No request can reach this (grants.exp is BIGINT NOT NULL), so it is proven here: a payer
+    // key whose end cannot be read must refuse the hold, never wave it through.
+    a("payment hold refused when the payer key's end cannot be read", () => {
+      let ask = { amount: 1, payee_tenant: "t_y", condition: { kind: "receipt:mesh" }, ttlSec: 600 },
+        refusal = (row) => {
+          try {
+            return (buildEscrow(row, ask), null);
+          } catch (err) {
+            return err?.code || String(err?.message || err);
+          }
+        },
+        readable = refusal(n),
+        unreadable = refusal({ ...n, exp: void 0 });
+      return (readable === null && unreadable === "escrow_deadline_exceeds_payer_key") || { readable, unreadable };
+    }));
   let s = t.every((i) => i.pass || String(i.info || "").startsWith("skipped"));
   return e.json(
     {

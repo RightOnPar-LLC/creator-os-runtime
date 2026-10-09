@@ -57,6 +57,19 @@ everything; add one scope block and two terminal statuses.
 
 1. **open** = `issueChildGrant` with `sub=escrow:*`, the `scope.escrow` block, `exp = deadline`.
    Reserve fires → the payer's value is held. Reuse; add scope validation. Ledger `escrow-hold`.
+
+   How long it is held (as built, `buildEscrow` in `src/escrow.js`). Every rule is checked before
+   a hold opens or an approval is filed for the owner, and again when an approval is run:
+   - The payer gives `deadline` (unix seconds) or `ttlSec`. With both, the deadline wins. With
+     neither, the hold lasts one hour.
+   - `deadline` absent, `null` or the number `0` means "not given". Anything else must be a time
+     later than now, or the open is refused: `400 escrow_deadline_invalid`. It is never swapped
+     for the default hour.
+   - `ttlSec`, when given, must be a number (or a string that reads as one): else `400 ttl_invalid`.
+   - A time asked for past the payer key's own end is refused: `409 escrow_deadline_exceeds_payer_key`
+     (`detail.payer_exp`). If the payer key's end cannot be read, nothing opens.
+   - The default hour is not a promise. It still ends at the payer key's own end or at the tier's
+     longest lifetime, whichever comes first. The answer carries the deadline the hold really got.
 2. **refund** = revoke, or let it expire. Release returns the held value to the payer. **Reuse
    entirely** — the reaper auto-refunds at the deadline, so refund-on-timeout is free. Ledger `escrow-refund`.
 3. **capture** (new) = verify the condition, then in **one transaction**: settle the escrow's
