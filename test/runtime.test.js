@@ -835,6 +835,65 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     expect(check).toEqual({ name: "payment hold refused when the payer key's end cannot be read", pass: true });
   });
 
+  // The tier's longest lifetime was the other thing that cut a hold short without a word: the
+  // owner's key asking for 20 days on a 7-day tier got a 201 and a 7-day hold.
+  test("a payment hold asked to outlast the tier's longest lifetime is refused, never quietly shortened", async () => {
+    const t = await newTenant("hold-outlives-tier", "studio"); // 7 days; the owner's own key lasts longer
+    const day = 86400;
+    const week = 7 * day;
+    const now = () => Math.floor(Date.now() / 1000);
+    const left = async () => (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining.usd_cents;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const before = await left();
+    let named;
+    for (const over of [{ deadline: now() + 20 * day }, { ttlSec: 20 * day }, { ttlSec: week + 1 }]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body(over) });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toBe("escrow_deadline_exceeds_tier_max");
+      expect(r.json.detail.max_ttl_sec).toBe(week);
+      expect(Math.abs(r.json.detail.latest_deadline - (now() + week))).toBeLessThanOrEqual(2);
+      named = r.json.detail.latest_deadline;
+    }
+    expect(await left()).toBe(before); // the refusals held nothing
+    // The longest the tier allows still opens: asked as a lifetime, and as the deadline the refusal named.
+    const full = await req("POST", "/api/escrow", { token: t.token, body: body({ ttlSec: week }) });
+    expect(full.status).toBe(201);
+    expect(full.json.escrow.deadline).toBeGreaterThan(now() + week - 5);
+    const byName = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: named }) });
+    expect(byName.status).toBe(201);
+    expect(Math.abs(byName.json.escrow.deadline - named)).toBeLessThanOrEqual(1);
+  });
+
+  // A key handed out on a bigger tier can outlive a move to a smaller one. Its holds follow the
+  // tier the tenant is on NOW, and the refusal comes before the owner is asked anything.
+  test("after a move to a smaller tier, a hold past the new limit is refused before an approval is filed", async () => {
+    const t = await newTenant("hold-tier-moved", "studio");
+    const day = 86400;
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 7 * day, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const filed = async () => (await req("GET", "/api/approvals", { token: t.token })).json.approvals.length;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    // On studio a 3-day hold from this key is fine: it goes to the owner.
+    const waiting = await req("POST", "/api/escrow", { token: asker.json.token, body: body({ deadline: now() + 3 * day }) });
+    expect(waiting.status).toBe(202);
+    expect(await filed()).toBe(1);
+    expect((await admin("POST", `/api/tenants/${t.id}/tier`, { body: { tier: "pro" } })).status).toBe(200); // pro: 1 day
+    const r = await req("POST", "/api/escrow", { token: asker.json.token, body: body({ deadline: now() + 3 * day }) });
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("escrow_deadline_exceeds_tier_max");
+    expect(r.json.detail.max_ttl_sec).toBe(day);
+    expect(await filed()).toBe(1); // nothing new was filed
+    // The request filed before the move is held to the new limit too when the owner approves it.
+    const ok = await req("POST", `/api/approvals/${waiting.json.approval.id}`, { token: t.token, body: { decision: "approve" } });
+    expect(ok.status).toBe(409);
+    expect(ok.json.error).toBe("escrow_deadline_exceeds_tier_max");
+    expect((await req("GET", "/api/grants/verify", { token: asker.json.token })).json.remaining.usd_cents).toBe(500); // nothing was held
+  });
+
   test("a lifetime that is not a number is a clean 400, not a server error", async () => {
     const t = await newTenant("ttl-odd");
     for (const ttlSec of ["abc", {}]) {

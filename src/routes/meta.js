@@ -303,7 +303,7 @@ app.get("/selftest", async (e) => {
       let ask = { amount: 1, payee_tenant: "t_y", condition: { kind: "receipt:mesh" }, ttlSec: 600 },
         refusal = (row) => {
           try {
-            return (buildEscrow(row, ask), null);
+            return (buildEscrow(row, ask, "starter"), null);
           } catch (err) {
             return err?.code || String(err?.message || err);
           }

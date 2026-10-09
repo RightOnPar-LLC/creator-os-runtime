@@ -4,8 +4,8 @@
 // CAPTURE (resolving held value to the payee on a verified condition) is stage 2 and lives
 // nowhere yet. See docs/specs/escrow-keystone.md.
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
-import { getGrant, recordEvent, sql } from "./db.js";
-import { addUsage, normalizeUsage, subtractUsage } from "./policy.js";
+import { getGrant, getTenant, recordEvent, sql } from "./db.js";
+import { addUsage, normalizeUsage, subtractUsage, TIERS } from "./policy.js";
 import { issueChildGrant } from "./grants.js";
 
 // Stage 1 accepts only MESH (closed-loop). A `usd` (real-money, withdrawable) capture would be
@@ -22,8 +22,8 @@ export const ESCROW_CUSTODY_CAP = "escrow.hold";
 var numberFrom = (v) => (typeof v === "number" || (typeof v === "string" && v.trim() !== "") ? Number(v) : NaN);
 
 // Validate the open request and shape the custodian child spec + the scope.escrow block.
-// Throws HttpError on any bad input; never partially opens.
-export function buildEscrow(payerRow, params) {
+// Throws HttpError on any bad input; never partially opens. `tier` is the payer tenant's tier.
+export function buildEscrow(payerRow, params, tier) {
   let p = params && typeof params === "object" && !Array.isArray(params) ? params : {};
   // amount: MESH-denominated commit, carried in usd_cents (the model's value slot). > 0.
   let amount = Math.floor(Number(p.amount ?? p.usd_cents ?? 0));
@@ -46,8 +46,9 @@ export function buildEscrow(payerRow, params) {
   // answer 201: a hold the payer never asked for.
   // With nothing asked the hold lasts an hour. That default is not a promise: issueChildGrant
   // still ends it at the payer key's own end and at the tier's longest lifetime, whichever
-  // comes first, and the answer carries the deadline it really got. An ASKED-for time past the
-  // tier's longest lifetime is still cut to it by issueChildGrant (never widened).
+  // comes first, and the answer carries the deadline it really got. A time that WAS asked for
+  // is never cut short: it is kept or refused (below). One less than a minute away is rounded
+  // up to the minute every key gets (issueChildGrant).
   let now = nowSec();
   let deadline = 0;
   if (p.deadline != null && p.deadline !== 0) {
@@ -67,6 +68,14 @@ export function buildEscrow(payerRow, params) {
   let payerExp = Number(payerRow.exp);
   let asked = deadline ? deadline : ttlAsked !== null ? now + ttlAsked : 0;
   if (!(asked <= payerExp)) throw new HttpError(409, "escrow_deadline_exceeds_payer_key", { payer_exp: payerExp });
+  // The tier's longest lifetime is the other limit issueChildGrant would cut a hold to, so an
+  // asked-for time past it is refused for the same reason. In practice only the owner's own key
+  // can ask for one (every other key already ends within the tier's longest lifetime), or a key
+  // that outlived a move to a smaller tier. An unknown tier refuses. `latest_deadline` is the
+  // latest time this key can ask for right now, both limits counted.
+  let tierMax = Number(TIERS[tier]?.maxTtlSec);
+  if (asked && !(asked - now <= tierMax))
+    throw new HttpError(409, "escrow_deadline_exceeds_tier_max", { max_ttl_sec: tierMax, latest_deadline: Math.min(payerExp, now + tierMax) });
   let escrowId = newId("es");
   let escrow = {
     escrow_id: escrowId,
@@ -93,7 +102,10 @@ export function buildEscrow(payerRow, params) {
 // remaining drops by `amount` and it can no longer spend that value elsewhere. Returns the same
 // {row, token} shape as issueChildGrant.
 export async function openEscrow(payerRow, params, issuedBy) {
-  let { childSpec, escrow } = buildEscrow(payerRow, params);
+  // The tier is read here, not passed in, so no caller can open a hold under the wrong one.
+  let tenant = await getTenant(payerRow.tenant);
+  if (!tenant) throw new HttpError(403, "tenant_missing");
+  let { childSpec, escrow } = buildEscrow(payerRow, params, tenant.tier);
   return issueChildGrant(payerRow, childSpec, issuedBy, { escrow });
 }
 
