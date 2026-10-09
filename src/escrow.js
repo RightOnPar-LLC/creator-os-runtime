@@ -210,8 +210,11 @@ async function findEscrowGrant(idOrEscrowId) {
 // with nothing changed; the receipt webhook then answers an error before it has recorded the
 // receipt, so the same receipt sent again is tried again.
 // NOT CHECKED HERE (noted 2026-10-09): whether a grant ABOVE the hold has ended. The hold's own key
-// is refused once one has (grants.js, endedAbove), but a signed receipt still captures the hold.
-// That takes a hold left active under an ended grant, which a cancel no longer leaves behind.
+// is refused once one has (grants.js, endedAbove), but a signed receipt still captures the hold: its
+// value is still held on the payer, and a rule that turned such a capture away was tried here and
+// taken out again the same day (see the note beside captureAmount). A hold can only be in that
+// state if a cancel of the grant above missed it: older code did, when the hold was opened at that
+// very moment; the cancel now looks again for such a hold (revokeGrantTree in grants.js).
 export async function captureEscrow(idOrEscrowId, { source = "capture", ref = null } = {}) {
   let g0 = await findEscrowGrant(idOrEscrowId);
   if (!g0) throw new HttpError(404, "escrow_not_found");

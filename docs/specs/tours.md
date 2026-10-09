@@ -115,7 +115,7 @@ no answer should stop and have the owner reissue, not retry with the old key.
 | `POST /api/tours/:id/reissue` | owner | a fresh key for a tour whose key ran out or that froze. Every key still working under the tour is cancelled first. 409 `tour_changed` when it lost its turn |
 | `POST /api/tours/:id/extend` | owner | `{ days }`. More days, never more money. The receipt says which limit stopped it; 409 `tour_at_limit` lists every limit |
 | `POST /api/tours/:id/end` | owner | cancels the holding grant and every key under it at once |
-| `POST /api/admin/grants/reap` | admin | the reaper on demand. Now also answers `tours_ended` |
+| `POST /api/admin/grants/reap` | admin | the reaper on demand. Now also answers `tours_ended`, and `failed`: the grants this pass could not release (id and why), left for the next pass |
 
 A tour reads:
 

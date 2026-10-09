@@ -3417,10 +3417,11 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
   });
 
   test("a key issued under a grant that somebody else ended while the cancel ran is cancelled too", async () => {
-    // A cancel skips a grant it finds already ended. The sweep and another cancel leave nothing active under a
-    // grant they end, but a capture does not look under the hold it ends. So the cancel looks under such a grant
-    // as well. Here: `mid` is in the cancel's list; before the cancel reaches it (at the statement that takes the
-    // key under it, which comes first) it is ended as a capture would end it, and a key has been issued under it.
+    // A cancel does not move a grant it finds already ended. Whoever ended it means to leave nothing active
+    // under it (the sweep and a capture wait until nothing is; another cancel looks), but the cancel does not
+    // take that on trust: it looks under such a grant as well. Here: `mid` is in the cancel's list; before the
+    // cancel reaches it (at the statement that takes the key under it, which comes first) it is ended by somebody
+    // else, written here as `captured`, with a key issued under it that was not there when the list was read.
     const root = await newTenant("cancel-race-ended", "studio");
     const before = await left(root.token);
     const mid = await issue(root.token, "agent:mid", 10);

@@ -264,14 +264,14 @@ function unusedOf(g, heldNow) {
 // DEFENCE IN DEPTH: a grant is only as alive as everything above it. Cancelling a grant cancels everything under
 // it (revokeGrantTree), and a grant that runs out waits for the keys under it, so an ACTIVE grant under one that
 // has ended is not a state this code means to leave. Where one exists it must not work. Three ways one can exist:
-// a row left by the gap revokeGrantTree had until 2026-10-09; a hold opened with another hold's own token, once
-// the hold above it is captured (possible until buildEscrow refuses a hold as payer); a mistake still to be made.
+// a row left by the gap revokeGrantTree had until 2026-10-09; a hold opened with another hold's own token before
+// buildEscrow refused a hold as payer (the same day), once the hold above it has ended; a mistake still to be made.
 // "Ended" is any status but active: cancelled, run out, captured.
 //
 // WHO LOOKS: verifyGrant (every request that carries a key), settleGrantUsage, issueChildGrant, the owner's
 // approval of a request the grant filed (routes/grants.js), the OAuth refresh and the admin's token reissue
-// (neither hands out a fresh token for it). WHO DOES NOT: captureEscrow. A hold under an ended grant can still be
-// captured on a signed delivery receipt; see the note there.
+// (neither hands out a fresh token for it). WHO DOES NOT: captureEscrow, on purpose. A hold under an ended grant
+// can still be captured on a signed delivery receipt; see the note there.
 //
 // ONE walk, used by all of them: grantAndChain reads a grant's row and, in the SAME statement, whether any grant
 // above it has ended. The walk goes up the parent chain, one primary-key look-up per step and at most as many
@@ -309,6 +309,10 @@ const CANCEL_TRIES = 3;
 // parent and refuses one that is not active, so it either finished before the grant was taken or is refused after.
 // So right after taking a grant its active children are listed AGAIN, each is cancelled the same way (and its
 // children, and so on down), and only then is what is held on the grant read for its own release.
+// ONE LIMIT: that second look goes down through ACTIVE children only. A key under a child that was written and
+// ALSO ended while this ran is not reached. That takes a writer that ends a grant while something under it is
+// still active, and none does: the sweep and a capture wait until nothing is, and another cancel makes this
+// same look. (Until 2026-10-09 a capture did not wait, and a hold could open a hold under itself.)
 // (This leans on READ COMMITTED, the level Postgres runs at unless told otherwise and the one this service uses:
 // each statement sees everything committed before it began, so the second look sees a key whose issue finished
 // while the statement before it was waiting for the parent's lock.)
@@ -320,7 +324,7 @@ const CANCEL_TRIES = 3;
 // lowerGrantAutonomy, whose one UPDATE takes a subtree's rows in no promised order.) Postgres aborts one side; no
 // balance moves, because that side's whole transaction is undone. When the side aborted is this one it simply
 // starts again: nothing of the failed try is left, the list is read afresh and a grant that somebody else ended
-// in the meantime is skipped. The fixed order (depth, then id) keeps two cancels that both LISTED the same two
+// in the meantime is not moved again (it is still looked under). The fixed order (depth, then id) keeps two cancels that both LISTED the same two
 // grants of one depth from taking them in opposite orders. It does not rule the other cycles out (not even that
 // one, when one of the two cancels finds a grant only by its second look); the retry is what covers those.
 export async function revokeGrantTree(e, t, a) {
@@ -335,10 +339,11 @@ export async function revokeGrantTree(e, t, a) {
           // landed, and the grants under it have let go, since the list was read).
           let i = (await r`UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = ${t} WHERE id = ${id} AND status = 'active' RETURNING *`)[0];
           // The second look: children issued since the list was read. Nothing can be added under this grant now.
-          // It is made ALSO when this call did not move the grant, because somebody else ended it first. The
-          // sweep ends a grant only when nothing under it is active, and another cancel makes this same look, but
-          // captureEscrow ends a hold without looking under it. Either way the grant is no longer active, so
-          // nothing more can be issued under it and one look is enough.
+          // It is made ALSO when this call did not move the grant, because somebody else ended it first. Every
+          // writer that ends a grant means to leave nothing active under it (the sweep and a capture wait until
+          // nothing is; another cancel makes this same look), so this finds something only if one of them ever
+          // does not. Either way the grant is no longer active, so nothing more can be issued under it and one
+          // look is enough.
           let late = await r`SELECT id FROM grants WHERE parent = ${id} AND status = 'active' ORDER BY id`;
           for (let child of late) await cancel(child.id);
           if (!i) return; // not this call's to let go
