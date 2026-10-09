@@ -77,11 +77,12 @@ var likeLiteral = (e) => e.replace(/[\\%_]/g, "\\$&");
 // `LIKE prefix%` let a key scoped to "article:job4" list "article:job42" too.
 // No prefix at all (a key whose memory scope is the empty list) lists nothing: the old
 // `undefined + "%"` only returned nothing by accident, and DID return a partition whose
-// name happened to start with "undefined".
+// name happened to start with "undefined". Anything that is not a string lists nothing
+// too (String([[]]) is "", which would have meant "everything").
 export async function searchMemories(e, t, a, n) {
-  if (a === void 0 || a === null) return [];
+  if (typeof a !== "string") return [];
   let r = Math.min(50, Math.max(1, Math.floor(n || 10))),
-    p = String(a),
+    p = a,
     l = likeLiteral(p),
     open = p === "" || /[:/-]$/.test(p),
     s1 = open ? l + "%" : l + ":%",

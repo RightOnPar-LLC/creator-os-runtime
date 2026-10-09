@@ -91,6 +91,12 @@ export async function mintRootGrant(e, t = "tenant:root") {
 // the only way a code.write grant is issued, and the hash is bound into the grant's
 // scope (scope.code.filesSha256) so whatever honours code.write can check that the
 // bytes being written are the bytes that were diagnosed.
+// A lifetime must be a number. A non-number used to reach the database as NaN and answer 500.
+var ttlOf = (e) => {
+  let t = Number(e ?? 3600);
+  if (!Number.isFinite(t)) throw Object.assign(Error("ttl_invalid"), { status: 400 });
+  return t;
+};
 export async function issueChildGrant(e, t, a, w = {}) {
   let n = await getTenant(e.tenant);
   if (!n)
@@ -101,8 +107,11 @@ export async function issueChildGrant(e, t, a, w = {}) {
     s = parseJson(e.scope),
     i = parseJson(e.constraints),
     // A key handed out BY AN AGENT (any issuer that is not the tenant's root key) lives
-    // 24 hours at most, whatever the tier allows the owner (policy.js).
-    o = Math.min(Math.max(60, Math.floor(t.ttlSec ?? 3600)), r.maxTtlSec, Number(e.depth) >= 1 ? AGENT_ISSUED_MAX_TTL_SEC : Infinity),
+    // 24 hours at most, whatever the tier allows the owner (policy.js). An escrow custodian
+    // (w.escrow) is not an agent being handed a key: it holds value until the deadline the
+    // payer chose, so its lifetime is left alone (cutting it would refund the payer early
+    // and leave a later, valid delivery unpaid).
+    o = Math.min(Math.max(60, Math.floor(ttlOf(t.ttlSec))), r.maxTtlSec, Number(e.depth) >= 1 && !w?.escrow ? AGENT_ISSUED_MAX_TTL_SEC : Infinity),
     l = nowSec(),
     c = Math.min(l + o, Number(e.exp)),
     E = {

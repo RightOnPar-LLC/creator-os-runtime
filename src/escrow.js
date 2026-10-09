@@ -34,11 +34,18 @@ export function buildEscrow(payerRow, params) {
   if (!ESCROW_CONDITION_KINDS.includes(kind))
     throw new HttpError(400, "escrow_condition_unknown", { kind, allowed: ESCROW_CONDITION_KINDS });
   let conditionRef = p.condition?.ref != null ? String(p.condition.ref).slice(0, 200) : null;
-  // Deadline drives the child's ttl; issueChildGrant clamps it to the tier max and the payer's
-  // own exp, so an over-long deadline is capped, never widened. Default 1h if none given.
+  // Deadline drives the child's ttl; issueChildGrant clamps it to the tier max, so an
+  // over-long deadline is capped, never widened. Default 1h if none given.
   let now = nowSec();
   let deadline = Math.floor(Number(p.deadline ?? 0));
   let ttlSec = deadline > now ? deadline - now : Math.floor(Number(p.ttlSec ?? 3600));
+  // A hold never outlives the key that pays for it (a child never outlives its parent). When
+  // the payer ASKS for a deadline past its own key's end, refuse and say why: quietly cutting
+  // it would refund the payer early and leave a later, valid delivery unpaid. A key an agent
+  // was handed lives a day at most (policy.js), so a longer hold needs a longer-lived payer.
+  let payerExp = Number(payerRow.exp);
+  let asked = deadline > now ? deadline : p.ttlSec != null && Number.isFinite(ttlSec) ? now + ttlSec : 0;
+  if (asked > payerExp) throw new HttpError(409, "escrow_deadline_exceeds_payer_key", { payer_exp: payerExp });
   let escrowId = newId("es");
   let escrow = {
     escrow_id: escrowId,
