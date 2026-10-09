@@ -6,6 +6,7 @@ import { armedIntegrations, env, POLICY_VERSION, SERVICE_NAME, VERSION } from ".
 import { getSetting, migrateSchema, setSetting } from "./db.js";
 import { loadGrantSigningKey } from "./tokens.js";
 import { reapExpiredGrants } from "./grants.js";
+import { sweepTours } from "./tours.js";
 import { attenuationViolations, CAPS, gatehouseEvaluate, TIERS } from "./policy.js";
 import { TEMPLATES } from "./railway.js";
 import { app, recordSource } from "./http.js";
@@ -13,6 +14,7 @@ import "./routes/core.js";
 import "./routes/admin.js";
 import "./routes/grants.js";
 import "./routes/escrow.js";
+import "./routes/tours.js";
 import "./routes/guest.js";
 import "./routes/memory.js";
 import "./routes/railway-auth.js";
@@ -40,7 +42,11 @@ console.log(
 var REAP_INTERVAL_MS = Number(env.REAP_INTERVAL_MS ?? 60000);
 if (REAP_INTERVAL_MS > 0) {
   var reapTimer = setInterval(
-    () => reapExpiredGrants().catch((e) => console.error("[reaper]", e?.message || e)),
+    // then the tours that are finished (over, idle, or their holding grant gone) are marked so: tours.js
+    () =>
+      reapExpiredGrants()
+        .then(() => sweepTours())
+        .catch((e) => console.error("[reaper]", e?.message || e)),
     REAP_INTERVAL_MS,
   );
   reapTimer.unref?.();

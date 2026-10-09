@@ -6,6 +6,7 @@ import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "./db.js";
 import { parseGrantToken, signGrantToken } from "./tokens.js";
 import { AUTONOMY_LEVELS, DEFAULT_AUTONOMY, autonomyOf, lowerCheck, parseAutonomy } from "./autonomy.js";
 import { hireSub, hireViolation } from "./hostpolicy.js";
+import { TOUR_RENEWED, tourKeyReused } from "./tours.js";
 import {
   addUsage,
   AGENT_ISSUED_MAX_TTL_SEC,
@@ -153,6 +154,9 @@ export async function issueChildGrant(e, t, a, w = {}) {
       // data annotation, not authority (attenuationViolations ignores it and the
       // custodian's only cap is the no-op escrow.hold), so it never widens the child.
       ...(w?.escrow ? { escrow: w.escrow } : {}),
+      // tours (tours.js): the mark on a tour's HOLDING grant. Like escrow it is an annotation, not
+      // authority; it is how verifyGrant knows this grant is a record and never a credential.
+      ...(w?.tour ? { tour: w.tour } : {}),
     },
     T = normalizeUsage(t.budget ?? zeroUsage()),
     R = clampConstraints(t.constraints ?? {}, i),
@@ -477,12 +481,18 @@ export async function verifyGrant(e, t, a, countRate = !0) {
       // sweep, nothing is freed here: the sweep takes both, lower one first.
       await sql.begin(async (tx) => {
         let g = (await tx`SELECT * FROM grants WHERE id = ${r.id} FOR UPDATE`)[0];
-        if (g) await releaseExpiredGrant(tx, g);
+        // The ROW's end decides, not the token's: a tour's holding grant can be extended after its token text
+        // was written (tours.js), and an old token for it must not end it early.
+        if (g && Number(g.exp) <= nowSec()) await releaseExpiredGrant(tx, g);
       });
       throw new HttpError(401, "grant_expired");
     }
     let s = await getGrant(r.id);
+    // A key that a tour renewal already replaced, presented again: the alarm (tours.js). It answers 401 either way.
+    if (s && s.status === "revoked" && s.revoke_reason === TOUR_RENEWED) await tourKeyReused(s);
     if (!s || s.status !== "active") throw new HttpError(401, "grant_revoked");
+    // A tour's holding grant is a record, never a credential, whoever came to hold a token for it.
+    if (parseJson(s.scope)?.tour?.holder) throw new HttpError(401, "holding_grant");
     let i = await getTenant(s.tenant);
     if (!i || i.status !== "active") throw new HttpError(403, "tenant_suspended");
     if (await isKillSwitchOn()) throw new HttpError(503, "runtime_paused");
