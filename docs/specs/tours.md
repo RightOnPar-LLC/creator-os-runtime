@@ -92,7 +92,7 @@ out only by the step whose turn it still is.
 | A reissue of a frozen tour while the sweep runs, or while the old key is tried again | The reissue first clears every replaced key of the alarm, then takes its turn (the tour is active again in the same statement), then issues. The sweep and a late alarm saw an earlier turn and cannot touch the new key. A reissue answers 201 only with a key it has checked still works |
 | The alarm cannot cancel a key | The tour is NOT marked frozen (it never reads frozen while a key works). The next use of the old key tries again. If the mark was written and a later cancel then failed, the sweep cancels it within a minute |
 | A key is left working that the tour has lost sight of | Nobody was handed it. It shows in `live_keys`, and the next turn, freeze or end cancels it. The next key still gets everything the tour has left: the holding grant and "is any earlier key still working" are read in one statement, so they cannot disagree |
-| A helper's key is written at the very moment the key above it is cancelled | The cancel's list misses it (the older gap noted in `revokeGrantTree`). Every tour cancel looks again, at every depth, until a look finds nothing; if something still works, the tour is not marked ended or frozen and the sweep tries again |
+| A helper's key is written at the very moment the key above it is cancelled | The cancel finds it itself: `revokeGrantTree` looks again under each grant right after taking it, and what the key held comes back (before 2026-10-09 the cancel's list missed it). Every tour cancel still looks again as well, at every depth, until a look finds nothing; if something still works, the tour is not marked ended or frozen and the sweep tries again |
 | The same dead key is used again and again | While frozen: nothing more happens. After the owner reissues: nothing at all |
 | Somebody cancels the tour's current key by hand with the words a renewal writes | Not the alarm. The current key is never "replaced" |
 | The tour cannot be recorded, or its first key cannot be issued, when it is opened | The holding grant is cancelled and nothing stays held |
@@ -115,7 +115,7 @@ no answer should stop and have the owner reissue, not retry with the old key.
 | `POST /api/tours/:id/reissue` | owner | a fresh key for a tour whose key ran out or that froze. Every key still working under the tour is cancelled first. 409 `tour_changed` when it lost its turn |
 | `POST /api/tours/:id/extend` | owner | `{ days }`. More days, never more money. The receipt says which limit stopped it; 409 `tour_at_limit` lists every limit |
 | `POST /api/tours/:id/end` | owner | cancels the holding grant and every key under it at once |
-| `POST /api/admin/grants/reap` | admin | the reaper on demand. Now also answers `tours_ended` |
+| `POST /api/admin/grants/reap` | admin | the reaper on demand. Now also answers `tours_ended`, and `failed`: the grants this pass could not release (id and why), left for the next pass |
 
 A tour reads:
 
@@ -150,11 +150,9 @@ TOURS_STRESS_RUNS=500 node test/run.mjs        the random mixes, 500 of them ins
 
 ## Known limits
 
-- A key written under a grant at the very moment that grant is cancelled is itself cancelled
-  (above), but the budget it held stays held on the grant above it: on the tour until the tour
-  ends, and for a key directly under the holding grant, on the owner's key until that key rolls
-  over. That is the older gap noted in `revokeGrantTree`; it fails safe (held, never handed out
-  twice).
+- A key that a cancel missed BEFORE 2026-10-09 (written under a grant at the very moment that
+  grant was cancelled) no longer works, but the budget it held stays held on the grant above the
+  cancelled one. Cancels since then find such a key themselves and give its budget back.
 - If the tour cannot be recorded AND cancelling its holding grant then also fails, the holding
   grant stays (no key exists under it, and its token was never handed out) and its budget comes
   back to the owner when it runs out, 7 days later at most.
