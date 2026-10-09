@@ -8,6 +8,7 @@ import { AUTONOMY_LEVELS, DEFAULT_AUTONOMY, autonomyOf, lowerCheck, parseAutonom
 import { hireSub, hireViolation } from "./hostpolicy.js";
 import {
   addUsage,
+  AGENT_ISSUED_MAX_TTL_SEC,
   attenuationViolations,
   CAPS,
   clampConstraints,
@@ -99,7 +100,9 @@ export async function issueChildGrant(e, t, a, w = {}) {
   let r = TIERS[n.tier],
     s = parseJson(e.scope),
     i = parseJson(e.constraints),
-    o = Math.min(Math.max(60, Math.floor(t.ttlSec ?? 3600)), r.maxTtlSec),
+    // A key handed out BY AN AGENT (any issuer that is not the tenant's root key) lives
+    // 24 hours at most, whatever the tier allows the owner (policy.js).
+    o = Math.min(Math.max(60, Math.floor(t.ttlSec ?? 3600)), r.maxTtlSec, Number(e.depth) >= 1 ? AGENT_ISSUED_MAX_TTL_SEC : Infinity),
     l = nowSec(),
     c = Math.min(l + o, Number(e.exp)),
     E = {

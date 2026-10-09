@@ -111,6 +111,11 @@ export var remainingBudget = (e) =>
     subtractUsage(normalizeUsage(parseJson(e.budget)), normalizeUsage(parseJson(e.reserved))),
     normalizeUsage(parseJson(e.settled)),
   );
+// The owner's rule (2026-10-09): a key that an AGENT hands to a sub-agent lives 24 hours at
+// most. "An agent" is any issuing key that is not the tenant's own root key (depth >= 1).
+// The tier's maxTtlSec still bounds what the owner's root key may issue; a child can never
+// outlive its parent either way, so when a grant is up everything under it is up too.
+export var AGENT_ISSUED_MAX_TTL_SEC = 86400;
 export var memoryPartitions = (e) => e.memory?.partitions ?? [""];
 // A scope prefix covers a partition only at a real boundary: exact match, the
 // empty prefix (root wildcard), a prefix that already ends in a separator, or

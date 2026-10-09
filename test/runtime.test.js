@@ -611,6 +611,63 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     const nested = await req("POST", "/api/memory", { token: child.json.token, body: { partition: "worker:a-shard1", content: "nested ok" } });
     expect(nested.status).toBe(201);
   });
+
+  // Listing must never reach further than assertMemoryScope allows. It used to be a bare
+  // `LIKE prefix%`, so a key for "article:job4" could LIST "article:job42" although it
+  // could not read or write it by name.
+  test("listing memory keeps the same boundary: a key for one section never lists a longer-named one", async () => {
+    const t = await newTenant("list-boundary");
+    for (const [partition, content] of [
+      ["agent:report:", "report brief"], ["agent:report:notes", "report notes"], ["agent:report2:", "report2 brief"],
+      ["worker:a", "a"], ["worker:ab", "ab"], ["worker:a-shard1", "a shard"], ["a_c", "underscore"], ["abc", "letters"],
+    ]) expect((await req("POST", "/api/memory", { token: t.token, body: { partition, content } })).status).toBe(201);
+    const key = async (partitions) =>
+      (await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:reader", caps: ["memory.read"], ttlSec: 600, scope: { memory: { partitions } } } })).json.token;
+    const list = async (token, q = "") =>
+      ((await req("GET", "/api/memory?limit=50" + (q ? "&q=" + q : ""), { token })).json.memories || []).map((m) => m.partition).sort();
+    expect(await list(await key(["agent:report:"]))).toEqual(["agent:report:", "agent:report:notes"]);
+    expect(await list(await key(["worker:a"]))).toEqual(["worker:a", "worker:a-shard1"]);
+    // % and _ in a scope are ordinary characters, not wildcards.
+    expect(await list(await key(["a_c"]))).toEqual(["a_c"]);
+    // The same boundary holds when searching by words.
+    expect(await list(await key(["agent:report:"]), "brief")).toEqual(["agent:report:"]);
+    // The root key (no memory scope = everything) still lists everything.
+    expect((await list(t.token)).length).toBe(8);
+  });
+
+  test("a key with an empty memory scope lists nothing and reads nothing", async () => {
+    const t = await newTenant("empty-scope");
+    expect((await req("POST", "/api/memory", { token: t.token, body: { partition: "tenant", content: "the past" } })).status).toBe(201);
+    // The old code searched for `partition LIKE 'undefined%'`: it returned nothing only by
+    // accident, and it DID return this one.
+    expect((await req("POST", "/api/memory", { token: t.token, body: { partition: "undefined-leftovers", content: "must never be listed" } })).status).toBe(201);
+    const blank = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:new", caps: ["memory.read"], ttlSec: 600, scope: { memory: { partitions: [] } } } });
+    expect(blank.status).toBe(201);
+    const listed = await req("GET", "/api/memory?limit=50", { token: blank.json.token });
+    expect(listed.status).toBe(200);
+    expect(listed.json.memories).toEqual([]);
+    const asked = await req("GET", "/api/memory?partition=tenant", { token: blank.json.token });
+    expect(asked.status).toBe(403);
+    expect(asked.json.error).toBe("out_of_scope");
+  });
+
+  // The owner's rule: a key an AGENT hands to a sub-agent lives 24 hours at most. The
+  // owner's own (root) key keeps the tier's limit.
+  test("a key handed out by an agent lives 24 hours at most; the owner's own key keeps the tier's limit", async () => {
+    const t = await newTenant("ttl-owner", "studio"); // studio allows 7 days
+    const week = 7 * 86400;
+    const now = Math.floor(Date.now() / 1000);
+    const lead = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:lead", caps: ["grant.issue", "grant.read"], ttlSec: week } });
+    expect(lead.status).toBe(201);
+    expect(lead.json.exp).toBeGreaterThan(now + 6 * 86400); // owner-issued: unchanged
+    const helper = await req("POST", "/api/grants", { token: lead.json.token, body: { sub: "agent:helper", caps: ["grant.read"], ttlSec: week } });
+    expect(helper.status).toBe(201);
+    expect(helper.json.exp).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 86400);
+    expect(helper.json.exp).toBeGreaterThan(now + 86400 - 120); // capped at a day, not cut further
+    // Asking for less than a day is still honoured.
+    const brief = await req("POST", "/api/grants", { token: lead.json.token, body: { sub: "agent:brief", caps: ["grant.read"], ttlSec: 600 } });
+    expect(brief.json.exp).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 600);
+  });
 });
 
 // ------------------------------------------------------------------------------------
