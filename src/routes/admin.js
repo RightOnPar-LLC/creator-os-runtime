@@ -4,7 +4,7 @@ import { HttpError, newId } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
-import { endedAbove, mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
+import { endedAbove, grantsLeftUnderEnded, mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
 import { readGuestPool, guestPoolStatus } from "../guest.js";
 import { sweepTours } from "../tours.js";
 import { TEMPLATES } from "../railway.js";
@@ -197,6 +197,14 @@ app.post("/api/admin/breakglass", requireAdmin, async (e) => {
 app.post("/api/admin/grants/reap", requireAdmin, async (e) => {
   let failed = [];
   return e.json({ reaped: await reapExpiredGrants({ failed }), failed, tours_ended: await sweepTours() });
+});
+// READ ONLY. Grants still active under a grant that has ended, and budget still held above an ended grant for a
+// key that let go after it had (grantsLeftUnderEnded in grants.js). The whole table, not the newest 200 that
+// GET /api/admin/grants shows. `limit` (1 to 5000, 500 if not given) bounds the two lists that are shown, never a
+// count or the total.
+app.get("/api/admin/grants/orphans", requireAdmin, async (e) => {
+  let asked = Math.floor(Number(e.req.query("limit") || NaN));
+  return e.json(await grantsLeftUnderEnded({ limit: Number.isFinite(asked) ? Math.min(5000, Math.max(1, asked)) : 500 }));
 });
 app.post("/api/admin/grants/:id/revoke", requireAdmin, async (e) =>
   e.json({

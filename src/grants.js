@@ -293,6 +293,119 @@ async function grantAndChain(q, id) {
 export async function endedAbove(q, id) {
   return (await grantAndChain(q, id)).endedAbove;
 }
+// THE COUNT, for the admin (GET /api/admin/grants/orphans). It reads the whole table and changes nothing: no
+// row is written and none is locked. Two lists, each from one statement (so they are a moment apart).
+//
+// LEFT: every grant that is still active with an ended grant somewhere above it. That is what the door refuses
+// one key at a time (grantAndChain); this finds them all at once. ONE walk, DOWN from the roots: each grant is
+// reached once, by way of its parent, and carries two things with it: the nearest grant above it that has ended
+// (`ended_above`; "ended" is the door's own test, any status but active) and the nearest above it that is still
+// active (`active_above`). A grant whose end has passed but which the sweep has not yet taken is counted apart
+// (`past_exp`): it is the same leftover, a moment before it lets go. `hold` marks a payment hold. `holds_under`
+// is how many payment holds that are still open sit anywhere under the grant, counted the way a cancel would
+// reach them: down through grants of ANY status (a cancel of the grant cancels, and so refunds, every one).
+//
+// WITHHELD: budget still held above an ended grant because something under it let go only AFTER it had. A grant
+// that ends gives back unusedOf(its row then). A key the cancel missed was still holding its whole budget on
+// that row, so the grant gave back that much less; when the key ends later, what it gives back lands on a grant
+// that has already let go, and nothing passes it on. Read: every ended grant that (1) has a 'release' row of
+// its own and (2) has a 'release' row written INTO it after its own first one. Without (2) a grant is not read,
+// whatever its row says. For each, three figures:
+//   gave_back            all its own 'release' rows together
+//   would_give_back_now  unusedOf on its row as it is now
+//   never_used           its budget, less everything really used at or under it: what it settled, what every
+//                        ended grant under it settled, and the WHOLE budget of any key under it that is still
+//                        active (that budget is still out)
+// `short` is the lesser of the last two, less gave_back, never below 0; the grant is listed when `short` is not
+// 0, and `to` is the grant that is holding it. WHY THE LESSER: the row can say more than is true. The sum used
+// before 2026-10-09 (budget less settled, whatever was held) gave back what the keys under a grant had USED as
+// well, so a key that let go under that sum leaves too little held on the grant above it. (An older service on
+// that sum read this same database until 2026-10-09 about 19:20 UTC, so such a release can be later than a
+// release under today's sum.) never_used does not depend on what is held on any row. With it, taking `short` off
+// what `to` holds never leaves `to` holding less for this grant than was really used under it.
+// A grant that itself ended under the old sum gave back at least what unusedOf says, so it is never listed:
+// nothing is held above for it. If `to` has ended too, then lowering what is held on it by `short` makes IT a
+// grant that is read, for what it owes the grant above it: the lowest grant first, then the one above.
+// EVERY grant that fits (1) and (2) is read and the sum is done on each before anything is cut to `limit`: the
+// lowest come first, and many of those owe nothing, so cutting first could hide the ones that do.
+export async function grantsLeftUnderEnded({ limit = 500 } = {}) {
+  let now = nowSec(),
+    left = await sql`WITH RECURSIVE down AS (
+        SELECT g.id, g.status, NULL::text AS ended_above, NULL::text AS ended_status, NULL::text AS active_above FROM grants g WHERE g.parent IS NULL
+        UNION ALL SELECT c.id, c.status,
+          CASE WHEN d.status <> 'active' THEN d.id ELSE d.ended_above END,
+          CASE WHEN d.status <> 'active' THEN d.status ELSE d.ended_status END,
+          CASE WHEN d.status = 'active' THEN d.id ELSE d.active_above END
+        FROM grants c JOIN down d ON c.parent = d.id),
+      open_hold AS (
+        SELECT h.id AS hold, h.parent AS above FROM grants h WHERE h.status = 'active' AND (h.scope->'escrow') IS NOT NULL AND h.parent IS NOT NULL
+        UNION ALL SELECT o.hold, g.parent FROM open_hold o JOIN grants g ON g.id = o.above WHERE g.parent IS NOT NULL),
+      hit AS (SELECT g.id, g.tenant, g.parent, g.depth, g.sub, g.exp, g.budget, g.settled, g.reserved, (g.scope->'escrow') IS NOT NULL AS hold,
+          (SELECT count(*) FROM open_hold o WHERE o.above = g.id)::int AS holds_under,
+          d.ended_above, d.ended_status, d.active_above, (g.exp > ${now}) AS live
+        FROM down d JOIN grants g ON g.id = d.id WHERE d.status = 'active' AND d.ended_above IS NOT NULL)
+      SELECT hit.*, (count(*) FILTER (WHERE live) OVER ())::int AS n_live, (count(*) FILTER (WHERE NOT live) OVER ())::int AS n_past
+      FROM hit ORDER BY live DESC, depth, id LIMIT ${limit}`,
+    late = await sql`WITH RECURSIVE cand AS (
+        SELECT g.id, g.tenant, g.parent, g.depth, g.status, g.budget, g.settled, g.reserved, p.status AS parent_status,
+          own.usd_cents, own.calls, own.deploys, own.times
+        FROM grants g JOIN grants p ON p.id = g.parent
+        JOIN (SELECT grant_id, min(id) AS first_id, sum(usd_cents)::float8 AS usd_cents, sum(calls)::float8 AS calls, sum(deploys)::float8 AS deploys, count(*)::int AS times
+            FROM ledger WHERE kind = 'release' GROUP BY grant_id) own ON own.grant_id = g.id
+        JOIN (SELECT parent, max(id) AS last_id FROM ledger WHERE kind = 'release' AND parent IS NOT NULL GROUP BY parent) under
+          ON under.parent = g.id AND under.last_id > own.first_id
+        WHERE g.status <> 'active'),
+      below AS (
+        SELECT c.id AS top, g.id, g.status, g.budget, g.settled FROM cand c JOIN grants g ON g.parent = c.id
+        UNION ALL SELECT b.top, g.id, g.status, g.budget, g.settled FROM below b JOIN grants g ON g.parent = b.id WHERE b.status <> 'active')
+      SELECT cand.*, (SELECT coalesce(jsonb_agg(jsonb_build_object('status', b.status, 'budget', b.budget, 'settled', b.settled)), '[]'::jsonb)
+          FROM below b WHERE b.top = cand.id) AS under_it
+      FROM cand ORDER BY cand.depth DESC, cand.id`,
+    usage = (j) => normalizeUsage(parseJson(j)),
+    notBelowZero = (u) => ({ usd_cents: Math.max(0, u.usd_cents), calls: Math.max(0, u.calls), deploys: Math.max(0, u.deploys) }),
+    withheld = [],
+    total = zeroUsage();
+  for (let g of late) {
+    let gave = normalizeUsage(g),
+      would = unusedOf(g, g.reserved),
+      used = usage(g.settled);
+    // A key that is still active counts with its whole budget, and nothing under it is looked at (the walk above
+    // stops there): whatever is under it comes out of that budget.
+    for (let b of parseJson(g.under_it)) used = addUsage(used, usage(b.status === "active" ? b.budget : b.settled));
+    let neverUsed = notBelowZero(subtractUsage(usage(g.budget), used)),
+      most = { usd_cents: Math.min(would.usd_cents, neverUsed.usd_cents), calls: Math.min(would.calls, neverUsed.calls), deploys: Math.min(would.deploys, neverUsed.deploys) },
+      short = notBelowZero(subtractUsage(most, gave));
+    if (!short.usd_cents && !short.calls && !short.deploys) continue;
+    total = addUsage(total, short);
+    withheld.push({ id: g.id, tenant: g.tenant, status: g.status, to: g.parent, to_status: g.parent_status, gave_back: gave, releases: g.times, would_give_back_now: would, never_used: neverUsed, short });
+  }
+  return {
+    now,
+    counts: { live: left[0]?.n_live ?? 0, past_exp: left[0]?.n_past ?? 0, withheld: withheld.length },
+    orphans: left.map((g) => ({
+      id: g.id,
+      tenant: g.tenant,
+      parent: g.parent,
+      depth: Number(g.depth),
+      sub: g.sub,
+      exp: Number(g.exp),
+      live: !!g.live,
+      hold: !!g.hold,
+      holds_under: Number(g.holds_under),
+      ended_above: g.ended_above,
+      ended_status: g.ended_status,
+      active_above: g.active_above,
+      budget: usage(g.budget),
+      settled: usage(g.settled),
+      reserved: usage(g.reserved),
+    })),
+    withheld: withheld.slice(0, limit),
+    withheld_total: total,
+    // `limit` cuts the two lists that are shown and nothing else: every count, and the total, is of the whole table.
+    truncated: { orphans: (left[0]?.n_live ?? 0) + (left[0]?.n_past ?? 0) > left.length, withheld: withheld.length > limit },
+    limit,
+  };
+}
 // When two transactions each hold a row the other wants, Postgres ends the wait after about a second by
 // aborting ONE of them (SQLSTATE 40P01, "deadlock detected"); everything that one had done is rolled back.
 // Bun.SQL carries the SQLSTATE in `errno`.
