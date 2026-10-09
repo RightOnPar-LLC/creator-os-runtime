@@ -705,6 +705,41 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     expect(hold.json.escrow.deadline).toBeGreaterThan(now() + 2 * day);
   });
 
+  // A hold cannot outlive the key that pays for it, and a key an agent was handed lives a day.
+  // So an agent's sub-agent asking for a 3-day hold must be TOLD no, never given a 1-day hold
+  // that looks like a 3-day one.
+  test("a payment hold asked to outlast the payer's own key is refused, never quietly shortened", async () => {
+    const t = await newTenant("hold-outlives-payer", "studio");
+    const week = 7 * 86400;
+    const day = 86400;
+    const now = () => Math.floor(Date.now() / 1000);
+    const lead = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:lead", caps: ["grant.issue", "grant.read", "escrow.hold"], ttlSec: week, budget: { usd_cents: 1000, calls: 10, deploys: 0 } },
+    });
+    const second = await req("POST", "/api/grants", {
+      token: lead.json.token,
+      body: { sub: "agent:second", caps: ["grant.read", "escrow.hold"], ttlSec: week, budget: { usd_cents: 600, calls: 5, deploys: 0 } },
+    });
+    expect(second.status).toBe(201);
+    expect(second.json.exp).toBeLessThanOrEqual(now() + day);
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    for (const over of [{ deadline: now() + 3 * day }, { ttlSec: 3 * day }]) {
+      const r = await req("POST", "/api/escrow", { token: second.json.token, body: body(over) });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toBe("escrow_deadline_exceeds_payer_key");
+      expect(r.json.detail.payer_exp).toBe(second.json.exp);
+    }
+    // nothing was held by the refusals: the whole budget is still there for a hold that fits
+    const fits = await req("POST", "/api/escrow", { token: second.json.token, body: body({ amount: 600, deadline: second.json.exp }) });
+    expect(fits.status).toBe(201);
+    expect(fits.json.escrow.deadline).toBe(second.json.exp);
+    // with no deadline asked, the default (an hour) still opens
+    const lead2 = await req("POST", "/api/escrow", { token: lead.json.token, body: body({}) });
+    expect(lead2.status).toBe(201);
+    expect(lead2.json.escrow.deadline).toBeLessThanOrEqual(now() + 3600);
+  });
+
   test("a lifetime that is not a number is a clean 400, not a server error", async () => {
     const t = await newTenant("ttl-odd");
     for (const ttlSec of ["abc", {}]) {
