@@ -72,11 +72,20 @@ everything; add one scope block and two terminal statuses.
      `409 escrow_deadline_exceeds_tier_max` (`detail.max_ttl_sec`, and `detail.latest_deadline`, the
      latest time this key can ask for right now). It used to be cut to the tier's limit with a 201.
    - A time that was asked for is never cut short: the hold ends at exactly that time, or the open
-     is refused. The check runs in `buildEscrow` and once more where the hold's end is written
-     (`holdExpiry` in `src/policy.js`, called by `issueChildGrant` on its own read of the tier and the clock), so a
-     tier that moves in the middle of a request refuses the hold instead of shortening it. A time
-     less than a minute away is rounded up to the minute every key gets.
-   - Nothing opens under a tier the runtime does not know: `403 unknown_tier`.
+     is refused. Times are whole seconds; a fraction of a second in `deadline` or `ttlSec` is
+     dropped. The check runs in `buildEscrow` and once more where the hold's end is written
+     (`holdExpiry` in `src/policy.js`, called by `issueChildGrant` on its own read of the tier and
+     the clock), so a tier that moves in the middle of a request refuses the hold instead of
+     shortening it.
+   - The one case where a hold ends later than asked: a time less than a minute away at the moment
+     the hold is written. It ends at the minute every key gets, or at the payer key's own end if
+     that comes first. `ttlSec` of zero or less meets the same floor.
+   - Nothing opens under a tier the runtime does not know: `403 unknown_tier` from `buildEscrow`.
+     (If a tier became unknown in the middle of one request, `issueChildGrant` would fail with a
+     500, as it does for any key. Still nothing opens.)
+   - "Ends at" means the end stored on the hold. The refund happens when the reaper next runs, or
+     when the hold's token is next presented, not on that second. Until the refund, a delivery
+     receipt can still capture the hold: `captureEscrow` checks that the hold is active, not the clock.
    - The default hour is not a promise. It still ends at the payer key's own end or at the tier's
      longest lifetime, whichever comes first. The answer carries the deadline the hold really got.
 2. **refund** = revoke, or let it expire. Release returns the held value to the payer. **Reuse

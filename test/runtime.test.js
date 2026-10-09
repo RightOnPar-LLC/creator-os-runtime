@@ -921,20 +921,20 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
     const held = async () => (await dbQuery("SELECT count(*)::int AS n FROM grants WHERE tenant = $1 AND sub LIKE 'escrow:%'", [t.id])).rows[0].n;
     const cols = (await dbQuery("SELECT column_name FROM information_schema.columns WHERE table_name = 'tenants' ORDER BY ordinal_position")).rows.map((r) => r.column_name);
-    await dbQuery("CREATE TABLE tier_flip (after int NOT NULL, seen int NOT NULL)");
-    await dbQuery("INSERT INTO tier_flip VALUES (1000000, 0)");
-    await dbQuery(`CREATE FUNCTION tier_seen(tid text, real_tier text) RETURNS text LANGUAGE plpgsql VOLATILE AS $f$
-      DECLARE flipped boolean;
-      BEGIN
-        IF tid <> '${t.id}' THEN RETURN real_tier; END IF;
-        UPDATE tier_flip SET seen = seen + 1 RETURNING seen > after INTO flipped;
-        RETURN CASE WHEN flipped THEN 'pro' ELSE real_tier END;
-      END $f$`);
-    await dbQuery("ALTER TABLE tenants RENAME TO tenants_real");
-    await dbQuery(`CREATE VIEW tenants AS SELECT ${cols.map((c) => (c === "tier" ? "tier_seen(id, tier) AS tier" : c)).join(", ")} FROM tenants_real`);
     const flipAfter = (k) => dbQuery("UPDATE tier_flip SET after = $1, seen = 0", [k]);
     const direct = [], approved = [];
     try {
+      await dbQuery("CREATE TABLE tier_flip (after int NOT NULL, seen int NOT NULL)");
+      await dbQuery("INSERT INTO tier_flip VALUES (1000000, 0)");
+      await dbQuery(`CREATE FUNCTION tier_seen(tid text, real_tier text) RETURNS text LANGUAGE plpgsql VOLATILE AS $f$
+        DECLARE flipped boolean;
+        BEGIN
+          IF tid <> '${t.id}' THEN RETURN real_tier; END IF;
+          UPDATE tier_flip SET seen = seen + 1 RETURNING seen > after INTO flipped;
+          RETURN CASE WHEN flipped THEN 'pro' ELSE real_tier END;
+        END $f$`);
+      await dbQuery("ALTER TABLE tenants RENAME TO tenants_real");
+      await dbQuery(`CREATE VIEW tenants AS SELECT ${cols.map((c) => (c === "tier" ? "tier_seen(id, tier) AS tier" : c)).join(", ")} FROM tenants_real`);
       for (let k = 0; k <= 6; k++) {
         const before = await held();
         const asked = now() + 3 * day; // fine on studio (7 days), too long for pro (1 day)
@@ -969,10 +969,11 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
         approved.push(r.status);
       }
     } finally {
-      await dbQuery("DROP VIEW tenants");
-      await dbQuery("ALTER TABLE tenants_real RENAME TO tenants");
-      await dbQuery("DROP FUNCTION tier_seen(text, text)");
-      await dbQuery("DROP TABLE tier_flip");
+      // Put the real table back whatever happened above, even a failure half-way through the swap.
+      await dbQuery("DROP VIEW IF EXISTS tenants");
+      if ((await dbQuery("SELECT to_regclass('tenants_real') IS NOT NULL AS there")).rows[0].there) await dbQuery("ALTER TABLE tenants_real RENAME TO tenants");
+      await dbQuery("DROP FUNCTION IF EXISTS tier_seen(text, text)");
+      await dbQuery("DROP TABLE IF EXISTS tier_flip");
     }
     // The sweep really crossed the window: early moves are refused, late ones (after the last
     // read) open, and once K is past the last read it stays open.

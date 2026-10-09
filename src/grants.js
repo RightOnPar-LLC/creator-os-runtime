@@ -119,7 +119,8 @@ export async function issueChildGrant(e, t, a, w = {}) {
   // time and is never cut short. buildEscrow has already refused a time past the payer key's
   // end or the tier's longest lifetime, but it read the tier before this function did. This is
   // the last word, on the tier (`r`) and the clock (`l`) read just above: if the tier moved in
-  // between, the hold is refused here, not shortened.
+  // between, the hold is refused here, not shortened. Only openEscrow sets heldUntil, always
+  // to a whole number (0 = nothing asked); anything unreadable is treated as nothing asked.
   let heldUntil = w?.escrow ? Number(w.heldUntil) || 0 : 0;
   if (heldUntil) {
     let limit = Math.min(l + r.maxTtlSec, Number(e.exp)),

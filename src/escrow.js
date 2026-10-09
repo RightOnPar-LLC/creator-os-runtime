@@ -48,8 +48,9 @@ export function buildEscrow(payerRow, params, tier) {
   // still ends it at the payer key's own end and at the tier's longest lifetime, whichever
   // comes first, and the answer carries the deadline it really got. A time that WAS asked for
   // is never cut short: the hold ends at exactly that time or the open is refused, here and
-  // again where the end is written (holdExpiry in issueChildGrant). One less than a minute
-  // away is rounded up to the minute every key gets.
+  // again where the end is written (holdExpiry in issueChildGrant). Times are whole seconds (a
+  // fraction is dropped). A time less than a minute away when the hold is written ends later
+  // than asked: at the minute every key gets, or at the payer key's end if that comes first.
   let now = nowSec();
   let deadline = 0;
   if (p.deadline != null && p.deadline !== 0) {

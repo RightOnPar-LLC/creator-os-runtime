@@ -120,7 +120,8 @@ export var AGENT_ISSUED_MAX_TTL_SEC = 86400;
 // at `now`: now + the tier's longest lifetime, or the payer key's end, whichever is sooner.
 // The hold ends at exactly the time asked. If the limits would end it sooner (or cannot be
 // read), the answer is null and the caller must refuse: a hold is never cut short. A time less
-// than a minute away keeps the minute every key gets.
+// than a minute from `now` ends later than asked: at the minute every key gets, or at the
+// limit if that comes first.
 export var holdExpiry = (heldUntil, now, limit) =>
   limit >= heldUntil ? Math.max(heldUntil, Math.min(limit, now + 60)) : null;
 export var memoryPartitions = (e) => e.memory?.partitions ?? [""];
