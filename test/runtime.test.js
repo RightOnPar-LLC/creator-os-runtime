@@ -3703,6 +3703,8 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     // The payer's own row settles only the 60 its hold captured. The 40 paid out under that hold
     // stays held on the payer, which is how spend below a grant is counted everywhere else.
     expect(await a.books()).toEqual({ settled: 60, held: 40 });
+    // and the payer's spend row in the ledger says 60, what was captured, not the hold's whole 100
+    expect((await dbQuery("SELECT usd_cents FROM ledger WHERE grant_id = $1 AND kind = 'escrow-capture'", [a.outer.grant_id])).rows.map((r) => r.usd_cents)).toEqual([60]);
     // outer delivered first: it waits while part of it is still pledged, then pays the rest
     const b = await nested("nest-part-b", 100, 40);
     expect((await receiptFor(b.outer)).json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" });
@@ -3721,32 +3723,6 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     expect((await receiptFor(n.inner)).json.escrow.captured).toBe(false); // refunded: it can never capture
     expect(await n.credits()).toEqual({ outer: 100, inner: 0 });
     expect(await n.paid()).toBe(100);
-  });
-
-  // What older code could leave behind: the hold above already ended, paid out or given back
-  // WHOLE, while the hold under it was still open. The hold under it must not be paid as well.
-  test("CONTROL: a hold whose hold above already ended (older code paid or refunded it whole) pays nothing", async () => {
-    const setCol = (id, col, cents) => dbQuery(`UPDATE grants SET ${col} = $2::jsonb WHERE id = $1`, [id, JSON.stringify({ usd_cents: cents, calls: 0, deploys: 0 })]);
-    // the hold above was CAPTURED whole: the payer settled 100 and its payee was credited 100
-    const cap = await nested("above-captured", 100, 100);
-    const payer = await cap.books();
-    await dbQuery("UPDATE grants SET status = 'captured' WHERE id = $1", [cap.outer.grant_id]);
-    await setCol(cap.root.grantId, "reserved", payer.held - 100);
-    await setCol(cap.root.grantId, "settled", payer.settled + 100);
-    await dbQuery("INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note) VALUES ($1, $2, $3, 'mesh-credit', 100, 0, 0, $4, 'as older code wrote it')", ["t_outer_above-captured", cap.outer.grant_id, cap.root.grantId, cap.outer.id]);
-    expect(await cap.credits()).toEqual({ outer: 100, inner: 0 });
-    expect((await receiptFor(cap.inner)).json.escrow).toMatchObject({ captured: false, reason: "hold_above_has_ended" });
-    expect(await cap.credits()).toEqual({ outer: 100, inner: 0 }); // not 100 + 100
-    expect(await cap.paid()).toBe(100);
-    // the hold above was REFUNDED whole: the payer has all of it back, so nobody may be paid from it
-    const ref = await nested("above-refunded", 100, 100);
-    const payer2 = await ref.books();
-    await dbQuery("UPDATE grants SET status = 'expired' WHERE id = $1", [ref.outer.grant_id]);
-    await setCol(ref.root.grantId, "reserved", payer2.held - 100);
-    expect(await ref.paid()).toBe(0);
-    expect((await receiptFor(ref.inner)).json.escrow).toMatchObject({ captured: false, reason: "hold_above_has_ended" });
-    expect(await ref.credits()).toEqual({ outer: 0, inner: 0 });
-    expect(await ref.paid()).toBe(0);
   });
 
   // Any shape of holds under holds, built the same way: each hold in `plan` is { amount, under }

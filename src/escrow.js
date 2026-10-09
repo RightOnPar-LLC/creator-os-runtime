@@ -167,9 +167,14 @@ export function serializeEscrow(grantRow) {
 // less only when value was passed on under the hold: what was captured directly under it is in
 // `settled`, and whatever is held on it is either still pledged to a hold underneath or was
 // spent further down (a grant keeps what the keys under it used held, see unusedOf in grants.js).
-// Neither is this hold's to pay. So a capture made under this rule never credits more than the
-// payer paid, whatever is under the hold. (captureEscrow also waits while anything under the hold
-// is still open, and pays nothing to a hold whose hold above has already ended.)
+// Neither is this hold's to pay. (captureEscrow also waits while anything under the hold is still
+// open.) On rows that only this code has touched, captures therefore never credit more than the
+// payer paid, whatever is under a hold. NOT covered: a hold left OPEN under a hold that older code
+// had already ended. That code paid out, or gave back, the upper hold's whole amount, the lower
+// hold's part included, so capturing the lower hold credits that part a second time. A rule for
+// it was tried and taken out again (it only looked one level up, and it turned away a delivery
+// that should be paid when the hold above had merely been cancelled). The live runtime had no
+// such row when this went live, and none can be made now: a hold cannot open a hold.
 export function captureAmount(grantRow) {
   let budget = normalizeUsage(parseJson(grantRow.budget)).usd_cents,
     held = normalizeUsage(parseJson(grantRow.reserved)).usd_cents,
@@ -220,13 +225,6 @@ export async function captureEscrow(idOrEscrowId, { source = "capture", ref = nu
     let amount = captureAmount(g),
       d = { usd_cents: amount, calls: 0, deploys: 0 };
     if (amount <= 0) return void (out.reason = "nothing_left_to_capture");
-    // The grant this hold sits under, locked here: child, then parent, the order every writer
-    // takes. If that grant is itself a hold and has already ended, this hold pays nothing. A hold
-    // above waits for the holds under it (just above), so one that ended while this one was
-    // still open was ended by older code, which paid out or gave back its WHOLE amount, this
-    // hold's part included. Paying this one as well is the double credit.
-    let p = g.parent ? (await tx`SELECT status, scope, reserved, settled FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0] : null;
-    if (p && p.status !== "active" && isHold(p)) return void (out.reason = "hold_above_has_ended");
     let flipped = await tx`UPDATE grants SET status = 'captured' WHERE id = ${g.id} AND status = 'active' RETURNING id`;
     if (flipped.length !== 1) return void (out.reason = "already_resolved"); // someone else resolved it
     // The payer PAID: convert the held reservation into a settlement on the parent — reserved down
@@ -234,10 +232,13 @@ export async function captureEscrow(idOrEscrowId, { source = "capture", ref = nu
     // this is the OPPOSITE of refund, which returns reserved to the payer. Only `amount` moves:
     // anything paid out under this hold stays held on the parent, which is how spend below a
     // grant is counted (unusedOf in grants.js).
-    if (p) {
-      let rem = subtractUsage(normalizeUsage(parseJson(p.reserved)), d),
-        set = addUsage(normalizeUsage(parseJson(p.settled)), d);
-      await tx`UPDATE grants SET reserved = ${{ usd_cents: Math.max(0, rem.usd_cents), calls: Math.max(0, rem.calls), deploys: Math.max(0, rem.deploys) }}::jsonb, settled = ${set}::jsonb WHERE id = ${g.parent}`;
+    if (g.parent) {
+      let p = (await tx`SELECT reserved, settled FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0];
+      if (p) {
+        let rem = subtractUsage(normalizeUsage(parseJson(p.reserved)), d),
+          set = addUsage(normalizeUsage(parseJson(p.settled)), d);
+        await tx`UPDATE grants SET reserved = ${{ usd_cents: Math.max(0, rem.usd_cents), calls: Math.max(0, rem.calls), deploys: Math.max(0, rem.deploys) }}::jsonb, settled = ${set}::jsonb WHERE id = ${g.parent}`;
+      }
     }
     // Two ledger rows are the durable record of truth (not the generic outbox, whose env-guard would
     // drop a cross-tenant credit and whose deliverer would reject the kind): the payer's spend, and
