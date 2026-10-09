@@ -7,7 +7,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   mod, entryPath, BASE, ADMIN_KEY, GITHUB_SECRET, BRAIN_SECRET, MESH_SECRET, RAILWAY_TOKEN, RATE_LIMIT,
-  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown, dbQuery, lsp, overlayHash,
+  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown, dbQuery, lsp, overlayHash, inOneWindow,
 } from "./harness.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -66,6 +66,7 @@ describe("1. /health", () => {
     expect(mod.CAPS.length).toBe(26);
     expect(mod.CAPS.slice(20)).toEqual(["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references", "escrow.hold"]);
     expect(mod.default.port).toBe(3000);
+    expect(mod.default.idleTimeout).toBe(255); // harness.js gives its own listener the same
     expect(mod.default.fetch).toBe(mod.app.fetch);
     expect(Object.keys(mod).sort()).toEqual(
       ["CAPS", "TEMPLATES", "TIERS", "VERSION", "app", "attenuationViolations", "default", "gatehouseEvaluate"],
@@ -531,19 +532,23 @@ describe("6. webhooks", () => {
 
 // ------------------------------------------------------------------------------------
 describe("7. rate limit", () => {
+  // The meter starts again every wall-clock minute. Each test here that fills it (or reads its row)
+  // counts only if the minute did not turn while it ran: see inOneWindow in harness.js.
   test(`exceeding RATE_LIMIT_PER_MIN (${RATE_LIMIT}) for one grant -> 429`, async () => {
-    const t = await newTenant("rate-tenant");
-    const other = await newTenant("rate-other");
-    let last;
-    for (let i = 0; i < RATE_LIMIT; i++) {
+    await inOneWindow(async () => {
+      const t = await newTenant("rate-tenant");
+      const other = await newTenant("rate-other");
+      let last;
+      for (let i = 0; i < RATE_LIMIT; i++) {
+        last = await req("GET", "/api/grants/verify", { token: t.token });
+        expect(last.status).toBe(200);
+      }
       last = await req("GET", "/api/grants/verify", { token: t.token });
-      expect(last.status).toBe(200);
-    }
-    last = await req("GET", "/api/grants/verify", { token: t.token });
-    expect(last.status).toBe(429);
-    expect(last.json.error).toBe("rate_limited");
-    // per grant: another grant is unaffected
-    expect((await req("GET", "/api/grants/verify", { token: other.token })).status).toBe(200);
+      expect(last.status).toBe(429);
+      expect(last.json.error).toBe("rate_limited");
+      // per grant: another grant is unaffected
+      expect((await req("GET", "/api/grants/verify", { token: other.token })).status).toBe(200);
+    });
     // admin is not grant-rate-limited
     expect((await admin("GET", "/api/admin/policy")).json.rateLimitPerMin).toBe(RATE_LIMIT);
   });
@@ -559,29 +564,83 @@ describe("7. rate limit", () => {
   // calls it only ever exercises the first, pre-check verifyGrant, pass or
   // fail, on both the buggy and the fixed line. "grant_verify" routes through
   // both calls, so it actually proves the fix.
+  //
+  // One window matters here in BOTH directions. A minute turning in the loop made the last call 200
+  // (seen 2026-10-09). And on the buggy line, a minute turning exactly half way would let every call
+  // through at two units each and still refuse the last one: a pass that proves nothing.
   test(`a single MCP tools/call spends exactly one rate-limit unit, matching REST`, async () => {
-    const t = await newTenant("mcp-rate-tenant");
-    let last;
-    for (let i = 0; i < RATE_LIMIT; i++) {
-      last = await mcp(t.token, "tools/call", { name: "grant_verify" }, i);
-      expect(last.status).toBe(200);
-      expect(last.json.result.isError).toBeUndefined();
-    }
-    last = await mcp(t.token, "tools/call", { name: "grant_verify" }, RATE_LIMIT);
-    expect(last.status).toBe(429);
-    expect(last.json.error).toBe("rate_limited");
+    await inOneWindow(async () => {
+      const t = await newTenant("mcp-rate-tenant");
+      let last;
+      for (let i = 0; i < RATE_LIMIT; i++) {
+        last = await mcp(t.token, "tools/call", { name: "grant_verify" }, i);
+        expect(last.status).toBe(200);
+        expect(last.json.result.isError).toBeUndefined();
+      }
+      last = await mcp(t.token, "tools/call", { name: "grant_verify" }, RATE_LIMIT);
+      expect(last.status).toBe(429);
+      expect(last.json.error).toBe("rate_limited");
+    });
   });
 
   // 2026-09-25: the bucket used to be a process-local Map — invisible to, and
   // reset independently by, every other replica. It now lives in Postgres.
   test("rate-limit counters are Postgres-backed, not process-local state", async () => {
-    const t = await newTenant("db-rate-tenant");
-    await req("GET", "/api/grants/verify", { token: t.token });
-    await req("GET", "/api/grants/verify", { token: t.token });
-    await req("GET", "/api/grants/verify", { token: t.token });
-    const rows = await dbQuery("SELECT count FROM rate_limits WHERE grant_id = $1", [t.grantId]);
-    expect(rows.rows.length).toBe(1);
-    expect(Number(rows.rows[0].count)).toBe(3);
+    // three calls are ONE row of 3 only inside one minute: across a turn they are two rows
+    await inOneWindow(async () => {
+      const t = await newTenant("db-rate-tenant");
+      await req("GET", "/api/grants/verify", { token: t.token });
+      await req("GET", "/api/grants/verify", { token: t.token });
+      await req("GET", "/api/grants/verify", { token: t.token });
+      const rows = await dbQuery("SELECT count, window_start FROM rate_limits WHERE grant_id = $1", [t.grantId]);
+      expect(rows.rows.length).toBe(1);
+      expect(Number(rows.rows[0].count)).toBe(3);
+      // the window the harness reasons about is the window the meter really used
+      expect(Number(rows.rows[0].window_start)).toBe(Math.floor(Date.now() / 60000) * 60000);
+    });
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("7a. the harness's one-window rule (inOneWindow), tried on a 200 ms window", () => {
+  const W = 200;
+  const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+  const pastNextTurn = () => pause(W - (Date.now() % W) + 2);
+  // start a test early in a window, so a body that does not wait cannot meet a turn by bad luck
+  const earlyInAWindow = async () => { do await pastNextTurn(); while (Date.now() % W > 50); };
+
+  test("a run that straddled a turn is thrown away, whether it passed or failed, and done again", async () => {
+    await earlyInAWindow();
+    const runs = [];
+    const out = await inOneWindow(async (attempt) => {
+      runs.push(attempt);
+      if (attempt === 1) (await pastNextTurn(), expect("a wrong answer from a straddled run").toBe("never reported"));
+      if (attempt === 2) return (await pastNextTurn(), "a right answer from a straddled run");
+      return "inside one window";
+    }, W);
+    expect(out).toBe("inside one window");
+    expect(runs).toEqual([1, 2, 3]);
+  });
+
+  test("a failure inside one window is the failure: no second run", async () => {
+    await earlyInAWindow();
+    let runs = 0;
+    const boom = new Error("the 41st call was 200");
+    await expect(inOneWindow(async () => { runs++; throw boom; }, W)).rejects.toBe(boom);
+    expect(runs).toBe(1);
+  });
+
+  test("a pass inside one window is the pass: no second run", async () => {
+    await earlyInAWindow();
+    let runs = 0;
+    expect(await inOneWindow(async () => (runs++, "ok"), W)).toBe("ok");
+    expect(runs).toBe(1);
+  });
+
+  test("three straddled runs in a row is a loud failure, never a pass", async () => {
+    let runs = 0;
+    await expect(inOneWindow(async () => (runs++, await pastNextTurn(), "looked fine"), W)).rejects.toThrow("window turned during each of 3 runs");
+    expect(runs).toBe(3);
   });
 });
 
@@ -2804,19 +2863,22 @@ describe("13. guest sybil defence (per-fingerprint, keyed on X-Real-IP)", () => 
   });
 
   test("rate limit: GUEST_MAX_PER_HOUR (3) mints per window per fingerprint, then 429", async () => {
-    const ip = "10.13.2.1";
-    const m1 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
-    expect(m1.status).toBe(201);
-    const fp = await fpOf(m1.json.grant);
-    // clear the active-lock between mints so the RATE cap (not one-active) is what governs
-    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
-    expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 2
-    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
-    expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 3
-    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
-    const m4 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
-    expect(m4.status).toBe(429);
-    expect(m4.json.error).toBe("guest_rate_limited");
+    // the mint count starts again every wall-clock HOUR (GUEST_FP_WINDOW_SEC): all four mints in one
+    await inOneWindow(async (attempt) => {
+      const ip = `10.13.2.${attempt}`;
+      const m1 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+      expect(m1.status).toBe(201);
+      const fp = await fpOf(m1.json.grant);
+      // clear the active-lock between mints so the RATE cap (not one-active) is what governs
+      await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+      expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 2
+      await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+      expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 3
+      await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+      const m4 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+      expect(m4.status).toBe(429);
+      expect(m4.json.error).toBe("guest_rate_limited");
+    }, 3600000);
   });
 
   test("privacy: no raw IP is ever stored — only the salted HMAC fingerprint", async () => {
@@ -2893,14 +2955,17 @@ describe("15. guest memory-write cap + brain-sync quarantine", () => {
   };
 
   test("guest writes are rate-capped tighter than the generic limit (10/min, own meter)", async () => {
-    const { token, base } = await freshGuest("10.15.1.1");
-    for (let i = 0; i < 10; i++) {
-      const w = await req("POST", "/api/memory", { token, body: { partition: base, key: "k" + i, content: "x" } });
-      expect(w.status).toBe(201);
-    }
-    const over = await req("POST", "/api/memory", { token, body: { partition: base, key: "k10", content: "x" } });
-    expect(over.status).toBe(429);
-    expect(over.json.error).toBe("memory_write_rate_limited"); // dedicated meter, not the generic 'rate_limited'
+    // the write meter starts again every wall-clock minute (the 11th write was 201 across a turn, seen 2026-10-09)
+    await inOneWindow(async (attempt) => {
+      const { token, base } = await freshGuest(`10.15.1.${attempt}`);
+      for (let i = 0; i < 10; i++) {
+        const w = await req("POST", "/api/memory", { token, body: { partition: base, key: "k" + i, content: "x" } });
+        expect(w.status).toBe(201);
+      }
+      const over = await req("POST", "/api/memory", { token, body: { partition: base, key: "k10", content: "x" } });
+      expect(over.status).toBe(429);
+      expect(over.json.error).toBe("memory_write_rate_limited"); // dedicated meter, not the generic 'rate_limited'
+    });
   });
 
   test("per-guest row cap, with updates to an existing key exempt", async () => {

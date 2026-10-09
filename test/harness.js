@@ -7,6 +7,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { PGLiteSocketServer } from "@electric-sql/pglite-socket";
 import { createHash, createHmac } from "node:crypto";
+import net from "node:net";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -26,20 +27,18 @@ export const RATE_LIMIT = 40;
 
 // ---- 1. throwaway Postgres -------------------------------------------------------
 const pg = await PGlite.create();
-const pgServer = new PGLiteSocketServer({ db: pg, port: 0, host: "127.0.0.1", maxConnections: 8 });
+// idleTimeout: a connection that sends nothing for 10 s is dropped and, if it was inside a transaction,
+// rolled back. Without it a run could hang for good: when this machine loses a connection's FIN (2a),
+// the server still holds that handler, the runtime's client re-dials, and pglite-socket parks every
+// query of the new connection behind the old one's open transaction. Seen as every remaining test
+// timing out, 30 s each. With it, the stuck handler is reaped after 10 s and the run goes on, minus the
+// one query that was waiting (its connection idles out at the same moment; that test fails with a 500).
+// Healthy runs never leave the database idle for 10 s: the longest gap is the 2.5 s "slow lsp" test.
+const pgServer = new PGLiteSocketServer({ db: pg, port: 0, host: "127.0.0.1", maxConnections: 8, idleTimeout: 10000 });
 /** Direct SQL against the throwaway DB, for tests that must set up a state no route can reach. */
 export const dbQuery = (q, params = []) => pg.query(q, params);
 await pgServer.start();
-
-// PGlite is ONE Postgres session shared by every socket. Bun.SQL pools connections
-// and names its prepared statements per connection, so two pooled connections
-// collide on the shared session ("prepared statement ... already exists"). Pin the
-// pool to one connection. This is a test-environment shim only: production talks
-// to a real Postgres and constructs Bun.SQL exactly as the runtime does.
-const RealSQL = globalThis.Bun.SQL;
-globalThis.Bun.SQL = function PinnedSQL(url, opts) {
-  return new RealSQL(url, { ...(opts || {}), max: 1 });
-};
+const DATABASE_URL = `postgres://postgres:postgres@${pgServer.getServerConn()}/postgres`;
 
 // ---- 2. outbound network: blocked ----------------------------------------------
 const realFetch = globalThis.fetch;
@@ -48,10 +47,52 @@ let port = 0;
 let lspPort = 0;
 globalThis.fetch = async (input, init) => {
   const url = new URL(typeof input === "string" ? input : input.url ?? String(input));
-  if (url.hostname === "127.0.0.1" && (Number(url.port) === port || Number(url.port) === lspPort)) return realFetch(input, init);
+  if (url.hostname === "127.0.0.1" && (Number(url.port) === port || Number(url.port) === lspPort)) return localFetch(input, init);
   blockedFetches.push(url.href);
   throw new TypeError(`blocked by test harness: ${url.href}`);
 };
+
+// ---- 2a. this machine's loopback: a refused connection is asked again ---------------
+// Every listener the harness talks to is up, in this process, for the whole run. So a REFUSED
+// connection to one of them says nothing about the runtime: the machine dropped it. Seen for real
+// (Windows, 2026-10-09; how to check a machine: loopback-check.mjs): connections to 127.0.0.1 whose
+// own (client) port fell in certain stretches of port numbers were dropped. The OS hands client ports
+// out in rising order, so everything on the box failed together until that shared pointer had moved
+// past the stretch. bun says ConnectionRefused when the socket died before bun wrote the request (a
+// closed port, or a peer that hung up on the handshake), so the runtime never saw that request and
+// asking again cannot repeat it. A request that was written and then lost (ECONNRESET, a timeout)
+// is never asked again: the runtime may have acted on it.
+const loopback = { refused: 0, bootRefused: 0, bootWaitMs: 0, reset: 0, lastAt: 0, step: 16 };
+const REFUSED = new Set(["ConnectionRefused", "ECONNREFUSED"]);
+/**
+ * After a refusal: count it, and move the OS's port pointer on (a listener on port 0 takes the next free
+ * port and gives it back). 16 ports the first time, twice as many each time refusals keep coming, so a
+ * stretch of any width is left behind after a few of them.
+ */
+const stepPastRefusal = async () => {
+  loopback.refused++;
+  loopback.step = Date.now() - loopback.lastAt < 5000 ? Math.min(loopback.step * 2, 1024) : 16;
+  loopback.lastAt = Date.now();
+  for (let i = 0; i < loopback.step; i++)
+    await new Promise((done) => {
+      const s = net.createServer();
+      s.once("error", done);
+      s.listen(0, "127.0.0.1", () => s.close(done));
+    });
+};
+/** fetch to one of the harness's own listeners. Gives up after 20 s of refusals with the last one. */
+async function localFetch(input, init) {
+  for (const t0 = Date.now(); ; ) {
+    try {
+      return await realFetch(input, init);
+    } catch (e) {
+      if (e?.code === "ECONNRESET") loopback.reset++; // counted, never asked again
+      // a Request object's body may already be spent, so only a plain url is asked again
+      if (!REFUSED.has(e?.code) || typeof input !== "string" || Date.now() - t0 > 20000) throw e;
+      await stepPastRefusal();
+    }
+  }
+}
 
 // ---- 2b. a fake lsp-mcp (0.3.2) --------------------------------------------------
 // Behaves like the real one at the seam the runtime depends on: it introspects the
@@ -79,7 +120,7 @@ const lspServer = Bun.serve({
     const token = (r.headers.get("authorization") || "").replace(/^Bearer /, "");
     const rpcErr = (status, message, data = null) => Response.json({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32001, message, data } }, { status });
     if (!token) return rpcErr(403, "missing_grant");
-    const v = await realFetch(`${BASE}/api/grants/verify`, { headers: { authorization: `Bearer ${token}` } });
+    const v = await localFetch(`${BASE}/api/grants/verify`, { headers: { authorization: `Bearer ${token}` } });
     if (v.status !== 200) return rpcErr(403, (await v.json()).error || "bad_grant");
     const caps = (await v.json()).caps || [];
     if (!caps.includes("lsp.diagnose")) return rpcErr(403, "missing_cap", { need: "lsp.diagnose" });
@@ -87,7 +128,7 @@ const lspServer = Bun.serve({
     if (lsp.mode === "slow") await new Promise((r) => setTimeout(r, 2500));
     const files = body.params?.arguments?.files || [];
     // Charge the call exactly as the real gate does (verify, then settle with the same token).
-    const st = await realFetch(`${BASE}/api/grants/settle`, {
+    const st = await localFetch(`${BASE}/api/grants/settle`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify({ calls: 1, usd_cents: 0, deploys: 0, ref: "lsp:diagnose", note: `lsp.diagnose ${files.length} file(s)` }),
@@ -113,9 +154,44 @@ export const LSP_URL = `http://127.0.0.1:${lspPort}`;
 
 // ---- 3. listener on 127.0.0.1 (port known before import, for PUBLIC_URL) ---------
 let handler = () => new Response("booting", { status: 503 });
-const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (req) => handler(req) });
+// idleTimeout as the runtime sets it for its own listener (src/index.js; section 1 checks the number).
+// With bun's default of 10 s this listener hung up on connections production keeps for 255 s.
+const server = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 255, fetch: (req) => handler(req) });
 port = server.port;
 export const BASE = `http://127.0.0.1:${port}`;
+
+// ---- 3a. the database client: one connection, made and proven before the runtime loads ----
+// PGlite is ONE Postgres session shared by every socket. Bun.SQL pools connections and names its
+// prepared statements per connection, so two pooled connections collide on the shared session
+// ("prepared statement ... already exists"). Pin the pool to one connection. This is a
+// test-environment shim only: production talks to a real Postgres and constructs Bun.SQL exactly
+// as the runtime does.
+//
+// The runtime opens its connection while it is imported and runs the schema on it at once. A refused
+// connect there is an error between tests and the whole run dies ("36 pass, 1 fail"). So the harness
+// makes that connection first, asks again while the machine refuses it (see 2a), and the shim hands
+// the runtime this proven client. A client whose connect was refused opens a new connection on its
+// next query, so once it has answered once nothing more is needed.
+const RealSQL = globalThis.Bun.SQL;
+const provenSql = new RealSQL(DATABASE_URL, { max: 1 });
+globalThis.Bun.SQL = function PinnedSQL(url, opts) {
+  if (url === DATABASE_URL && opts === undefined) return provenSql;
+  return new RealSQL(url, { ...(opts || {}), max: 1 });
+};
+const bootStart = Date.now();
+for (;;) {
+  try {
+    await provenSql`SELECT 1`;
+    break;
+  } catch (e) {
+    if (e?.code !== "ERR_POSTGRES_CONNECTION_REFUSED" || Date.now() - bootStart > 120000)
+      throw new Error("harness: the throwaway database, listening in this process, could not be reached for two minutes. That is this machine, not the runtime: node test/loopback-check.mjs", { cause: e });
+    await stepPastRefusal();
+  }
+}
+loopback.bootWaitMs = Date.now() - bootStart;
+loopback.bootRefused = loopback.refused;
+if (loopback.bootRefused) console.warn(`harness: this machine refused ${loopback.bootRefused} connection(s) to the throwaway database before boot; it answered after ${loopback.bootWaitMs} ms (node test/loopback-check.mjs)`);
 
 // ---- 4. env, then import --------------------------------------------------------
 for (const k of [
@@ -127,7 +203,7 @@ for (const k of [
 Object.assign(process.env, {
   LSP_MCP_URL: LSP_URL,
   CREATOR_WORKER_READY: "1",
-  DATABASE_URL: `postgres://postgres:postgres@${pgServer.getServerConn()}/postgres`,
+  DATABASE_URL,
   RUNTIME_ADMIN_KEY: ADMIN_KEY,
   VAULT_KEY,
   MESH_RECEIPT_SECRET: MESH_SECRET,
@@ -146,6 +222,10 @@ export const mod = await import(pathToFileURL(entryPath).href);
 handler = (req) => mod.default.fetch(req, server);
 
 export async function shutdown() {
+  if (loopback.refused)
+    console.warn(`harness: this machine refused ${loopback.refused} connection(s) to listeners that were up in this process (${loopback.bootRefused} before boot, ${loopback.refused - loopback.bootRefused} during the run); each was asked again. That is the machine's loopback, not the runtime: node test/loopback-check.mjs`);
+  if (loopback.reset)
+    console.warn(`harness: this machine reset ${loopback.reset} established connection(s) to the harness listener; those were NOT asked again (the runtime may have acted on them), so a test may have failed with ECONNRESET. That is the machine, not the runtime: node test/loopback-check.mjs`);
   server.stop(true);
   lspServer.stop(true);
   await pgServer.stop();
@@ -162,7 +242,7 @@ export async function req(method, path, { token, body, headers = {}, raw } = {})
     payload = JSON.stringify(body);
     h["content-type"] ??= "application/json";
   }
-  const res = await realFetch(BASE + path, { method, headers: h, body: payload, redirect: "manual" });
+  const res = await localFetch(BASE + path, { method, headers: h, body: payload, redirect: "manual" });
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch {}
@@ -180,4 +260,25 @@ export async function newTenant(name = "t", tier = "starter") {
 }
 export async function mcp(token, method, params, id = 1) {
   return req("POST", "/mcp", { token, body: { jsonrpc: "2.0", id, method, params } });
+}
+
+// ---- fixed-window meters ----------------------------------------------------------
+// The runtime's meters count in fixed wall-clock windows: a minute for checkNamedRateLimit
+// (src/grants.js), an hour for the guest mint cap (src/guest.js). The count starts again when the
+// window turns, so "fill the meter, the next call is refused" is only true if every call landed in
+// ONE window. This runs `body` and keeps its outcome, pass or fail, only if the window did not turn
+// while it ran. A run that straddled a turn is thrown away WHATEVER it said and done again, so the
+// body gets the attempt number and must start from fresh grants (and a fresh ip for a guest).
+// Nothing is waited for, and the runtime is in this process, so it reads this same clock.
+export async function inOneWindow(body, windowMs = 60000) {
+  for (let attempt = 1; ; attempt++) {
+    const w = Math.floor(Date.now() / windowMs);
+    let out, err;
+    try { out = await body(attempt); } catch (e) { err = e; }
+    if (Math.floor(Date.now() / windowMs) === w) {
+      if (err) throw err;
+      return out;
+    }
+    if (attempt === 3) throw new Error(`inOneWindow: the ${windowMs} ms window turned during each of 3 runs`, { cause: err });
+  }
 }
