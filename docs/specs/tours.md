@@ -150,6 +150,9 @@ TOURS_STRESS_RUNS=500 node test/run.mjs        the random mixes, 500 of them ins
 
 ## Known limits
 
+- A key that a cancel missed BEFORE 2026-10-09 (written under a grant at the very moment that
+  grant was cancelled) no longer works, but the budget it held stays held on the grant above the
+  cancelled one. Cancels since then find such a key themselves and give its budget back.
 - If the tour cannot be recorded AND cancelling its holding grant then also fails, the holding
   grant stays (no key exists under it, and its token was never handed out) and its budget comes
   back to the owner when it runs out, 7 days later at most.

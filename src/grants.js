@@ -320,8 +320,9 @@ const CANCEL_TRIES = 3;
 // lowerGrantAutonomy, whose one UPDATE takes a subtree's rows in no promised order.) Postgres aborts one side; no
 // balance moves, because that side's whole transaction is undone. When the side aborted is this one it simply
 // starts again: nothing of the failed try is left, the list is read afresh and a grant that somebody else ended
-// in the meantime is skipped. The fixed order (depth, then id) keeps two cancels from taking the same two grants
-// of one depth in opposite orders; it does not rule the other cycles out, the retry is what covers those.
+// in the meantime is skipped. The fixed order (depth, then id) keeps two cancels that both LISTED the same two
+// grants of one depth from taking them in opposite orders. It does not rule the other cycles out (not even that
+// one, when one of the two cancels finds a grant only by its second look); the retry is what covers those.
 export async function revokeGrantTree(e, t, a) {
   let n = [];
   for (let attempt = 1; ; attempt++) {
@@ -333,10 +334,14 @@ export async function revokeGrantTree(e, t, a) {
           // never release twice), and what it gives back is worked out from the row AS IT IS NOW (a settle may have
           // landed, and the grants under it have let go, since the list was read).
           let i = (await r`UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = ${t} WHERE id = ${id} AND status = 'active' RETURNING *`)[0];
-          if (!i) return;
           // The second look: children issued since the list was read. Nothing can be added under this grant now.
+          // It is made ALSO when this call did not move the grant, because somebody else ended it first. The
+          // sweep ends a grant only when nothing under it is active, and another cancel makes this same look, but
+          // captureEscrow ends a hold without looking under it. Either way the grant is no longer active, so
+          // nothing more can be issued under it and one look is enough.
           let late = await r`SELECT id FROM grants WHERE parent = ${id} AND status = 'active' ORDER BY id`;
           for (let child of late) await cancel(child.id);
+          if (!i) return; // not this call's to let go
           // What is held on it. This transaction has had the row locked since the statement above, so the only
           // thing that can have changed it since is a release made just now by one of those late children.
           let held = late.length ? (await r`SELECT reserved FROM grants WHERE id = ${id}`)[0].reserved : i.reserved,

@@ -100,7 +100,8 @@ const changed = async (id) => {
 // RULE 1 and RULE 2 in one query: every grant still ACTIVE anywhere under the holding grant, whose day key
 // (the grant directly under the holding grant that it hangs from) belongs to a turn up to `gen`. Shallowest
 // first. It walks down from the day keys WHATEVER their own state, so a helper that outlived a cancelled day
-// key (written at the very moment that key was cancelled: the gap noted in revokeGrantTree) is found too.
+// key is found too. (That was the gap revokeGrantTree had until 2026-10-09: a key written at the very moment the
+// key above it was cancelled. The cancel now finds such a key itself; this stays as a second look.)
 const liveUnder = (tour, gen) => sql`WITH RECURSIVE sub AS (
     SELECT id, status, depth FROM grants WHERE parent = ${tour.grant_id} AND COALESCE((scope->'tour'->>'gen')::bigint, 0) <= ${gen}::bigint
     UNION ALL SELECT c.id, c.status, c.depth FROM grants c JOIN sub ON c.parent = sub.id)
@@ -461,8 +462,9 @@ export async function extendTour(auth, id, body) {
 
 async function endTourRow(tour, reason, by, approver = null) {
   let cancelled = await revokeGrantTree(tour.grant_id, `tour: ${reason}`, by); // the holding grant and every key under it, at once
-  // A key written under it (or under one of its keys) while that ran is not in its list. Look until a look finds
-  // nothing, at every depth and whatever the turn; throws, and the tour is NOT marked ended, if something still works.
+  // A key written under it (or under one of its keys) while that ran was not in its list; since 2026-10-09 the
+  // cancel looks again itself, and this is a second look on top of that. Look until a look finds nothing, at every
+  // depth and whatever the turn; throws, and the tour is NOT marked ended, if something still works.
   cancelled.push(...(await cancelUnder(tour, EVERY_TURN, `tour: ${reason}`, by)));
   let marked = await sql`UPDATE tours SET status = 'ended', current_key = NULL, ended_reason = ${String(reason).slice(0, 200)}, gen = gen + 1 WHERE id = ${tour.id} AND status <> 'ended' RETURNING id`;
   if (marked.length === 1) {
