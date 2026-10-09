@@ -2301,3 +2301,44 @@ describe("23. agent-host (docs/specs/agent-host.md)", () => {
     expect((await verify(root.token)).remaining).toEqual(before);
   });
 });
+
+describe("24. stored deploy secrets never leave the runtime (bridge prerequisite, 2026-10-09)", () => {
+  // A deploy's stored intent is the caller's request body; its env carries real
+  // values (other services' keys). GET /api/deploys/:id and GET /api/approvals
+  // must return the variable NAMES only, so the front door can bridge them.
+  const SECRET = "sk_live_must_not_leave_" + Date.now();
+  const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
+
+  test("GET /api/deploys/:id returns env names, never values", async () => {
+    const t = await newTenant("deploy-redact");
+    const name = (await verify(t.token)).scope.workers.namePrefix + "redact-1";
+    const d = await req("POST", "/api/deploys", { token: t.token, body: { name, template: "probe", env: { STRIPE_SECRET_KEY: SECRET, PORT: "8080" }, api_token: SECRET } });
+    expect(d.status).toBe(201);
+    const got = await req("GET", `/api/deploys/${d.json.id}`, { token: t.token });
+    expect(got.status).toBe(200);
+    expect(JSON.stringify(got.json)).not.toContain(SECRET);
+    expect(got.json.deploy.intent.env).toEqual({ STRIPE_SECRET_KEY: "[redacted]", PORT: "[redacted]" });
+    expect(got.json.deploy.intent.api_token).toBe("[redacted]");
+    expect(got.json.deploy.intent.template).toBe("probe"); // non-secret fields untouched
+    // ...and the stored row still holds the real value (an approved deploy must run with it).
+    const row = (await dbQuery("SELECT intent FROM deploys WHERE id = $1", [d.json.id])).rows[0];
+    expect(JSON.stringify(row.intent)).toContain(SECRET);
+  });
+
+  test("GET /api/approvals returns a pending deploy's env names, never values", async () => {
+    const root = await newTenant("approvals-redact", "pro");
+    const c = await req("POST", "/api/grants", {
+      token: root.token,
+      body: { sub: "agent:redact", caps: ["deploy.worker"], ttlSec: 3600, budget: { usd_cents: 2000, calls: 10, deploys: 2 }, constraints: { autonomy: "ask" } },
+    });
+    expect(c.status).toBe(201);
+    const name = (await verify(c.json.token)).scope.workers.namePrefix + "redact-2";
+    const d = await req("POST", "/api/deploys", { token: c.json.token, body: { name, template: "probe", confirm: true, env: { DB_PASSWORD: SECRET } } });
+    expect(d.json.status).toBe("awaiting_approval");
+    const list = await req("GET", "/api/approvals", { token: root.token });
+    expect(list.status).toBe(200);
+    expect(list.json.approvals.length).toBeGreaterThan(0);
+    expect(JSON.stringify(list.json)).not.toContain(SECRET);
+    expect(list.json.approvals[0].intent.env).toEqual({ DB_PASSWORD: "[redacted]" });
+  });
+});
