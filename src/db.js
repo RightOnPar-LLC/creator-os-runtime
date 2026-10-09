@@ -84,11 +84,16 @@ CREATE INDEX IF NOT EXISTS approvals_tenant_status ON approvals(tenant, status);
 -- Tours (tours.js): the record that lets one named agent keep renewing a 24-hour key until its end date.
 -- grant_id is the holding grant (never a credential). current_key is a NOTE of the key the tour handed out
 -- last. The keys themselves are found by parent (every active grant under the holding grant), never by this note.
+-- gen is the TURN number: every step that will issue a key adds one to it first, in a statement that only
+-- succeeds if the row is still as it was read (tours.js, rule 2).
 CREATE TABLE IF NOT EXISTS tours (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, grant_id TEXT NOT NULL REFERENCES grants(id), agent TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active', current_key TEXT, renewals INT NOT NULL DEFAULT 0,
   opened_at BIGINT NOT NULL, until BIGINT NOT NULL, last_renewed_at BIGINT NOT NULL, opened_by TEXT, frozen_reason TEXT,
-  ended_reason TEXT, created_at TIMESTAMPTZ DEFAULT now());
+  ended_reason TEXT, gen BIGINT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now());
+-- (for a database that made the table from an earlier build of this branch)
+ALTER TABLE tours ADD COLUMN IF NOT EXISTS ended_reason TEXT;
+ALTER TABLE tours ADD COLUMN IF NOT EXISTS gen BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS tours_tenant ON tours(tenant);
 CREATE INDEX IF NOT EXISTS tours_current_key ON tours(current_key);
 CREATE INDEX IF NOT EXISTS tours_grant ON tours(grant_id);
