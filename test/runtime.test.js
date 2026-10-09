@@ -740,6 +740,274 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     expect(lead2.json.escrow.deadline).toBeLessThanOrEqual(now() + 3600);
   });
 
+  // A deadline that cannot be read, or has already passed, used to be swapped for the default
+  // hour with a 201: the payer got a hold it never asked for.
+  test("a hold deadline that is not a time, or has already passed, is refused, never swapped for the default hour", async () => {
+    const t = await newTenant("hold-deadline-odd", "pro");
+    const now = () => Math.floor(Date.now() / 1000);
+    const left = async () => (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining.usd_cents;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const before = await left();
+    for (const deadline of ["2026-12-25T00:00:00Z", "soon", "", "0", true, false, [], {}, [now() + 600], now() - 5, 1, -1]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline }) });
+      expect([JSON.stringify(deadline), r.status, r.json.error]).toEqual([JSON.stringify(deadline), 400, "escrow_deadline_invalid"]);
+    }
+    expect(await left()).toBe(before); // the refusals held nothing
+    // "Not given" is exactly: absent, null, or the number 0. Those still open the default hour.
+    for (const over of [{}, { deadline: null }, { deadline: 0 }]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body(over) });
+      expect(r.status).toBe(201);
+      expect(r.json.escrow.deadline).toBeGreaterThan(now() + 3500);
+      expect(r.json.escrow.deadline).toBeLessThanOrEqual(now() + 3600);
+    }
+    // A real deadline is kept, written as a number or as a string that reads as one.
+    for (const deadline of [now() + 600, String(now() + 600)]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline }) });
+      expect(r.status).toBe(201);
+      expect(r.json.escrow.deadline).toBe(Number(deadline)); // to the second
+    }
+  });
+
+  // The owner's approval runs the request as it was asked. If its deadline has gone by while it
+  // waited, there is nothing left to honour: it used to open a fresh one-hour hold instead.
+  test("a hold whose deadline passes while it waits for the owner is refused at approval, not opened for a fresh hour", async () => {
+    const t = await newTenant("hold-deadline-late", "pro");
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const left = async () => (await req("GET", "/api/grants/verify", { token: asker.json.token })).json.remaining.usd_cents;
+    const intent = { amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, deadline: now() + 600 };
+    const d = await req("POST", "/api/escrow", { token: asker.json.token, body: intent });
+    expect(d.status).toBe(202);
+    // Time passes: the same request, its deadline now behind us.
+    await dbQuery("UPDATE approvals SET intent = $1::jsonb WHERE id = $2", [JSON.stringify({ ...intent, deadline: now() - 5 }), d.json.approval.id]);
+    const ok = await req("POST", `/api/approvals/${d.json.approval.id}`, { token: t.token, body: { decision: "approve" } });
+    expect(ok.status).toBe(400);
+    expect(ok.json.error).toBe("escrow_deadline_invalid");
+    expect(await left()).toBe(500); // nothing was held
+    const row = (await req("GET", "/api/approvals", { token: t.token })).json.approvals.find((a) => a.id === d.json.approval.id);
+    expect(row.status).toBe("failed");
+    expect((typeof row.result === "string" ? JSON.parse(row.result) : row.result).reason).toBe("escrow_deadline_invalid");
+  });
+
+  // A lifetime that is not a number was only refused when the hold was issued. For a payer whose
+  // dial says "ask" that is AFTER the approval was filed: the owner was asked to approve a hold
+  // that could never open.
+  test("a hold lifetime that is not a number is refused before anything is filed for the owner", async () => {
+    const t = await newTenant("hold-ttl-odd", "pro");
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const filed = async () => (await req("GET", "/api/approvals", { token: t.token })).json.approvals.length;
+    const left = async () => (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining.usd_cents;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const before = await left();
+    for (const ttlSec of ["abc", {}, "", true, []]) {
+      for (const token of [asker.json.token, t.token]) {
+        const r = await req("POST", "/api/escrow", { token, body: body({ ttlSec }) });
+        expect([JSON.stringify(ttlSec), r.status, r.json.error]).toEqual([JSON.stringify(ttlSec), 400, "ttl_invalid"]);
+      }
+    }
+    // It is refused even when a good deadline is given with it (the deadline would have won).
+    const both = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: now() + 600, ttlSec: "abc" }) });
+    expect([both.status, both.json.error]).toEqual([400, "ttl_invalid"]);
+    expect(await filed()).toBe(0); // the owner was never asked
+    expect(await left()).toBe(before); // and nothing was held
+    // A lifetime that is a number still works on both paths.
+    const opened = await req("POST", "/api/escrow", { token: t.token, body: body({ ttlSec: "600" }) });
+    expect(opened.status).toBe(201);
+    expect(opened.json.escrow.deadline).toBeLessThanOrEqual(now() + 600);
+    expect((await req("POST", "/api/escrow", { token: asker.json.token, body: body({ ttlSec: 600 }) })).status).toBe(202);
+    expect(await filed()).toBe(1);
+  });
+
+  // No request can give a payer key an unreadable end (the column is BIGINT NOT NULL), so the
+  // runtime proves this one on itself: /selftest calls the same check with such a key.
+  test("a hold is refused, not waved through, when the payer key's end cannot be read", async () => {
+    const r = await req("GET", "/selftest");
+    const check = r.json.results.find((c) => c.name === "payment hold refused when the payer key's end cannot be read");
+    expect(check).toEqual({ name: "payment hold refused when the payer key's end cannot be read", pass: true });
+  });
+
+  // The rule used where a hold's end is written (holdExpiry, policy.js): exactly the time asked,
+  // refused if a limit would end it sooner. /selftest runs it with a clock that moved on between
+  // the asking and the writing, which no request here can arrange.
+  test("where a hold's end is written, it is the time asked or a refusal, never sooner and never later", async () => {
+    const r = await req("GET", "/selftest");
+    const check = r.json.results.find((c) => c.name === "payment hold ends at the time asked, or is refused, never sooner");
+    expect(check).toEqual({ name: "payment hold ends at the time asked, or is refused, never sooner", pass: true });
+  });
+
+  // The tier's longest lifetime was the other thing that cut a hold short without a word: the
+  // owner's key asking for 20 days on a 7-day tier got a 201 and a 7-day hold.
+  test("a payment hold asked to outlast the tier's longest lifetime is refused, never quietly shortened", async () => {
+    const t = await newTenant("hold-outlives-tier", "studio"); // 7 days; the owner's own key lasts longer
+    const day = 86400;
+    const week = 7 * day;
+    const now = () => Math.floor(Date.now() / 1000);
+    const left = async () => (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining.usd_cents;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const before = await left();
+    let named;
+    for (const over of [{ deadline: now() + 20 * day }, { ttlSec: 20 * day }, { ttlSec: week + 1 }]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body(over) });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toBe("escrow_deadline_exceeds_tier_max");
+      expect(r.json.detail.max_ttl_sec).toBe(week);
+      expect(Math.abs(r.json.detail.latest_deadline - (now() + week))).toBeLessThanOrEqual(2);
+      named = r.json.detail.latest_deadline;
+    }
+    expect(await left()).toBe(before); // the refusals held nothing
+    // The longest the tier allows still opens: asked as a lifetime, and as the deadline the refusal named.
+    const full = await req("POST", "/api/escrow", { token: t.token, body: body({ ttlSec: week }) });
+    expect(full.status).toBe(201);
+    expect(full.json.escrow.deadline).toBeGreaterThan(now() + week - 5);
+    const byName = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: named }) });
+    expect(byName.status).toBe(201);
+    expect(byName.json.escrow.deadline).toBe(named);
+  });
+
+  // A key handed out on a bigger tier can outlive a move to a smaller one. Its holds follow the
+  // tier the tenant is on NOW, and the refusal comes before the owner is asked anything.
+  test("after a move to a smaller tier, a hold past the new limit is refused before an approval is filed", async () => {
+    const t = await newTenant("hold-tier-moved", "studio");
+    const day = 86400;
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 7 * day, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const filed = async () => (await req("GET", "/api/approvals", { token: t.token })).json.approvals.length;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    // On studio a 3-day hold from this key is fine: it goes to the owner.
+    const waiting = await req("POST", "/api/escrow", { token: asker.json.token, body: body({ deadline: now() + 3 * day }) });
+    expect(waiting.status).toBe(202);
+    expect(await filed()).toBe(1);
+    expect((await admin("POST", `/api/tenants/${t.id}/tier`, { body: { tier: "pro" } })).status).toBe(200); // pro: 1 day
+    const r = await req("POST", "/api/escrow", { token: asker.json.token, body: body({ deadline: now() + 3 * day }) });
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("escrow_deadline_exceeds_tier_max");
+    expect(r.json.detail.max_ttl_sec).toBe(day);
+    expect(await filed()).toBe(1); // nothing new was filed
+    // The request filed before the move is held to the new limit too when the owner approves it.
+    const ok = await req("POST", `/api/approvals/${waiting.json.approval.id}`, { token: t.token, body: { decision: "approve" } });
+    expect(ok.status).toBe(409);
+    expect(ok.json.error).toBe("escrow_deadline_exceeds_tier_max");
+    expect((await req("GET", "/api/grants/verify", { token: asker.json.token })).json.remaining.usd_cents).toBe(500); // nothing was held
+  });
+
+  // The tier is read more than once while a hold opens (the key check, the hold's own check,
+  // the issuing). If the tenant moves to a smaller tier between any two of those reads, the hold
+  // must be refused or kept whole. It used to come back 201, cut to the smaller tier's limit.
+  // One request cannot land in the middle of another here (one database session), so for this
+  // test `tenants` is a view that answers studio for the first K reads of this tenant and pro
+  // after that. Every K is tried, on the direct path and on the approvals path.
+  test("a tier that moves while a hold is being opened never cuts the hold short", async () => {
+    const t = await newTenant("hold-tier-races", "studio");
+    const day = 86400;
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 7 * day, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const held = async () => (await dbQuery("SELECT count(*)::int AS n FROM grants WHERE tenant = $1 AND sub LIKE 'escrow:%'", [t.id])).rows[0].n;
+    const cols = (await dbQuery("SELECT column_name FROM information_schema.columns WHERE table_name = 'tenants' ORDER BY ordinal_position")).rows.map((r) => r.column_name);
+    const flipAfter = (k) => dbQuery("UPDATE tier_flip SET after = $1, seen = 0", [k]);
+    const direct = [], approved = [];
+    try {
+      await dbQuery("CREATE TABLE tier_flip (after int NOT NULL, seen int NOT NULL)");
+      await dbQuery("INSERT INTO tier_flip VALUES (1000000, 0)");
+      await dbQuery(`CREATE FUNCTION tier_seen(tid text, real_tier text) RETURNS text LANGUAGE plpgsql VOLATILE AS $f$
+        DECLARE flipped boolean;
+        BEGIN
+          IF tid <> '${t.id}' THEN RETURN real_tier; END IF;
+          UPDATE tier_flip SET seen = seen + 1 RETURNING seen > after INTO flipped;
+          RETURN CASE WHEN flipped THEN 'pro' ELSE real_tier END;
+        END $f$`);
+      await dbQuery("ALTER TABLE tenants RENAME TO tenants_real");
+      await dbQuery(`CREATE VIEW tenants AS SELECT ${cols.map((c) => (c === "tier" ? "tier_seen(id, tier) AS tier" : c)).join(", ")} FROM tenants_real`);
+      for (let k = 0; k <= 6; k++) {
+        const before = await held();
+        const asked = now() + 3 * day; // fine on studio (7 days), too long for pro (1 day)
+        await flipAfter(k);
+        const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: asked }) });
+        await flipAfter(1000000);
+        if (r.status === 201) {
+          expect([k, r.json.escrow.deadline]).toEqual([k, asked]); // kept whole, to the second
+          expect(await held()).toBe(before + 1);
+        } else {
+          expect([k, r.status, r.json.error]).toEqual([k, 409, "escrow_deadline_exceeds_tier_max"]);
+          expect(r.json.detail.max_ttl_sec).toBe(day);
+          expect(await held()).toBe(before); // refused: nothing held
+        }
+        direct.push(r.status);
+      }
+      for (let k = 0; k <= 6; k++) {
+        const before = await held();
+        const asked = now() + 3 * day;
+        const filed = await req("POST", "/api/escrow", { token: asker.json.token, body: body({ deadline: asked }) });
+        expect(filed.status).toBe(202);
+        await flipAfter(k);
+        const r = await req("POST", `/api/approvals/${filed.json.approval.id}`, { token: t.token, body: { decision: "approve" } });
+        await flipAfter(1000000);
+        if (r.status === 200) {
+          expect([k, r.json.status, r.json.result.escrow.deadline]).toEqual([k, "executed", asked]);
+          expect(await held()).toBe(before + 1);
+        } else {
+          expect([k, r.status, r.json.error]).toEqual([k, 409, "escrow_deadline_exceeds_tier_max"]);
+          expect(await held()).toBe(before);
+        }
+        approved.push(r.status);
+      }
+    } finally {
+      // Put the real table back whatever happened above, even a failure half-way through the swap.
+      await dbQuery("DROP VIEW IF EXISTS tenants");
+      if ((await dbQuery("SELECT to_regclass('tenants_real') IS NOT NULL AS there")).rows[0].there) await dbQuery("ALTER TABLE tenants_real RENAME TO tenants");
+      await dbQuery("DROP FUNCTION IF EXISTS tier_seen(text, text)");
+      await dbQuery("DROP TABLE IF EXISTS tier_flip");
+    }
+    // The sweep really crossed the window: early moves are refused, late ones (after the last
+    // read) open, and once K is past the last read it stays open.
+    for (const seen of [direct, approved]) {
+      expect(seen[0]).toBe(409);
+      expect(seen[6] === 201 || seen[6] === 200).toBe(true);
+      const firstOpen = seen.findIndex((x) => x !== 409);
+      expect(seen.slice(firstOpen).every((x) => x !== 409)).toBe(true);
+    }
+    // and the table is back: a new tenant can be made
+    expect((await newTenant("hold-tier-races-after", "pro")).id).toBeTruthy();
+  });
+
+  // A tier name the runtime does not know (a wrong name in the price map, say) used to answer
+  // 500 for the owner's key and file an approval that could never open for an "ask" key.
+  test("no hold opens under a tier the runtime does not know, and the owner is not asked", async () => {
+    const t = await newTenant("hold-tier-unknown", "pro");
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    await dbQuery("UPDATE tenants SET tier = 'bogus' WHERE id = $1", [t.id]);
+    for (const token of [t.token, asker.json.token]) {
+      for (const over of [{}, { ttlSec: 600 }]) {
+        const r = await req("POST", "/api/escrow", { token, body: body(over) });
+        expect([r.status, r.json.error]).toEqual([403, "unknown_tier"]);
+      }
+    }
+    expect((await req("GET", "/api/approvals", { token: t.token })).json.approvals.length).toBe(0);
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE tenant = $1 AND sub LIKE 'escrow:%'", [t.id])).rows[0].n).toBe(0);
+  });
+
   test("a lifetime that is not a number is a clean 400, not a server error", async () => {
     const t = await newTenant("ttl-odd");
     for (const ttlSec of ["abc", {}]) {

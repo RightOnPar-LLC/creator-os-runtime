@@ -4,8 +4,8 @@
 // CAPTURE (resolving held value to the payee on a verified condition) is stage 2 and lives
 // nowhere yet. See docs/specs/escrow-keystone.md.
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
-import { getGrant, recordEvent, sql } from "./db.js";
-import { addUsage, normalizeUsage, subtractUsage } from "./policy.js";
+import { getGrant, getTenant, recordEvent, sql } from "./db.js";
+import { addUsage, normalizeUsage, subtractUsage, TIERS } from "./policy.js";
 import { issueChildGrant } from "./grants.js";
 
 // Stage 1 accepts only MESH (closed-loop). A `usd` (real-money, withdrawable) capture would be
@@ -17,9 +17,13 @@ export const ESCROW_DENOMS = ["mesh"];
 export const ESCROW_CONDITION_KINDS = ["attestation:self-settle", "receipt:mesh"];
 export const ESCROW_CUSTODY_CAP = "escrow.hold";
 
+// A JSON number, or a string that reads as one. Number() alone would also read true as 1 and
+// "", false and [] as 0, so those are not numbers here.
+var numberFrom = (v) => (typeof v === "number" || (typeof v === "string" && v.trim() !== "") ? Number(v) : NaN);
+
 // Validate the open request and shape the custodian child spec + the scope.escrow block.
-// Throws HttpError on any bad input; never partially opens.
-export function buildEscrow(payerRow, params) {
+// Throws HttpError on any bad input; never partially opens. `tier` is the payer tenant's tier.
+export function buildEscrow(payerRow, params, tier) {
   let p = params && typeof params === "object" && !Array.isArray(params) ? params : {};
   // amount: MESH-denominated commit, carried in usd_cents (the model's value slot). > 0.
   let amount = Math.floor(Number(p.amount ?? p.usd_cents ?? 0));
@@ -34,18 +38,50 @@ export function buildEscrow(payerRow, params) {
   if (!ESCROW_CONDITION_KINDS.includes(kind))
     throw new HttpError(400, "escrow_condition_unknown", { kind, allowed: ESCROW_CONDITION_KINDS });
   let conditionRef = p.condition?.ref != null ? String(p.condition.ref).slice(0, 200) : null;
-  // Deadline drives the child's ttl; issueChildGrant clamps it to the tier max, so an
-  // over-long deadline is capped, never widened. Default 1h if none given.
+  // How long the hold lasts. The payer gives `deadline` (unix seconds) or `ttlSec`; with both,
+  // the deadline wins. `deadline` absent, null or the number 0 means "not given". Anything else
+  // must be a time later than now, and a `ttlSec` that is given must be a number, or the open is
+  // refused here, before a hold is opened or an approval is filed for the owner. A deadline
+  // that could not be read, or had already passed, used to fall back to the default hour and
+  // answer 201: a hold the payer never asked for.
+  // With nothing asked the hold lasts an hour. That default is not a promise: issueChildGrant
+  // still ends it at the payer key's own end and at the tier's longest lifetime, whichever
+  // comes first, and the answer carries the deadline it really got. A time that WAS asked for
+  // is never cut short: the hold ends at exactly that time or the open is refused, here and
+  // again where the end is written (holdExpiry in issueChildGrant). Times are whole seconds (a
+  // fraction is dropped). A time less than a minute away when the hold is written ends later
+  // than asked: at the minute every key gets, or at the payer key's end if that comes first.
   let now = nowSec();
-  let deadline = Math.floor(Number(p.deadline ?? 0));
-  let ttlSec = deadline > now ? deadline - now : Math.floor(Number(p.ttlSec ?? 3600));
+  let deadline = 0;
+  if (p.deadline != null && p.deadline !== 0) {
+    deadline = Math.floor(numberFrom(p.deadline));
+    if (!(Number.isFinite(deadline) && deadline > now))
+      throw new HttpError(400, "escrow_deadline_invalid", { now, hint: "unix seconds, later than now" });
+  }
+  let ttlAsked = p.ttlSec == null ? null : Math.floor(numberFrom(p.ttlSec));
+  if (ttlAsked !== null && !Number.isFinite(ttlAsked)) throw new HttpError(400, "ttl_invalid");
+  let ttlSec = deadline ? deadline - now : (ttlAsked ?? 3600);
   // A hold never outlives the key that pays for it (a child never outlives its parent). When
   // the payer ASKS for a deadline past its own key's end, refuse and say why: quietly cutting
   // it would refund the payer early and leave a later, valid delivery unpaid. A key an agent
   // was handed lives a day at most (policy.js), so a longer hold needs a longer-lived payer.
+  // Written to fail closed: if the payer key's end is not a real time still ahead of us (it
+  // cannot be read as a number, or reads as nothing), nothing opens, asked or not. With
+  // nothing asked, `asked` is 0 and passes a readable key.
   let payerExp = Number(payerRow.exp);
-  let asked = deadline > now ? deadline : p.ttlSec != null && Number.isFinite(ttlSec) ? now + ttlSec : 0;
-  if (asked > payerExp) throw new HttpError(409, "escrow_deadline_exceeds_payer_key", { payer_exp: payerExp });
+  let asked = deadline ? deadline : ttlAsked !== null ? now + ttlAsked : 0;
+  if (!(Number.isFinite(payerExp) && payerExp > now && asked <= payerExp))
+    throw new HttpError(409, "escrow_deadline_exceeds_payer_key", { payer_exp: payerExp });
+  // The tier's longest lifetime is the other limit issueChildGrant would cut a hold to, so an
+  // asked-for time past it is refused for the same reason. In practice only the owner's own key
+  // can ask for one (every other key already ends within the tier's longest lifetime), or a key
+  // that outlived a move to a smaller tier. Nothing opens under a tier that is not in TIERS,
+  // asked or not. `latest_deadline` is the latest time this key can ask for right now, both
+  // limits counted.
+  let tierMax = Number(TIERS[tier]?.maxTtlSec);
+  if (!(Number.isFinite(tierMax) && tierMax > 0)) throw new HttpError(403, "unknown_tier");
+  if (asked - now > tierMax)
+    throw new HttpError(409, "escrow_deadline_exceeds_tier_max", { max_ttl_sec: tierMax, latest_deadline: Math.min(payerExp, now + tierMax) });
   let escrowId = newId("es");
   let escrow = {
     escrow_id: escrowId,
@@ -65,15 +101,22 @@ export function buildEscrow(payerRow, params) {
     budget: { usd_cents: amount, calls: 0, deploys: 0 },
     scope: { memory: { partitions: [] } }, // custodian holds no memory; caps make scope inert anyway
   };
-  return { childSpec, escrow };
+  // `until` is the time the payer asked for (0 when nothing was asked). openEscrow hands it to
+  // issueChildGrant, which ends the hold at exactly that time.
+  return { childSpec, escrow, until: asked };
 }
 
 // Open = issue the custodian child. The reserve inside issueChildGrant IS the hold: the payer's
 // remaining drops by `amount` and it can no longer spend that value elsewhere. Returns the same
 // {row, token} shape as issueChildGrant.
 export async function openEscrow(payerRow, params, issuedBy) {
-  let { childSpec, escrow } = buildEscrow(payerRow, params);
-  return issueChildGrant(payerRow, childSpec, issuedBy, { escrow });
+  // The tier is read here, not passed in, so the approvals path is checked against the tier
+  // the tenant is on when the owner approves. issueChildGrant reads the tenant once more and
+  // has the last word (heldUntil): if the tier moved between the two reads, it refuses.
+  let tenant = await getTenant(payerRow.tenant);
+  if (!tenant) throw new HttpError(403, "tenant_missing");
+  let { childSpec, escrow, until } = buildEscrow(payerRow, params, tenant.tier);
+  return issueChildGrant(payerRow, childSpec, issuedBy, { escrow, heldUntil: until });
 }
 
 // A grant is an escrow iff it carries scope.escrow. Stage-1 state is derived from the grant's
