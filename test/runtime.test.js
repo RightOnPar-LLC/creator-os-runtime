@@ -3632,8 +3632,10 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
     const beingRevoked = (...ids) => `OLD.id IN (${ids.map((id) => `'${id}'`).join(", ")}) AND OLD.status = 'active' AND NEW.status = 'revoked'`;
     const refuse = "RAISE EXCEPTION 'test: % cannot be cancelled right now', OLD.id; RETURN NEW;";
     const refused = (id) => `test: ${id} cannot be cancelled right now`;
-    // what the runtime wrote down about each pass over one client, oldest first
-    const noted = async (client) => JSON.parse(JSON.stringify((await dbQuery("SELECT data FROM events WHERE type = 'oauth.refresh_reuse_detected' AND data->>'client' = $1 ORDER BY id", [client])).rows.map((x) => x.data)));
+    // What the runtime wrote down about each pass over one client, oldest first, each with the tenant it is filed under.
+    const noted = async (client) =>
+      JSON.parse(JSON.stringify((await dbQuery("SELECT tenant, data FROM events WHERE type = 'oauth.refresh_reuse_detected' AND data->>'client' = $1 ORDER BY id", [client])).rows.map((x) => ({ tenant: x.tenant, ...x.data }))));
+    const rec = (c, grants, cancelled, failed, tenant = c.root.id) => ({ tenant, client: c.client, grants, cancelled, failed });
     const unmarked = async (client) => (await dbQuery("SELECT count(*)::int AS n FROM oauth_refresh WHERE client_id = $1 AND revoked = false", [client])).rows[0].n;
     // what the runtime logs while `fn` runs
     const logOf = async (fn) => {
@@ -3645,7 +3647,7 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
         console.error = original;
       }
     };
-    const leftLine = (left, of, first) => `[oauth] refresh token reuse: ${left.length} of ${of} grants NOT cancelled: ${left.join(", ")}; the first failure: ${refused(first)}`;
+    const leftLine = (left, of, words) => `[oauth] refresh token reuse: ${left.length} of ${of} grants NOT cancelled: ${left.join(", ")}; the first failure: ${words}`;
     // the owner approves `client` for a tenant and the client exchanges the code: one grant, one refresh token
     const approve = async (client, redirect, tenantId, tag) => {
       const verifier = `${tag}-verifier-` + "r".repeat(40);
@@ -3654,32 +3656,39 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
       expect(tok.status).toBe(200);
       return tok.json;
     };
-    // A client that refreshes have moved through `n` grants in a row: each grant but the last was within an hour
-    // of running out when its token was refreshed (it still has ten minutes), so the refresh issued a NEW grant
-    // and all `n` are live. tokens[i] is the refresh token that came with grants[i]; all but the last are spent.
-    const chain = async (name, n = 2, { tenant, redirect = devdesk } = {}) => {
+    // A new client with one grant. tokens[i] is the refresh token that came with grants[i], access[i] its key.
+    // move(): the newest grant is put within an hour of running out (it keeps ten minutes), so the next refresh
+    // issues a NEW grant and both stay live; the refresh token that was exchanged for it is spent.
+    const start = async (name, { tenant, redirect = devdesk } = {}) => {
       const root = tenant || (await newTenant(name, "studio"));
       const client = (await req("POST", "/oauth/register", { body: { client_name: name, redirect_uris: [redirect] } })).json.client_id;
-      const refresh = (t) => req("POST", "/oauth/token", { body: { grant_type: "refresh_token", refresh_token: t, client_id: client } });
-      let tok = await approve(client, redirect, root.id, name);
-      const tokens = [tok.refresh_token], access = [tok.access_token], grants = [await idOf(tok.access_token)];
-      for (let i = 1; i < n; i++) {
-        await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [Math.floor(Date.now() / 1000) + 600, grants[i - 1]]);
-        const next = await refresh(tokens[i - 1]);
+      const c = { root, client, redirect, tokens: [], access: [], grants: [] };
+      const take = async (tok) => (c.tokens.push(tok.refresh_token), c.access.push(tok.access_token), c.grants.push(await idOf(tok.access_token)));
+      c.refresh = (t) => req("POST", "/oauth/token", { body: { grant_type: "refresh_token", refresh_token: t, client_id: client } });
+      c.move = async () => {
+        await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [Math.floor(Date.now() / 1000) + 600, c.grants.at(-1)]);
+        const next = await c.refresh(c.tokens.at(-1));
         expect(next.status).toBe(200);
-        tok = next.json;
-        tokens.push(tok.refresh_token), access.push(tok.access_token), grants.push(await idOf(tok.access_token));
-      }
-      expect(new Set(grants).size).toBe(n);
-      for (const g of grants) expect(await statusOf(g)).toBe("active");
-      expect(await unmarked(client)).toBe(1);
-      return { root, client, redirect, refresh, tokens, access, grants };
+        await take(next.json);
+      };
+      await take(await approve(client, redirect, root.id, name));
+      return c;
+    };
+    // a client that refreshes have moved through `n` grants in a row, all of them live; all but the last token spent
+    const chain = async (name, n = 2, opts) => {
+      const c = await start(name, opts);
+      for (let i = 1; i < n; i++) await c.move();
+      expect(new Set(c.grants).size).toBe(n);
+      for (const g of c.grants) expect(await statusOf(g)).toBe("active");
+      expect(await unmarked(c.client)).toBe(1);
+      return c;
     };
     const reused = (r) => {
       expect(r.status).toBe(400);
       expect(r.json).toEqual({ error: "invalid_grant", error_description: "refresh token reused; grant revoked" });
     };
-    // the request failed, and its answer says nothing more than that
+    // The request failed, and its answer says nothing more than that. (A database error's own DETAIL would come
+    // through in `detail`: core.js does that for every route, and these failures carry none.)
     const failedAs = (r) => {
       expect(r.status).toBe(500);
       expect(r.json).toEqual({ error: "internal_error", detail: null });
@@ -3696,13 +3705,13 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
       failedAs(one.r.r);
       expect(one.r.tries).toBe(1); // an ordinary failure is not tried again
       expect(await unmarked(a.client)).toBe(0); // and no refresh token of this client is good for anything now
-      const first = { client: a.client, grants: [aOld, aNow], cancelled: [aNow], failed: [aOld] };
+      const first = rec(a, [aOld, aNow], [aNow], [aOld]);
       expect(await noted(a.client)).toEqual([first]);
-      expect(one.lines).toContain(leftLine([aOld], 2, aOld)); // why it failed is in the log, not in the record
+      expect(one.lines).toContain(leftLine([aOld], 2, refused(aOld))); // why it failed is in the log, not in the record
       //    used again with nothing in the way: the one that was left goes, and nothing else is gone over again
       reused(await a.refresh(a.tokens[0]));
       expect(await statusOf(aOld)).toBe("revoked");
-      expect(await noted(a.client)).toEqual([first, { client: a.client, grants: [aOld], cancelled: [aOld], failed: [] }]);
+      expect(await noted(a.client)).toEqual([first, rec(a, [aOld], [aOld], [])]);
 
       // 2. the SECOND grant's cancel fails: the grant the client was moved onto. It is not the spent token's own
       //    grant and every refresh row of the client is marked by now, so only a pass that does not go by the mark
@@ -3714,32 +3723,50 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
       expect(await statusOf(bNow)).toBe("active");
       expect(await works(b.access[1])).toBe(200); // what a pass that failed leaves behind: a key that still works
       expect(await unmarked(b.client)).toBe(0);
-      const second = { client: b.client, grants: [bOld, bNow], cancelled: [bOld], failed: [bNow] };
+      const second = rec(b, [bOld, bNow], [bOld], [bNow]);
       expect(await noted(b.client)).toEqual([second]);
-      expect(two.lines).toContain(leftLine([bNow], 2, bNow));
+      expect(two.lines).toContain(leftLine([bNow], 2, refused(bNow)));
       reused(await b.refresh(b.tokens[0]));
       expect(await statusOf(bNow)).toBe("revoked");
       expect(await works(b.access[1])).toBe(401);
-      expect(await noted(b.client)).toEqual([second, { client: b.client, grants: [bOld, bNow], cancelled: [bNow], failed: [] }]);
+      expect(await noted(b.client)).toEqual([second, rec(b, [bOld, bNow], [bNow], [])]);
       //    and the refresh token the client held gets nothing either
       reused(await b.refresh(b.tokens[1]));
 
-      // 3. BOTH fail: both were tried, the record and the log name both in the order they were tried, and the
-      //    failure the request ends with is the FIRST one
+      // 3. BOTH fail, with a great many words: both were tried, the record and the log name both in the order they
+      //    were tried, the log carries the first 200 characters of the first failure's words, and the failure the
+      //    request ends with is the FIRST one
       const d = await chain("reuse-both"), [dOld, dNow] = d.grants;
-      const both = await logOf(() => at("t18c_reuse_both", "grants", "BEFORE UPDATE", beingRevoked(dOld, dNow), refuse, () => d.refresh(d.tokens[0])));
+      const atLength = "RAISE EXCEPTION 'test: % cannot be cancelled right now%', OLD.id, repeat(' and so on', 40); RETURN NEW;";
+      const both = await logOf(() => at("t18c_reuse_both", "grants", "BEFORE UPDATE", beingRevoked(dOld, dNow), atLength, () => d.refresh(d.tokens[0])));
       failedAs(both.r);
       expect([await statusOf(dOld), await statusOf(dNow)]).toEqual(["active", "active"]);
-      const third = { client: d.client, grants: [dOld, dNow], cancelled: [], failed: [dOld, dNow] };
+      const third = rec(d, [dOld, dNow], [], [dOld, dNow]);
       expect(await noted(d.client)).toEqual([third]);
-      expect(both.lines).toContain(leftLine([dOld, dNow], 2, dOld));
+      const words = (refused(dOld) + " and so on".repeat(40)).slice(0, 200);
+      expect(words.length).toBe(200);
+      expect(both.lines).toContain(leftLine([dOld, dNow], 2, words));
       const thrown = both.lines.filter((l) => l.startsWith("ERR POST "));
       expect(thrown.length).toBe(1);
       expect(thrown[0]).toContain(refused(dOld));
       expect(thrown[0]).not.toContain(dNow);
       reused(await d.refresh(d.tokens[0]));
       expect([await statusOf(dOld), await statusOf(dNow)]).toEqual(["revoked", "revoked"]);
-      expect(await noted(d.client)).toEqual([third, { client: d.client, grants: [dOld, dNow], cancelled: [dOld, dNow], failed: [] }]);
+      expect(await noted(d.client)).toEqual([third, rec(d, [dOld, dNow], [dOld, dNow], [])]);
+
+      // 4. a lost lock wait is tried again inside the cancel (grants.js): lost three times, the grant is left like
+      //    any other; lost once, the pass goes through
+      const e = await chain("reuse-lock"), [eOld, eNow] = e.grants;
+      const lost = await logOf(() => losesTheWait("t18c_reuse_lock", eNow, "revoked", 1000, () => e.refresh(e.tokens[0])));
+      failedAs(lost.r.r);
+      expect(lost.r.tries).toBe(3);
+      expect([await statusOf(eOld), await statusOf(eNow)]).toEqual(["revoked", "active"]);
+      expect(lost.lines).toContain(leftLine([eNow], 2, "deadlock detected"));
+      const once = await losesTheWait("t18c_reuse_lock_once", eNow, "revoked", 1, () => e.refresh(e.tokens[0]));
+      reused(once.r);
+      expect(once.tries).toBe(2);
+      expect(await statusOf(eNow)).toBe("revoked");
+      expect(await noted(e.client)).toEqual([rec(e, [eOld, eNow], [eOld], [eNow]), rec(e, [eOld, eNow], [eNow], [])]);
     });
 
     test("it takes every grant the client still has, in every tenant: one it was moved off earlier, and what is under a grant that had already ended; and nothing of any other client", async () => {
@@ -3761,37 +3788,55 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
       expect([await statusOf(g1), await statusOf(g2), await statusOf(g3)]).toEqual(["revoked", "revoked", "revoked"]);
       expect(await works(c.access[2])).toBe(401);
       await untouched();
-      const [rec, ...more] = await noted(c.client);
+      const [only, ...more] = await noted(c.client);
       expect(more).toEqual([]);
-      expect(rec.grants[0]).toBe(g2); // the spent token's own grant first
-      expect({ ...rec, grants: [...rec.grants].sort(), cancelled: [...rec.cancelled].sort() }).toEqual({ client: c.client, grants: [...c.grants].sort(), cancelled: [...c.grants].sort(), failed: [] });
+      expect(only.grants[0]).toBe(g2); // the spent token's own grant first
+      expect({ ...only, grants: [...only.grants].sort(), cancelled: [...only.cancelled].sort() }).toEqual(rec(c, [...c.grants].sort(), [...c.grants].sort(), []));
 
       // 2. A grant that had ENDED before the pass, with a key under it that is still active (written by hand: the
-      //    sweep ends a grant only when nothing under it is). The row that points at it is unmarked, so the pass
-      //    goes after it whatever its status, and a cancel looks under a grant it does not move. The record names
-      //    the grants this pass ended and nothing under them.
-      const o = await chain("reuse-ended", 2, { redirect: operator }), [oOld, oNow] = o.grants;
-      const helper = await issue(o.access[1], "agent:helper", 1, ["grant.read"]);
-      expect(helper.status).toBe(201);
-      await dbQuery("UPDATE grants SET status = 'expired' WHERE id = $1", [oNow]);
-      reused(await o.refresh(o.tokens[0]));
-      expect(await statusOf(helper.json.id)).toBe("revoked");
-      expect(await statusOf(oNow)).toBe("expired");
-      expect(await noted(o.client)).toEqual([{ client: o.client, grants: [oOld, oNow], cancelled: [oOld], failed: [] }]);
+      //    sweep ends a grant only when nothing under it is, and a cancel takes all under it). The pass goes after
+      //    the grant of a row it marks whatever that grant's status, and a cancel looks under a grant it does not
+      //    move. The record names the grants this pass ended and nothing under them.
+      for (const status of ["expired", "revoked"]) {
+        const o = await chain(`reuse-ended-${status}`, 2, { redirect: operator }), [oOld, oNow] = o.grants;
+        const helper = await issue(o.access[1], "agent:helper", 1, ["grant.read"]);
+        expect(helper.status).toBe(201);
+        await dbQuery("UPDATE grants SET status = $2 WHERE id = $1", [oNow, status]);
+        reused(await o.refresh(o.tokens[0]));
+        expect(await statusOf(helper.json.id)).toBe("revoked");
+        expect(await statusOf(oNow)).toBe(status);
+        expect(await noted(o.client)).toEqual([rec(o, [oOld, oNow], [oOld], [])]);
+      }
+      //    The same when the grant that had ended is the spent token's OWN: no unmarked row points at it and it is
+      //    not active, so it is gone after only because the spent token's own grant always is.
+      const p = await start("reuse-own-ended", { redirect: operator });
+      const under = await issue(p.access[0], "agent:helper", 1, ["grant.read"]);
+      expect(under.status).toBe(201);
+      await p.move();
+      const [pOld, pNow] = p.grants;
+      await dbQuery("UPDATE grants SET status = 'expired' WHERE id = $1", [pOld]);
+      reused(await p.refresh(p.tokens[0]));
+      expect(await statusOf(under.json.id)).toBe("revoked");
+      expect(await noted(p.client)).toEqual([rec(p, [pOld, pNow], [pNow], [])]);
 
-      // 3. A client the owner approved for TWO tenants. Used again in one, it loses its grants in both (so before
-      //    2026-10-09 as well). Here the pass fails on the other tenant's grant; the same token used again takes it.
-      //    (The one record, filed under the first tenant, names the other tenant's grant too, as it always did.
-      //    Nothing here says that it should.)
-      const x = await chain("reuse-two-tenants", 1), [xA] = x.grants;
+      // 3. A client the owner approved for TWO tenants. Used again in one, it loses its grants and its refresh rows
+      //    in both (so before 2026-10-09 as well). Here the pass fails on the other tenant's grant, and the same
+      //    token used again takes it. Each tenant gets its own record, naming its own grants only.
+      const x = await start("reuse-two-tenants"), [xA] = x.grants;
       const elsewhere = await newTenant("reuse-two-tenants-b", "studio");
       expect((await x.refresh(x.tokens[0])).status).toBe(200); // the first token is spent; the same grant is signed again
-      const xB = await idOf((await approve(x.client, x.redirect, elsewhere.id, "reuse-two-tenants-b")).access_token);
+      const there = await approve(x.client, x.redirect, elsewhere.id, "reuse-two-tenants-b");
+      const xB = await idOf(there.access_token);
       expect(await unmarked(x.client)).toBe(2);
       failedAs((await logOf(() => losesTheWait("t18c_reuse_elsewhere", xB, "revoked", 1000, () => x.refresh(x.tokens[0]), refuse))).r.r);
       expect([await statusOf(xA), await statusOf(xB)]).toEqual(["revoked", "active"]);
+      expect(await unmarked(x.client)).toBe(0); // the row in the other tenant is marked too: its token refreshes nothing
+      const firstPass = [rec(x, [xA], [xA], []), rec(x, [xB], [], [xB], elsewhere.id)];
+      expect(await noted(x.client)).toEqual(firstPass);
       reused(await x.refresh(x.tokens[0]));
       expect(await statusOf(xB)).toBe("revoked");
+      expect(await noted(x.client)).toEqual([...firstPass, rec(x, [xA], [], []), rec(x, [xB], [xB], [], elsewhere.id)]);
+      reused(await x.refresh(there.refresh_token));
 
       // and after all of that the two bystanders are as they were, and their own refresh tokens still work
       await untouched();
@@ -3800,7 +3845,21 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
 
     test("when the record cannot be written: the request fails, the grants are cancelled all the same, and the log still says which were left", async () => {
       const noRecord = (name, fn) => at(name, "events", "BEFORE INSERT", "NEW.type = 'oauth.refresh_reuse_detected'", "RAISE EXCEPTION 'test: the record cannot be written'; RETURN NEW;", fn);
-      // 1. every cancel goes through, the record does not: the answer is not "grant revoked"
+      // 1. a cancel fails AND the record cannot be written: the other grant is cancelled, the log says which one was
+      //    left, and the failure the request ends with is still the first one, the cancel's
+      const b = await chain("reuse-no-record-left"), [bOld, bNow] = b.grants;
+      const two = await logOf(() => noRecord("t18c_reuse_no_record_left", () => losesTheWait("t18c_reuse_no_record_cancel", bOld, "revoked", 1000, () => b.refresh(b.tokens[0]), refuse)));
+      expect([await statusOf(bOld), await statusOf(bNow)]).toEqual(["active", "revoked"]);
+      failedAs(two.r.r);
+      expect(await noted(b.client)).toEqual([]);
+      expect(two.lines).toContain(leftLine([bOld], 2, refused(bOld)));
+      const thrown = two.lines.filter((l) => l.startsWith("ERR POST "));
+      expect(thrown.length).toBe(1);
+      expect(thrown[0]).toContain(refused(bOld));
+      expect(thrown[0]).not.toContain("test: the record cannot be written");
+      reused(await b.refresh(b.tokens[0]));
+      expect(await statusOf(bOld)).toBe("revoked");
+      // 2. every cancel goes through, the record does not: the answer is not "grant revoked"
       const a = await chain("reuse-no-record"), [aOld, aNow] = a.grants;
       const one = await logOf(() => noRecord("t18c_reuse_no_record", () => a.refresh(a.tokens[0])));
       failedAs(one.r);
@@ -3808,21 +3867,39 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
       expect(await noted(a.client)).toEqual([]);
       expect(one.lines.filter((l) => l.startsWith("ERR POST "))[0]).toContain("test: the record cannot be written");
       reused(await a.refresh(a.tokens[0]));
-      expect(await noted(a.client)).toEqual([{ client: a.client, grants: [aOld], cancelled: [], failed: [] }]);
-      // 2. a cancel fails AND the record cannot be written: the log line was written before the record was tried,
-      //    and the failure the request ends with is still the first one, the cancel's
-      const b = await chain("reuse-no-record-left"), [bOld, bNow] = b.grants;
-      const two = await logOf(() => noRecord("t18c_reuse_no_record_left", () => losesTheWait("t18c_reuse_no_record_cancel", bOld, "revoked", 1000, () => b.refresh(b.tokens[0]), refuse)));
-      failedAs(two.r.r);
-      expect([await statusOf(bOld), await statusOf(bNow)]).toEqual(["active", "revoked"]);
-      expect(await noted(b.client)).toEqual([]);
-      expect(two.lines).toContain(leftLine([bOld], 2, bOld));
-      const thrown = two.lines.filter((l) => l.startsWith("ERR POST "));
-      expect(thrown.length).toBe(1);
-      expect(thrown[0]).toContain(refused(bOld));
-      expect(thrown[0]).not.toContain("test: the record cannot be written");
-      reused(await b.refresh(b.tokens[0]));
-      expect(await statusOf(bOld)).toBe("revoked");
+      expect(await noted(a.client)).toEqual([rec(a, [aOld], [], [])]);
+    });
+
+    test("the rows are marked and the grants listed by ONE statement: nothing on this path reads the refresh rows again once they are marked", async () => {
+      // Were the list a statement of its own it could fail after the rows were marked: nothing cancelled, nothing
+      // written down, and the rows marked all the same. Here every later statement that reads oauth_refresh WOULD
+      // fail: at the mark, a trigger puts an empty table of that name in front of the real one (the session's
+      // search path) until the request is over. The pass goes through because it has no such statement.
+      const a = await chain("reuse-one-statement"), [aOld, aNow] = a.grants;
+      const path = (await dbQuery("SHOW search_path")).rows[0].search_path;
+      const back = () => dbQuery("SELECT set_config('search_path', $1, false)", [path]);
+      await dbQuery("CREATE SCHEMA IF NOT EXISTS t18c_out_of_sight");
+      await dbQuery("CREATE TABLE IF NOT EXISTS t18c_out_of_sight.oauth_refresh (nothing INT)");
+      let r, hidden;
+      try {
+        r = await at("t18c_reuse_one_statement", "oauth_refresh", "AFTER UPDATE", `NEW.client_id = '${a.client}' AND NEW.revoked AND NOT OLD.revoked`,
+          "PERFORM set_config('search_path', 't18c_out_of_sight, public', false); RETURN NEW;",
+          async () => {
+            try {
+              return await a.refresh(a.tokens[0]);
+            } finally {
+              hidden = (await dbQuery("SHOW search_path")).rows[0].search_path;
+              await back(); // before `at` drops its trigger, which it finds by the table's name
+            }
+          });
+      } finally {
+        await back();
+        await dbQuery("DROP SCHEMA IF EXISTS t18c_out_of_sight CASCADE");
+      }
+      expect(hidden).toBe("t18c_out_of_sight, public"); // the trigger did fire: the real table was out of sight
+      reused(r);
+      expect([await statusOf(aOld), await statusOf(aNow)]).toEqual(["revoked", "revoked"]);
+      expect(await unmarked(a.client)).toBe(0);
     });
   });
 

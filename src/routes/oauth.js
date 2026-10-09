@@ -156,23 +156,30 @@ app.post("/oauth/token", async (e) => {
       // rotation may have moved this client onto a NEW child grant (when the
       // old one was near expiry) rather than reissuing the same one.
       //
-      // ONE statement marks the client's rows and lists the grants to go after: it does both or neither. The list
-      // is the grants of the rows marked just now (whatever their status, as before) AND every grant that any
-      // refresh row of this client points at and that is still active. Once the rows are marked the mark cannot
-      // find a grant again, so without the second part a pass that marked the rows and then failed to cancel one
-      // of their grants left that grant to nobody: until 2026-10-09 the same token used again went after its own
-      // grant only. The second part also takes every grant the client was moved OFF that has not ended (on a
-      // tenant whose keys live an hour: one for each refresh of the last hour).
+      // ONE statement marks the client's rows and lists the grants to go after: it does both or neither, and
+      // nothing after it on this path reads the refresh rows again. The list has two parts. First, the grants of
+      // the rows marked just now, whatever their status (as before): a cancel looks under a grant it does not
+      // move. Second, every grant that any refresh row of this client points at and that is still ACTIVE. Once the
+      // rows are marked the mark cannot find a grant again, so without the second part a pass that marked the rows
+      // and then failed to cancel one of their grants left that grant to nobody: until 2026-10-09 the same token
+      // used again went after its own grant only. The second part also takes every grant the client was moved OFF
+      // that has not ended (on a tenant whose keys live an hour: one for each refresh of the last hour).
+      // What the second part does NOT find again: a key that a failed pass left under a grant that had itself
+      // ended before. Only the token whose own grant that is reaches it. Such a key is refused at the door
+      // (grants.js, endedAbove).
       //
       // NOT COVERED, before this change or after it: a refresh of this client's CURRENT token that is under way
-      // while this pass runs. It marked its own row before this statement looked. If it then signs the SAME grant
-      // again, that grant is in the list here (still active) and is cancelled, and the row it writes leads
-      // nowhere. If it issues a NEW grant, that grant and its row are written after this statement looked: both
-      // stay good, and this pass answers "grant revoked".
-      let found = await sql`WITH marked AS (UPDATE oauth_refresh SET revoked = true WHERE client_id = ${existing.client_id} AND revoked = false RETURNING grant_id)
-          SELECT grant_id FROM marked
-          UNION SELECT r.grant_id FROM oauth_refresh r JOIN grants g ON g.id = r.grant_id WHERE r.client_id = ${existing.client_id} AND g.status = 'active'`,
-        ids = [...new Set([existing.grant_id, ...found.map((r) => r.grant_id)])],
+      // while this pass runs. It marked its own row before this statement looked, and it writes its new row last.
+      // If it signs the SAME grant again, that grant is in the list here (still active) and is cancelled, and the
+      // row it then writes leads nowhere. If it issues a NEW grant, no row points at that grant when this
+      // statement looks: the grant and its row stay good, and this pass answers "grant revoked".
+      let found = await sql`WITH marked AS (UPDATE oauth_refresh SET revoked = true WHERE client_id = ${existing.client_id} AND revoked = false RETURNING grant_id, tenant)
+          SELECT grant_id, tenant FROM marked
+          UNION SELECT r.grant_id, r.tenant FROM oauth_refresh r JOIN grants g ON g.id = r.grant_id WHERE r.client_id = ${existing.client_id} AND g.status = 'active'`,
+        // Which tenant each grant is in. A client can have been approved for more than one tenant, and it loses
+        // its grants in all of them (as before). The spent token's own grant comes first, listed or not.
+        tenantOf = new Map([[existing.grant_id, existing.tenant], ...found.map((r) => [r.grant_id, r.tenant])]),
+        ids = [...tenantOf.keys()],
         cancelled = [],
         failed = [],
         errors = [];
@@ -187,33 +194,39 @@ app.post("/oauth/token", async (e) => {
           failed.push(id);
         }
       }
-      // Which grants were left, and why the first one was, goes to the log: the record must not carry the reason
-      // (see below), and the record is one more thing that can fail.
+      // Which grants were left, and why the first one was, goes to the log: a record must not carry the reason
+      // (see below), and a record is one more thing that can fail.
       if (failed.length) console.error(`[oauth] refresh token reuse: ${failed.length} of ${ids.length} grants NOT cancelled: ${failed.join(", ")}; the first failure: ${String(errors[0]?.message || errors[0]).slice(0, 200)}`);
+      // One record for each tenant the client has grants in, filed under that tenant and naming that tenant's
+      // grants only, because a tenant's own keys can read its records (GET /api/events). (Until 2026-10-09 there
+      // was one record, under the spent token's tenant, naming the grants in every tenant.) For the same reason a
+      // record carries ids of the grants gone after and nothing else: not the database's words for a failure, and
+      // not the keys ended UNDER a grant, which are in that cancel's own grant.revoked record.
       // grants: what this pass went after. cancelled: those it ended. failed: those whose cancel threw. Such a
       // grant and all under it are untouched (the cancel's transaction was undone), except when the cancel had
       // finished and only its own grant.revoked record failed: then it is listed here although it has ended. A
       // grant in neither list was not this pass's to end: it had ended already, or somebody else ended it meanwhile.
-      // Ids of `grants` only. A tenant's own keys can read this record (GET /api/events), so it carries neither
-      // the database's words for a failure nor the keys ended UNDER a grant: those are in that cancel's own
-      // grant.revoked record, which is filed under the tenant the grant belongs to.
-      try {
-        await recordEvent(
-          "oauth.refresh_reuse_detected",
-          {
-            client: existing.client_id,
-            grants: ids,
-            cancelled,
-            failed,
-          },
-          existing.tenant,
-          "oauth",
-        );
-      } catch (err) {
-        errors.push(err);
+      for (let tenant of new Set(tenantOf.values())) {
+        let own = (list) => list.filter((id) => tenantOf.get(id) === tenant);
+        try {
+          await recordEvent(
+            "oauth.refresh_reuse_detected",
+            {
+              client: existing.client_id,
+              grants: own(ids),
+              cancelled: own(cancelled),
+              failed: own(failed),
+            },
+            tenant,
+            "oauth",
+          );
+        } catch (err) {
+          errors.push(err);
+        }
       }
-      // A pass that left a grant, or could not write its record, does not answer "grant revoked". The caller gets
-      // the first failure (a 500, and no token either way); the same token used again goes after what was left.
+      // A pass that left a grant, or could not write a record, does not answer "grant revoked". The caller gets
+      // the first failure (a 500, and no token either way). The same token used again goes after every grant of
+      // the client that is still active then.
       if (errors.length) throw errors[0];
       return oauthError(e, "invalid_grant", "refresh token reused; grant revoked");
     }
