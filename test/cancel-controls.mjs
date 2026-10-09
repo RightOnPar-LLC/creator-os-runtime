@@ -2,6 +2,8 @@
 // Do the cancel tests (section 18c of runtime.test.js) really test anything? For each rule that the 2026-10-09
 // change put into src/grants.js (and one line each of three files under src/routes) this takes the rule OUT of the source, runs those tests, and expects them to
 // FAIL. A rule whose removal nothing notices is a rule with no test. Same method as tours-controls.mjs.
+// The last eight are the rules of a refresh token used twice (src/routes/oauth.js): every grant of that client is
+// tried even when one cancel fails, the request then fails, and the same token used again takes what was left.
 //
 //   node test/cancel-controls.mjs        (from the repo root; about a minute)
 //
@@ -112,6 +114,39 @@ const BREAKS = [
     "src/routes/oauth.js",
     " && Number(n.exp) - nowSec() > 3600 && !(await endedAbove(sql, n.id))",
     " && Number(n.exp) - nowSec() > 3600"],
+  // A refresh token used twice (src/routes/oauth.js): every grant of that client is cancelled, also when one cancel fails.
+  ["a refresh token used twice: the first cancel that fails ends the pass, and the grants after it stay live",
+    "src/routes/oauth.js",
+    "          errors.push(err);\n          failed.push({ id, error: String(err?.message || err).slice(0, 200) });\n",
+    "          throw err;\n"],
+  ["a refresh token used twice: a pass that left a grant answers as if every grant had been cancelled",
+    "src/routes/oauth.js",
+    "      if (errors.length) throw errors[0];\n",
+    ""],
+  ["a refresh token used twice: the request ends with the last failure, not the first",
+    "src/routes/oauth.js",
+    "      if (errors.length) throw errors[0];\n",
+    "      if (errors.length) throw errors[errors.length - 1];\n"],
+  ["a refresh token used again does not find a grant an earlier pass left (it goes by the mark on the refresh rows)",
+    "src/routes/oauth.js",
+    ", ...left.map((r) => r.grant_id)])],",
+    "])],"],
+  ["a refresh token used again goes over every grant the client ever had, ended ones too",
+    "src/routes/oauth.js",
+    "WHERE r.client_id = ${existing.client_id} AND g.status = 'active'`,",
+    "WHERE r.client_id = ${existing.client_id}`,"],
+  ["a refresh token used twice: the record does not say which grants were left",
+    "src/routes/oauth.js",
+    "          cancelled,\n          failed,\n",
+    "          cancelled,\n          failed: [],\n"],
+  ["a refresh token used twice: the record does not say which grants were cancelled",
+    "src/routes/oauth.js",
+    "          cancelled,\n          failed,\n",
+    "          cancelled: [],\n          failed,\n"],
+  ["a refresh token used twice: the log does not say that a grant was left",
+    "src/routes/oauth.js",
+    "      if (failed.length) console.error(`[oauth] refresh token reuse: ",
+    "      if (0) console.error(`[oauth] refresh token reuse: "],
 ];
 
 const once = () => spawnSync(bun, ["test", "runtime.test.js", "-t", "18c\\. a cancel"], { cwd: here, env: { ...process.env, RUNTIME_ENTRY: "" }, encoding: "utf8", timeout: 300000 });

@@ -73,7 +73,7 @@ cd test && npm ci && cd ..
 node test/run.mjs                 # suite against src/index.js
 node tools/build.mjs && node test/run.mjs dist   # the same suite against the bundle
 node test/run.mjs tools/rebuild/runtime.js       # the same suite against the unsplit original
-node test/cancel-controls.mjs     # takes each rule of the cancel (grants.js) out in turn; section 18c must notice
+node test/cancel-controls.mjs     # takes each rule of the cancel (grants.js; a refresh token used twice, routes/oauth.js) out in turn; section 18c must notice
 ```
 
 The suite boots the runtime on 127.0.0.1 against a throwaway PGlite database (served

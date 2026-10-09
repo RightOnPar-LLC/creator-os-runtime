@@ -156,17 +156,48 @@ app.post("/oauth/token", async (e) => {
       // rotation may have moved this client onto a NEW child grant (when the
       // old one was near expiry) rather than reissuing the same one.
       let live = await sql`UPDATE oauth_refresh SET revoked = true WHERE client_id = ${existing.client_id} AND revoked = false RETURNING grant_id`,
-        ids = [...new Set([existing.grant_id, ...live.map((r) => r.grant_id)])];
-      for (let id of ids) await revokeGrantTree(id, "refresh_token_reuse_detected", "oauth");
+        // From here on the rows are marked, whatever happens below. So the mark cannot be what finds the grants: a
+        // pass that marked the rows and then failed to cancel one of their grants would leave that grant to nobody
+        // (until 2026-10-09 the same token used again went after its own grant only). The second list does not go
+        // by the mark: every grant that any refresh row of this client points at and that is still active. It also
+        // takes a grant the client was moved off that has not run out yet.
+        left = await sql`SELECT DISTINCT r.grant_id FROM oauth_refresh r JOIN grants g ON g.id = r.grant_id
+          WHERE r.client_id = ${existing.client_id} AND g.status = 'active'`,
+        ids = [...new Set([existing.grant_id, ...live.map((r) => r.grant_id), ...left.map((r) => r.grant_id)])],
+        cancelled = [],
+        failed = [],
+        errors = [];
+      // EVERY grant is tried. Each cancel is its own transaction, so one that fails says nothing about the next.
+      // Until 2026-10-09 the first failure ended the pass and the grants after it stayed live: typically the NEW
+      // grant the real client had been moved onto.
+      for (let id of ids) {
+        try {
+          cancelled.push(...(await revokeGrantTree(id, "refresh_token_reuse_detected", "oauth")));
+        } catch (err) {
+          errors.push(err);
+          failed.push({ id, error: String(err?.message || err).slice(0, 200) });
+        }
+      }
+      // Said here as well, before the record is written: the record is one more thing that can fail.
+      if (failed.length) console.error(`[oauth] refresh token reuse: ${failed.length} of ${ids.length} grants NOT cancelled; the first: ${failed[0].id} (${failed[0].error})`);
+      // grants: what this pass went after. cancelled: what it ended (those and the keys under them). failed: the
+      // grants whose cancel threw, and why. Such a grant and all under it are untouched (the cancel's transaction
+      // was undone), except when the cancel had finished and only its own grant.revoked record failed: then it is
+      // listed here although it has ended. A grant in `grants` and in neither list had ended before this pass.
       await recordEvent(
         "oauth.refresh_reuse_detected",
         {
           client: existing.client_id,
           grants: ids,
+          cancelled,
+          failed,
         },
         existing.tenant,
         "oauth",
       );
+      // A pass that left a grant does not answer "grant revoked". The caller gets the first failure (a 500, and no
+      // token either way); the same token used again goes after what was left.
+      if (errors.length) throw errors[0];
       return oauthError(e, "invalid_grant", "refresh token reused; grant revoked");
     }
     let a = (

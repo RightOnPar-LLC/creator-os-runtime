@@ -3621,6 +3621,135 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
     expect(second.text).not.toContain("cog1.");
   });
 
+  test("a refresh token used twice: one cancel that fails does not save the client's other grants; the request fails and the record says which were left; used again, it takes those too", async () => {
+    // A refresh token works once. Seen a second time it was stolen, and every grant of that client is cancelled
+    // (routes/oauth.js). Each cancel is its own transaction, so one can fail while the others go through. Until
+    // 2026-10-09 the first failure ended the pass, so the grants after it stayed live; and because the client's
+    // refresh rows were marked by then, the same token used again went after its own grant only.
+    const redirect = "https://devdesk.meshtool.ai/runtime/callback";
+    const soon = Math.floor(Date.now() / 1000) + 600;
+    const idOf = async (token) => (await req("GET", "/api/grants/verify", { token })).json.id;
+    const beingRevoked = (...ids) => `OLD.id IN (${ids.map((id) => `'${id}'`).join(", ")}) AND OLD.status = 'active' AND NEW.status = 'revoked'`;
+    const refuse = "RAISE EXCEPTION 'test: % cannot be cancelled right now', OLD.id; RETURN NEW;";
+    // what the runtime wrote down about each pass over one client, oldest first
+    const noted = async (client) => JSON.parse(JSON.stringify((await dbQuery("SELECT data FROM events WHERE type = 'oauth.refresh_reuse_detected' AND data->>'client' = $1 ORDER BY id", [client])).rows.map((x) => x.data)));
+    const unmarked = async (client) => (await dbQuery("SELECT count(*)::int AS n FROM oauth_refresh WHERE client_id = $1 AND revoked = false", [client])).rows[0].n;
+    // what the runtime logs while `fn` runs
+    const logOf = async (fn) => {
+      const lines = [], original = console.error;
+      console.error = (...x) => lines.push(x.map(String).join(" "));
+      try {
+        return { r: await fn(), lines };
+      } finally {
+        console.error = original;
+      }
+    };
+    // A client that a refresh has moved from one grant onto a NEW one: the first was within an hour of running out
+    // (it still has ten minutes), so both are live. `used` is the refresh token that was exchanged for the move, so
+    // it is spent; `fresh` is the one the client holds now.
+    const moved = async (name) => {
+      const root = await newTenant(name, "pro");
+      const client = (await req("POST", "/oauth/register", { body: { client_name: name, redirect_uris: [redirect] } })).json.client_id;
+      const verifier = `${name}-verifier-` + "r".repeat(40);
+      const ap = await admin("POST", "/oauth/approve", { body: { client_id: client, redirect_uri: redirect, code_challenge: s256(verifier), state: "r", tenant: root.id } });
+      const tok = await req("POST", "/oauth/token", { body: { grant_type: "authorization_code", code: new URL(ap.json.redirect).searchParams.get("code"), client_id: client, redirect_uri: redirect, code_verifier: verifier } });
+      expect(tok.status).toBe(200);
+      const refresh = (t) => req("POST", "/oauth/token", { body: { grant_type: "refresh_token", refresh_token: t, client_id: client } });
+      const old = await idOf(tok.json.access_token);
+      await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [soon, old]);
+      const next = await refresh(tok.json.refresh_token);
+      expect(next.status).toBe(200);
+      const now = await idOf(next.json.access_token);
+      expect(now).not.toBe(old);
+      expect([await statusOf(old), await statusOf(now)]).toEqual(["active", "active"]);
+      expect(await unmarked(client)).toBe(1);
+      return { client, refresh, used: tok.json.refresh_token, fresh: next.json.refresh_token, old, now, nowToken: next.json.access_token };
+    };
+    const reused = (r) => {
+      expect(r.status).toBe(400);
+      expect(r.json).toEqual({ error: "invalid_grant", error_description: "refresh token reused; grant revoked" });
+    };
+    const failedAs = (r) => {
+      expect(r.status).toBe(500);
+      expect(r.json.error).toBe("internal_error");
+      expect(r.text).not.toContain("cog1.");
+    };
+
+    // 0. control, nothing in the way: both grants go, the grant the spent token was for first
+    const c = await moved("reuse-control");
+    reused(await c.refresh(c.used));
+    expect([await statusOf(c.old), await statusOf(c.now)]).toEqual(["revoked", "revoked"]);
+    expect(await noted(c.client)).toEqual([{ client: c.client, grants: [c.old, c.now], cancelled: [c.old, c.now], failed: [] }]);
+
+    // 1. the FIRST grant's cancel fails with an ordinary error. The second is cancelled all the same, and the
+    //    request says it failed.
+    const a = await moved("reuse-first");
+    const one = await logOf(() => losesTheWait("t18c_reuse_first", a.old, "revoked", 1000, () => a.refresh(a.used), refuse));
+    failedAs(one.r.r);
+    expect(one.r.tries).toBe(1); // an ordinary failure is not tried again
+    expect(await statusOf(a.old)).toBe("active"); // the one whose cancel failed: untouched
+    expect(await statusOf(a.now)).toBe("revoked"); // the grant AFTER it
+    expect(await works(a.nowToken)).toBe(401);
+    expect(await unmarked(a.client)).toBe(0); // and no refresh token of this client is good for anything now
+    let events = await noted(a.client);
+    expect(events.length).toBe(1);
+    expect(events[0].failed[0].error).toContain(`test: ${a.old} cannot be cancelled right now`);
+    expect(events[0]).toEqual({ client: a.client, grants: [a.old, a.now], cancelled: [a.now], failed: [{ id: a.old, error: events[0].failed[0].error }] });
+    expect(one.lines.some((l) => l.includes("[oauth] refresh token reuse: 1 of 2 grants NOT cancelled") && l.includes(a.old))).toBe(true);
+    //    used again with nothing in the way: the one that was left goes, and nothing else is gone over again
+    reused(await a.refresh(a.used));
+    expect(await statusOf(a.old)).toBe("revoked");
+    events = await noted(a.client);
+    expect(events.length).toBe(2);
+    expect(events[1]).toEqual({ client: a.client, grants: [a.old], cancelled: [a.old], failed: [] });
+
+    // 2. the SECOND grant's cancel fails: the grant the client was moved onto. It is not the spent token's own
+    //    grant and every refresh row of the client is marked by now, so only a pass that does not go by the mark
+    //    finds it again.
+    const b = await moved("reuse-second");
+    const two = await logOf(() => losesTheWait("t18c_reuse_second", b.now, "revoked", 1000, () => b.refresh(b.used), refuse));
+    failedAs(two.r.r);
+    expect(await statusOf(b.old)).toBe("revoked");
+    expect(await statusOf(b.now)).toBe("active");
+    expect(await works(b.nowToken)).toBe(200); // what a pass that failed leaves behind: a key that still works
+    expect(await unmarked(b.client)).toBe(0);
+    events = await noted(b.client);
+    expect(events.length).toBe(1);
+    expect(events[0].failed[0].error).toContain(`test: ${b.now} cannot be cancelled right now`);
+    expect(events[0]).toEqual({ client: b.client, grants: [b.old, b.now], cancelled: [b.old], failed: [{ id: b.now, error: events[0].failed[0].error }] });
+    reused(await b.refresh(b.used));
+    expect(await statusOf(b.now)).toBe("revoked");
+    expect(await works(b.nowToken)).toBe(401);
+    events = await noted(b.client);
+    expect(events.length).toBe(2);
+    expect(events[1]).toEqual({ client: b.client, grants: [b.old, b.now], cancelled: [b.now], failed: [] });
+    //    and the refresh token the client held gets nothing either
+    const held = await b.refresh(b.fresh);
+    reused(held);
+    expect(held.text).not.toContain("cog1.");
+
+    // 3. BOTH fail: both were tried, the record lists both in the order they were tried, and the failure the
+    //    request ends with is the FIRST one
+    const d = await moved("reuse-both");
+    const both = await logOf(() => at("t18c_reuse_both", "grants", "BEFORE UPDATE", beingRevoked(d.old, d.now), refuse, () => d.refresh(d.used)));
+    failedAs(both.r);
+    expect([await statusOf(d.old), await statusOf(d.now)]).toEqual(["active", "active"]);
+    events = await noted(d.client);
+    expect(events.length).toBe(1);
+    expect(events[0].grants).toEqual([d.old, d.now]);
+    expect(events[0].cancelled).toEqual([]);
+    expect(events[0].failed.map((f) => f.id)).toEqual([d.old, d.now]);
+    expect(events[0].failed[1].error).toContain(`test: ${d.now} cannot be cancelled right now`);
+    const thrown = both.lines.filter((l) => l.startsWith("ERR POST "));
+    expect(thrown.length).toBe(1);
+    expect(thrown[0]).toContain(`test: ${d.old} cannot be cancelled right now`);
+    expect(thrown[0]).not.toContain(d.now);
+    expect(both.lines.some((l) => l.includes("[oauth] refresh token reuse: 2 of 2 grants NOT cancelled") && l.includes(d.old))).toBe(true);
+    reused(await d.refresh(d.used));
+    expect([await statusOf(d.old), await statusOf(d.now)]).toEqual(["revoked", "revoked"]);
+    expect((await noted(d.client))[1]).toEqual({ client: d.client, grants: [d.old, d.now], cancelled: [d.old, d.now], failed: [] });
+  });
+
   test("a cancel that loses a lock wait starts again and lets go exactly once; it gives up after three tries with nothing changed; any other failure is not tried again", async () => {
     const root = await newTenant("cancel-retry", "studio");
     const before = await left(root.token);
