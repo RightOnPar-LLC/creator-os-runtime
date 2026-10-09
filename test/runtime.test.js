@@ -3788,11 +3788,12 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
   // 2026-10-09 (unusedOf: the key's whole budget is still held on the grant, so it gives back that much less).
   // `sum: "old"` is the one before (budget less settled, whatever is held): made here by having nothing held on
   // the grant while it is cancelled, and putting back afterwards what was held for the missed key.
-  // ONLY for a grant whose one key is the missed one: with another key under it, that key would let go into the
-  // grant during the cancel and putting the old figure back would undo it.
+  // ONLY for a grant whose one ACTIVE key is the missed one: another active key under it would let go into the
+  // grant during the cancel and putting the old figure back would undo it. (A key that has already ended lets
+  // nothing go.)
   const cancelMissing = async (keyId, parentId, sum, doCancel) => {
-    const under = (await dbQuery("SELECT id FROM grants WHERE parent = $1", [parentId])).rows.map((g) => g.id);
-    if (under.length !== 1 || under[0] !== keyId) throw new Error("cancelMissing: the missed key must be the only key under the grant");
+    const under = (await dbQuery("SELECT id FROM grants WHERE parent = $1 AND status = 'active'", [parentId])).rows.map((g) => g.id);
+    if (under.length !== 1 || under[0] !== keyId) throw new Error("cancelMissing: the missed key must be the only active key under the grant");
     const was = (await dbQuery("SELECT reserved FROM grants WHERE id = $1", [parentId])).rows[0].reserved;
     await dbQuery("UPDATE grants SET parent = NULL WHERE id = $1", [keyId]);
     if (sum === "old") await hold(parentId, 0);
@@ -3873,30 +3874,33 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
     const mid = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:mid", caps: ["grant.issue", "grant.read", "escrow.hold"], ttlSec: 3600, budget: { usd_cents: 5, calls: 20, deploys: 0 } } });
     const leaf = await issue(mid.json.token, "agent:leaf", 10);
     const deep = await issue(leaf.json.token, "agent:deep", 3, ["grant.read"]);
+    const gone = await issue(mid.json.token, "agent:gone", 2, ["grant.read"]); // beside `leaf`, and so ABOVE `deep`
     expect((await spend(leaf.json.token, 4)).status).toBe(200);
     const held = await req("POST", "/api/escrow", { token: mid.json.token, body: { amount: 1, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" } } });
     expect(held.status).toBe(201);
     const before = await count();
     await end(mid.json.id, "revoked");
-    await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [deep.json.id, past]);
+    await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [gone.json.id, past]);
     const answer = await count(),
       rows = mine(answer, root).orphans;
-    // the live ones first (in either order: how the database sorts ids is not this test's business), then the one past its end
+    // The live ones first, the higher of them before the lower (two at one height in either order: how the
+    // database sorts ids is not this test's business). The one past its end comes LAST although it is higher up
+    // than `deep`.
     const shown = rows.map((o) => [o.id, o.live, o.hold]);
     expect(shown.slice(0, 2).sort()).toEqual([[leaf.json.id, true, false], [held.json.escrow.grant_id, true, true]].sort());
-    expect(shown.slice(2)).toEqual([[deep.json.id, false, false]]);
+    expect(shown.slice(2)).toEqual([[deep.json.id, true, false], [gone.json.id, false, false]]);
     const row = rows.find((o) => o.id === leaf.json.id);
     expect(row).toEqual({
-      id: leaf.json.id, tenant: root.id, parent: mid.json.id, depth: 2, sub: "agent:leaf", exp: row.exp, live: true, hold: false,
+      id: leaf.json.id, tenant: root.id, parent: mid.json.id, depth: 2, sub: "agent:leaf", exp: row.exp, live: true, hold: false, holds_under: 0,
       ended_above: mid.json.id, ended_status: "revoked", active_above: root.grantId, budget: calls(10), settled: calls(4), reserved: calls(3),
     });
     expect(row.exp).toBeGreaterThan(answer.now);
-    expect(answer.counts.live).toBe(before.counts.live + 2);
+    expect(answer.counts.live).toBe(before.counts.live + 3);
     expect(answer.counts.past_exp).toBe(before.counts.past_exp + 1);
     // the sweep takes the one past its end; it is then no longer a key left active, and the count says so
-    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).toContain(deep.json.id);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).toContain(gone.json.id);
     const after = await count();
-    expect(mine(after, root).orphans.map((o) => o.id).sort()).toEqual([leaf.json.id, held.json.escrow.grant_id].sort());
+    expect(mine(after, root).orphans.map((o) => o.id).sort()).toEqual([leaf.json.id, deep.json.id, held.json.escrow.grant_id].sort());
     expect(after.counts.past_exp).toBe(before.counts.past_exp);
   });
 
@@ -3960,7 +3964,8 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
     expect(answer.orphans).toEqual([]); // no key is left active, so the first list no longer shows anything
     expect(answer.withheld).toEqual([
       // would_give_back_now is unusedOf on the row as it is now: 10 given, 0 settled, 2 still held (what `late` used)
-      { id: mid.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "active", gave_back: calls(4), releases: 1, would_give_back_now: calls(8), short: calls(4) },
+      // never_used is its budget less all that was really used at or under it: 10 less the 2 `late` settled
+      { id: mid.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "active", gave_back: calls(4), releases: 1, would_give_back_now: calls(8), never_used: calls(8), short: calls(4) },
     ]);
     // THE SUM PUTS IT RIGHT. `short` off what `to` holds: the grant above then has exactly what nobody used, and
     // the count has nothing more to show for it (so doing it twice is not possible by this list).
@@ -3974,7 +3979,7 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
     await cancelMissing(late2.json.id, mid2.json.id, "now", () => cancel(root.token, mid2.json.id));
     expect((await cancel(root.token, late2.json.id)).json.revoked).toEqual([late2.json.id]);
     expect(mine(await count(), root).withheld).toEqual([
-      { id: mid2.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "active", gave_back: calls(4), releases: 1, would_give_back_now: calls(9), short: calls(5) },
+      { id: mid2.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "active", gave_back: calls(4), releases: 1, would_give_back_now: calls(9), never_used: calls(9), short: calls(5) },
     ]);
   });
 
@@ -3994,11 +3999,17 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
     expect(await left(root.token)).toBe(before - 6); // still: what `late` gave back stopped at `mid`
     let answer = mine(await count(), root);
     // only `mid`: nothing has been let go into `top` since `top` itself let go
-    expect(answer.withheld).toEqual([{ id: mid.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "revoked", gave_back: calls(4), releases: 1, would_give_back_now: calls(8), short: calls(4) }]);
+    expect(answer.withheld).toEqual([{ id: mid.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "revoked", gave_back: calls(4), releases: 1, would_give_back_now: calls(8), never_used: calls(8), short: calls(4) }]);
+    // `top` is not read at all yet, whatever its row says: with 2 fewer held on it (written by hand, as nothing in
+    // the runtime does) its row would give back 16 where it gave 14, and 18 were never used under it. But nothing
+    // has let go into it since it let go itself, so there is nothing to explain those 2 and they are not offered.
+    await hold(top.json.id, 4);
+    expect(mine(await count(), root).withheld.map((w) => w.id)).toEqual([mid.json.id]);
+    await hold(top.json.id, 6);
     await passOn(answer.withheld[0]);
     answer = mine(await count(), root);
     // now `top` is the one that gave back less than its row says, and what it owes goes to a grant that is active
-    expect(answer.withheld).toEqual([{ id: top.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", gave_back: calls(14), releases: 1, would_give_back_now: calls(18), short: calls(4) }]);
+    expect(answer.withheld).toEqual([{ id: top.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", gave_back: calls(14), releases: 1, would_give_back_now: calls(18), never_used: calls(18), short: calls(4) }]);
     await passOn(answer.withheld[0]);
     expect(mine(await count(), root).withheld).toEqual([]);
     expect(await left(root.token)).toBe(before - 2); // the owner is left holding exactly what was used
@@ -4038,6 +4049,126 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
     expect(cut.counts.withheld).toBe(whole.counts.withheld);
     expect(cut.withheld_total).toEqual(whole.withheld_total);
     expect(sum(cut.withheld)).toBeLessThan(cut.withheld_total.calls); // the total is of all of them, not of the line shown
+  });
+
+  test("in usd_cents and deploys too: what a hold paid out stays held above, what a refunded hold and unused deploys give back late is shown, each to the unit", async () => {
+    const meshReceipt = (obj) => { const m = JSON.stringify(obj); return req("POST", "/webhooks/mesh", { raw: m, headers: { "x-mesh-signature": hmacHex(MESH_SECRET, m) } }); };
+    const setting = (k, v) => dbQuery("INSERT INTO settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()", [k, v]);
+    const remaining = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
+    const root = await newTenant("count-withheld-money", "studio");
+    const before = await remaining(root.token);
+    const give = (token, sub, budget, caps) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget } });
+    const mid = await give(root.token, "agent:mid", { usd_cents: 1000, calls: 10, deploys: 5 }, ["grant.issue", "grant.read", "escrow.hold"]);
+    const late = await give(mid.json.token, "agent:late", { usd_cents: 700, calls: 4, deploys: 3 }, ["grant.issue", "grant.read", "escrow.hold"]);
+    expect(late.status).toBe(201);
+    const open = (amount) => req("POST", "/api/escrow", { token: late.json.token, body: { amount, payee_tenant: "t_payee", condition: { kind: "receipt:mesh" } } });
+    const paid = await open(200);
+    const open2 = await open(150);
+    expect(paid.status).toBe(201);
+    expect(open2.status).toBe(201);
+    await setting("escrow_capture", "on");
+    try {
+      expect((await meshReceipt({ receipt_id: "rc-18d-1", escrow_id: paid.json.escrow.id })).json.escrow.captured).toBe(true);
+    } finally {
+      await setting("escrow_capture", "off");
+    }
+    // `mid` is cancelled and the cancel misses `late`, whose whole budget is still held on `mid`
+    await cancelMissing(late.json.id, mid.json.id, "now", () => cancel(root.token, mid.json.id));
+    expect(await remaining(root.token)).toEqual({ usd_cents: before.usd_cents - 700, calls: before.calls - 4, deploys: before.deploys - 3 });
+    let answer = mine(await count(), root);
+    // the key that was left, and the hold still open under it: a cancel of the key would refund that hold
+    expect(answer.orphans.map((o) => [o.id, o.hold, o.holds_under]).sort()).toEqual([[late.json.id, false, 1], [open2.json.escrow.grant_id, true, 0]].sort());
+    expect(answer.withheld).toEqual([]);
+    // the key is cancelled through the ordinary route; the open hold goes with it (refunded), the paid one stays paid
+    expect((await cancel(root.token, late.json.id)).json.revoked).toEqual([open2.json.escrow.grant_id, late.json.id]);
+    answer = mine(await count(), root);
+    expect(answer.orphans).toEqual([]);
+    expect(answer.withheld).toEqual([{
+      id: mid.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", releases: 1,
+      gave_back: { usd_cents: 300, calls: 6, deploys: 2 }, // 1000 - 700, 10 - 4, 5 - 3
+      would_give_back_now: { usd_cents: 800, calls: 10, deploys: 5 }, // 200 are still held on it: what the paid hold took
+      never_used: { usd_cents: 800, calls: 10, deploys: 5 },
+      short: { usd_cents: 500, calls: 4, deploys: 3 },
+    }]);
+    const whole = await count();
+    for (const k of ["usd_cents", "calls", "deploys"]) expect([k, whole.withheld_total[k]]).toEqual([k, whole.withheld.reduce((n, w) => n + w.short[k], 0)]);
+    expect(whole.withheld_total.usd_cents).toBeGreaterThanOrEqual(500);
+    expect(whole.withheld_total.deploys).toBeGreaterThanOrEqual(3);
+    await passOn(answer.withheld[0]);
+    expect(await remaining(root.token)).toEqual({ usd_cents: before.usd_cents - 200, calls: before.calls, deploys: before.deploys }); // all but what was paid
+    expect(mine(await count(), root).withheld).toEqual([]);
+  });
+
+  test("a hold that is still open is counted under every key above it, also through a grant that has ended; one that is no longer open is not", async () => {
+    // A cancel of a key cancels, and so refunds, every open hold under it, whatever lies in between. The list
+    // shows only grants that are active, so a hold reached through an ended grant could not be found by going
+    // from row to row: each row says for itself how many open holds are under it.
+    const root = await newTenant("count-holds-under", "studio");
+    const give = (token, sub, usd, caps = ["grant.issue", "grant.read", "escrow.hold"]) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget: { usd_cents: usd, calls: usd, deploys: 0 } } });
+    const x = await give(root.token, "agent:x", 100);
+    const k = await give(x.json.token, "agent:k", 50);
+    const plain = await give(x.json.token, "agent:plain", 10, ["grant.read"]); // beside `k`: nothing under it
+    const m = await give(k.json.token, "agent:m", 20);
+    const side = await give(k.json.token, "agent:side", 5, ["grant.read"]); // under `k` too, active, and no hold
+    expect(side.status).toBe(201);
+    expect(plain.status).toBe(201);
+    expect(m.status).toBe(201);
+    const open = await req("POST", "/api/escrow", { token: m.json.token, body: { amount: 5, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" } } });
+    expect(open.status).toBe(201);
+    const holdId = open.json.escrow.grant_id;
+    await end(x.json.id, "revoked");
+    await end(m.json.id, "expired"); // between the key and the hold, and not in the list
+    const rows = async () => Object.fromEntries(mine(await count(), root).orphans.map((o) => [o.id, [o.hold, o.holds_under]]));
+    expect(await rows()).toEqual({ [k.json.id]: [false, 1], [plain.json.id]: [false, 0], [side.json.id]: [false, 0], [holdId]: [true, 0] });
+    // a hold that is no longer open is not counted
+    await end(holdId, "captured");
+    expect(await rows()).toEqual({ [k.json.id]: [false, 0], [plain.json.id]: [false, 0], [side.json.id]: [false, 0] });
+    await end(holdId, "active");
+    expect((await rows())[k.json.id]).toEqual([false, 1]);
+  });
+
+  test("never more than was really unused: a key that let go under the old sum gave back what was USED under it too, and the row above then says more than is true", async () => {
+    // owner -> x (50) -> c (20) -> j (8) and k (6) -> k2 (2). j used 5 and has ended; k used 1 and is active, with
+    // a key of its own under it.
+    const root = await newTenant("count-withheld-old-under-new", "studio");
+    const before = await left(root.token);
+    const x = await issue(root.token, "agent:x", 50);
+    const c = await issue(x.json.token, "agent:c", 20);
+    const j = await issue(c.json.token, "agent:j", 8, ["grant.read"]);
+    const k = await issue(c.json.token, "agent:k", 6);
+    const k2 = await issue(k.json.token, "agent:k2", 2, ["grant.read"]);
+    expect(k2.status).toBe(201);
+    expect((await spend(j.json.token, 5)).status).toBe(200);
+    expect((await spend(k.json.token, 1)).status).toBe(200);
+    expect((await cancel(root.token, j.json.id)).json.revoked).toEqual([j.json.id]); // held on c: j's 5 used, and k's 6
+    // x is cancelled under today's sum and the cancel misses c: c's whole 20 stay held on x
+    await cancelMissing(c.json.id, x.json.id, "now", () => cancel(root.token, x.json.id));
+    expect(await gaveBack(x.json.id)).toEqual([30]);
+    expect(await left(root.token)).toBe(before - 20);
+    // then c lets go under the OLD sum (as the older service did), missing k: it gives back all 20, the 5 that j
+    // used and the 6 still out with k included. Nothing is held on x any more.
+    await cancelMissing(k.json.id, c.json.id, "old", () => cancel(root.token, c.json.id));
+    expect(await gaveBack(c.json.id)).toEqual([20]);
+    let answer = mine(await count(), root);
+    expect(answer.orphans.map((o) => o.id).sort()).toEqual([k.json.id, k2.json.id].sort());
+    expect(answer.withheld).toEqual([
+      // By its row x would give back all 50. Really used under it: 5 (j); and k's whole 6 are still out (the 2 with
+      // k2 are part of those 6, not 2 more). So 39 at most.
+      { id: x.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", gave_back: calls(30), releases: 1, would_give_back_now: calls(50), never_used: calls(39), short: calls(9) },
+    ]);
+    await passOn(answer.withheld[0]);
+    expect(await left(root.token)).toBe(before - 11);
+    expect(mine(await count(), root).withheld).toEqual([]);
+    // k is cancelled, and k2 with it; k used 1, so 5 more were never used. c gave everything back long ago and
+    // owes nothing; the 5 show on x, and after them the owner holds exactly the 6 that were used (5 by j, 1 by k).
+    expect((await cancel(root.token, k.json.id)).json.revoked).toEqual([k2.json.id, k.json.id]);
+    answer = mine(await count(), root);
+    expect(answer.withheld).toEqual([
+      { id: x.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", gave_back: calls(39), releases: 2, would_give_back_now: calls(50), never_used: calls(44), short: calls(5) },
+    ]);
+    await passOn(answer.withheld[0]);
+    expect(await left(root.token)).toBe(before - 6);
+    expect(mine(await count(), root).withheld).toEqual([]);
   });
 
   test("a grant that ended under the sum used before 2026-10-09 is never shown as holding anything back", async () => {
@@ -4083,6 +4214,11 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
     expect((await cancel(root.token, late.json.id)).json.revoked).toEqual([late.json.id]);
     const listed = async () => mine(await count(), root).withheld.map((w) => [w.id, w.short]);
     expect(await listed()).toEqual([[mid2.json.id, calls(6)]]);
+    // and the lesser of the two figures is taken whichever of them is the smaller: with 3 held on it (written by
+    // hand; nothing was used under it) its row would give back 7, less the 4 it gave: 3, although 6 were never used
+    await hold(mid2.json.id, 3);
+    expect(await listed()).toEqual([[mid2.json.id, calls(3)]]);
+    await hold(mid2.json.id, 0);
     await end(mid2.json.id, "active");
     expect(await listed()).toEqual([]);
     await end(mid2.json.id, "expired");
