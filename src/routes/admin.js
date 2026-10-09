@@ -200,8 +200,8 @@ app.post("/api/admin/grants/reap", requireAdmin, async (e) => {
 });
 // READ ONLY. Grants still active under a grant that has ended, and budget still held above an ended grant for a
 // key that let go after it had (grantsLeftUnderEnded in grants.js). The whole table, not the newest 200 that
-// GET /api/admin/grants shows. `limit` (1 to 5000, 500 if not given) bounds the two lists, never the counts of
-// `live` and `past_exp`.
+// GET /api/admin/grants shows. `limit` (1 to 5000, 500 if not given) bounds the two lists that are shown, never a
+// count or the total.
 app.get("/api/admin/grants/orphans", requireAdmin, async (e) => {
   let asked = Math.floor(Number(e.req.query("limit") || NaN));
   return e.json(await grantsLeftUnderEnded({ limit: Number.isFinite(asked) ? Math.min(5000, Math.max(1, asked)) : 500 }));

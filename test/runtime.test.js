@@ -3787,13 +3787,18 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
   // cancelled grant gave back depends on the sum in use at the time. `sum: "now"` is the one in use since
   // 2026-10-09 (unusedOf: the key's whole budget is still held on the grant, so it gives back that much less).
   // `sum: "old"` is the one before (budget less settled, whatever is held): made here by having nothing held on
-  // the grant while it is cancelled.
+  // the grant while it is cancelled, and putting back afterwards what was held for the missed key.
+  // ONLY for a grant whose one key is the missed one: with another key under it, that key would let go into the
+  // grant during the cancel and putting the old figure back would undo it.
   const cancelMissing = async (keyId, parentId, sum, doCancel) => {
+    const under = (await dbQuery("SELECT id FROM grants WHERE parent = $1", [parentId])).rows.map((g) => g.id);
+    if (under.length !== 1 || under[0] !== keyId) throw new Error("cancelMissing: the missed key must be the only key under the grant");
     const was = (await dbQuery("SELECT reserved FROM grants WHERE id = $1", [parentId])).rows[0].reserved;
     await dbQuery("UPDATE grants SET parent = NULL WHERE id = $1", [keyId]);
     if (sum === "old") await hold(parentId, 0);
     const r = await doCancel();
-    await dbQuery("UPDATE grants SET reserved = $2::jsonb WHERE id = $1", [parentId, JSON.stringify(was)]);
+    // under today's sum the cancel leaves what is held on the grant alone, so there is nothing to put back
+    if (sum === "old") await dbQuery("UPDATE grants SET reserved = $2::jsonb WHERE id = $1", [parentId, JSON.stringify(was)]);
     await dbQuery("UPDATE grants SET parent = $2 WHERE id = $1", [keyId, parentId]);
     return r;
   };
@@ -3876,8 +3881,10 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
     await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [deep.json.id, past]);
     const answer = await count(),
       rows = mine(answer, root).orphans;
-    // the live ones first, then the one past its end
-    expect(rows.map((o) => [o.id, o.live, o.hold])).toEqual([[leaf.json.id, true, false], [held.json.escrow.grant_id, true, true], [deep.json.id, false, false]].sort((a, b) => (a[1] === b[1] ? (a[0] < b[0] ? -1 : 1) : a[1] ? -1 : 1)));
+    // the live ones first (in either order: how the database sorts ids is not this test's business), then the one past its end
+    const shown = rows.map((o) => [o.id, o.live, o.hold]);
+    expect(shown.slice(0, 2).sort()).toEqual([[leaf.json.id, true, false], [held.json.escrow.grant_id, true, true]].sort());
+    expect(shown.slice(2)).toEqual([[deep.json.id, false, false]]);
     const row = rows.find((o) => o.id === leaf.json.id);
     expect(row).toEqual({
       id: leaf.json.id, tenant: root.id, parent: mid.json.id, depth: 2, sub: "agent:leaf", exp: row.exp, live: true, hold: false,
@@ -3911,7 +3918,7 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
       expect(newest.length).toBe(200);
       expect(newest).not.toContain(one.json.id); // control: this is why the list of grants could not answer the question
       const whole = await count();
-      expect(mine(whole, root).orphans.map((o) => o.id)).toEqual([one.json.id, two.json.id].sort());
+      expect(mine(whole, root).orphans.map((o) => o.id).sort()).toEqual([one.json.id, two.json.id].sort());
       expect(whole.truncated.orphans).toBe(false);
       expect(whole.limit).toBe(5000);
       const cut = await count("?limit=1");
@@ -3955,9 +3962,6 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
       // would_give_back_now is unusedOf on the row as it is now: 10 given, 0 settled, 2 still held (what `late` used)
       { id: mid.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "active", gave_back: calls(4), releases: 1, would_give_back_now: calls(8), short: calls(4) },
     ]);
-    const whole = await count();
-    expect(whole.counts.withheld).toBe(whole.withheld.length);
-    expect(whole.withheld_total.calls).toBe(whole.withheld.reduce((n, w) => n + w.short.calls, 0));
     // THE SUM PUTS IT RIGHT. `short` off what `to` holds: the grant above then has exactly what nobody used, and
     // the count has nothing more to show for it (so doing it twice is not possible by this list).
     await passOn(answer.withheld[0]);
@@ -3998,6 +4002,42 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
     await passOn(answer.withheld[0]);
     expect(mine(await count(), root).withheld).toEqual([]);
     expect(await left(root.token)).toBe(before - 2); // the owner is left holding exactly what was used
+  });
+
+  test("the sum is done on every grant before the list is cut: the lowest grant comes first, and the limit hides no count and no part of the total", async () => {
+    const root = await newTenant("count-withheld-limit", "studio");
+    const top = await issue(root.token, "agent:top", 40);
+    // three grants, each with one key the cancel missed: `a` one below the owner, `b` two below, and `c` three
+    // below, which ended under the OLD sum and so owes nothing although it is the lowest of the three
+    const a = await issue(root.token, "agent:a", 10);
+    const lateA = await issue(a.json.token, "agent:late-a", 6, ["grant.read"]);
+    const b = await issue(top.json.token, "agent:b", 8);
+    const lateB = await issue(b.json.token, "agent:late-b", 3, ["grant.read"]);
+    const c0 = await issue(top.json.token, "agent:c0", 12);
+    const c = await issue(c0.json.token, "agent:c", 3);
+    const lateC = await issue(c.json.token, "agent:late-c", 2, ["grant.read"]);
+    expect(lateA.status).toBe(201);
+    expect(lateB.status).toBe(201);
+    expect(lateC.status).toBe(201);
+    await cancelMissing(lateA.json.id, a.json.id, "now", () => cancel(root.token, a.json.id));
+    await cancelMissing(lateB.json.id, b.json.id, "now", () => cancel(root.token, b.json.id));
+    await cancelMissing(lateC.json.id, c.json.id, "old", () => cancel(root.token, c.json.id));
+    for (const k of [lateA, lateB, lateC]) expect((await cancel(root.token, k.json.id)).json.revoked).toEqual([k.json.id]);
+    const whole = await count();
+    expect(whole.truncated.withheld).toBe(false);
+    expect(whole.counts.withheld).toBe(whole.withheld.length);
+    expect(mine(whole, root).withheld.map((w) => [w.id, w.short])).toEqual([[b.json.id, calls(3)], [a.json.id, calls(6)]]); // the lower one first; `c` owes nothing
+    const sum = (list) => list.reduce((n, w) => n + w.short.calls, 0);
+    expect(whole.withheld_total.calls).toBe(sum(whole.withheld));
+    expect(whole.counts.withheld).toBeGreaterThanOrEqual(2);
+    // cut to one line: the line shown is the first of the whole list, and it is a grant that owes (never an empty
+    // list because a lower grant that owes nothing took the one place)
+    const cut = await count("?limit=1");
+    expect(cut.withheld).toEqual([whole.withheld[0]]);
+    expect(cut.truncated.withheld).toBe(true);
+    expect(cut.counts.withheld).toBe(whole.counts.withheld);
+    expect(cut.withheld_total).toEqual(whole.withheld_total);
+    expect(sum(cut.withheld)).toBeLessThan(cut.withheld_total.calls); // the total is of all of them, not of the line shown
   });
 
   test("a grant that ended under the sum used before 2026-10-09 is never shown as holding anything back", async () => {

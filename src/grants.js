@@ -314,7 +314,9 @@ export async function endedAbove(q, id) {
 // `short` makes IT the next grant listed, for what it owes the grant above it: the lowest grant first, then the
 // one above. Under the sum used before 2026-10-09 (budget less settled, whatever was held) a grant gave back at
 // least what unusedOf says, never less, so a grant that ended under that sum is never listed: nothing is held
-// above for it.
+// above for it. EVERY grant that fits (1) and (2) is read and the sum is done on each before anything is cut to
+// `limit`: the lowest come first, and many of those owe nothing (they ended under the old sum, or were put right
+// already), so cutting first could hide the ones that do.
 export async function grantsLeftUnderEnded({ limit = 500 } = {}) {
   let now = nowSec(),
     left = await sql`WITH RECURSIVE down AS (
@@ -330,13 +332,13 @@ export async function grantsLeftUnderEnded({ limit = 500 } = {}) {
       SELECT hit.*, (count(*) FILTER (WHERE live) OVER ())::int AS n_live, (count(*) FILTER (WHERE NOT live) OVER ())::int AS n_past
       FROM hit ORDER BY live DESC, depth, id LIMIT ${limit}`,
     late = await sql`SELECT g.id, g.tenant, g.parent, g.status, g.budget, g.settled, g.reserved, p.status AS parent_status,
-        own.usd_cents, own.calls, own.deploys, own.times, (count(*) OVER ())::int AS n_all
+        own.usd_cents, own.calls, own.deploys, own.times
       FROM grants g JOIN grants p ON p.id = g.parent
       JOIN (SELECT grant_id, min(id) AS first_id, sum(usd_cents)::float8 AS usd_cents, sum(calls)::float8 AS calls, sum(deploys)::float8 AS deploys, count(*)::int AS times
           FROM ledger WHERE kind = 'release' GROUP BY grant_id) own ON own.grant_id = g.id
       JOIN (SELECT parent, max(id) AS last_id FROM ledger WHERE kind = 'release' AND parent IS NOT NULL GROUP BY parent) under
         ON under.parent = g.id AND under.last_id > own.first_id
-      WHERE g.status <> 'active' ORDER BY g.depth DESC, g.id LIMIT ${limit}`,
+      WHERE g.status <> 'active' ORDER BY g.depth DESC, g.id`,
     usage = (j) => normalizeUsage(parseJson(j)),
     withheld = [],
     total = zeroUsage();
@@ -368,11 +370,10 @@ export async function grantsLeftUnderEnded({ limit = 500 } = {}) {
       settled: usage(g.settled),
       reserved: usage(g.reserved),
     })),
-    withheld,
+    withheld: withheld.slice(0, limit),
     withheld_total: total,
-    // The counts of `live` and `past_exp` are of the whole table whatever the limit. `withheld` is worked out from
-    // the rows read, so when its list was cut short its count and total are of the part that was read.
-    truncated: { orphans: (left[0]?.n_live ?? 0) + (left[0]?.n_past ?? 0) > left.length, withheld: (late[0]?.n_all ?? 0) > late.length },
+    // `limit` cuts the two lists that are shown and nothing else: every count, and the total, is of the whole table.
+    truncated: { orphans: (left[0]?.n_live ?? 0) + (left[0]?.n_past ?? 0) > left.length, withheld: withheld.length > limit },
     limit,
   };
 }
