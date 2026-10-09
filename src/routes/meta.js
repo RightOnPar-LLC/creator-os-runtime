@@ -7,7 +7,7 @@ import { verifyTimestampedSignature } from "../webhooks.js";
 import { app, routeInventory } from "../http.js";
 import { MCP_TOOLS } from "../mcp.js";
 import { buildAgentCard, validateAgentCard } from "../a2a.js";
-import { buildEscrow } from "../escrow.js";
+import { buildEscrow, captureAmount } from "../escrow.js";
 
 app.get("/routes", (e) => {
   let t = routeInventory();
@@ -317,6 +317,41 @@ app.get("/selftest", async (e) => {
           readable,
           unreadable,
         }
+      );
+    }),
+    // A hold opened with another hold's token cannot be made any more (buildEscrow refuses), so the
+    // rule that keeps two captures from paying twice is proven here on such rows.
+    a("payment hold cannot pay for another hold, and a capture never pays out what was passed on", () => {
+      let ask = { amount: 1, payee_tenant: "t_y", condition: { kind: "receipt:mesh" } },
+        asHold = { ...n, scope: { ...n.scope, escrow: { escrow_id: "es_x", payee_tenant: "t_z" } } },
+        refusal = (row) => {
+          try {
+            return (buildEscrow(row, ask, "starter"), null);
+          } catch (err) {
+            return err?.code || String(err?.message || err);
+          }
+        },
+        row = (budget, reserved, settled) => ({ budget: { usd_cents: budget }, reserved: { usd_cents: reserved }, settled: { usd_cents: settled } }),
+        got = {
+          plainKeyPays: refusal(n),
+          holdPays: refusal(asHold),
+          whole: captureAmount(row(100, 0, 0)), // nothing under it: all of it
+          pledgedBelow: captureAmount(row(100, 100, 0)), // all pledged to a hold below: wait
+          partPledged: captureAmount(row(100, 40, 0)), // part still pledged below: wait
+          paidBelow: captureAmount(row(100, 0, 100)), // already paid out below: nothing left
+          partPaidBelow: captureAmount(row(100, 0, 40)), // 40 paid out below: the other 60
+          asText: captureAmount({ budget: '{"usd_cents":100}', reserved: '{"usd_cents":0}', settled: '{"usd_cents":40}' }),
+        };
+      return (
+        (got.plainKeyPays === null &&
+          got.holdPays === "escrow_custodian_cannot_pay" &&
+          got.whole === 100 &&
+          got.pledgedBelow === 0 &&
+          got.partPledged === 0 &&
+          got.paidBelow === 0 &&
+          got.partPaidBelow === 60 &&
+          got.asText === 60) ||
+        got
       );
     }),
     // The rule issueChildGrant uses where a hold's end is written: holdExpiry(asked, now, limit).

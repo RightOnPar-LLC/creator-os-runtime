@@ -58,6 +58,12 @@ everything; add one scope block and two terminal statuses.
 1. **open** = `issueChildGrant` with `sub=escrow:*`, the `scope.escrow` block, `exp = deadline`.
    Reserve fires → the payer's value is held. Reuse; add scope validation. Ledger `escrow-hold`.
 
+   Who can pay (as built): any key that holds `escrow.hold`, except a hold itself. The custodian's
+   only capability is `escrow.hold` (a marker), and its token goes back to the payer, so a hold's
+   own token would otherwise pass `POST /api/escrow`'s check and pledge the held value a second
+   time. `buildEscrow` refuses it: `403 escrow_custodian_cannot_pay`, before a hold opens or an
+   approval is filed.
+
    How long it is held (as built, `buildEscrow` in `src/escrow.js`). Every rule is checked before
    a hold opens or an approval is filed for the owner, and again when an approval is run:
    - The payer gives `deadline` (unix seconds) or `ttlSec`. With both, the deadline wins. With
@@ -93,6 +99,13 @@ everything; add one scope block and two terminal statuses.
 3. **capture** (new) = verify the condition, then in **one transaction**: settle the escrow's
    amount (ledger `escrow-capture`) **and** emit a MESH credit to the payee. Only the runtime,
    holding the escrow, can capture; the *condition* is the authorization, never either party's say-so.
+
+   What a capture pays (as built, `captureAmount` in `src/escrow.js`): the value the hold still
+   holds itself. That is the whole amount for every hold, because nothing can be opened under a
+   hold. The rule is written for the case where something was: while any of the value is still
+   pledged to a hold underneath, the capture waits (`pledged_to_a_hold_below`, the hold stays open);
+   what was already paid out underneath is not paid again (`nothing_left_to_capture` if that was
+   all of it). Captures can never credit more than the payer paid.
 
 ## Condition kinds (start with two)
 

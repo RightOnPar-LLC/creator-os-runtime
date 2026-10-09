@@ -2411,6 +2411,46 @@ describe("19. escrow keystone (stage 1: open + read)", () => {
     expect(r.status).toBe(403);
   });
 
+  // POST /api/escrow hands the custodian's token back to the payer. The custodian's one capability
+  // is escrow.hold (a marker), which is also the capability this route asks for, so that token used
+  // to open a SECOND hold out of the held value. Captured, the two paid out twice what was paid in.
+  test("CONTROL: a hold cannot pay for another hold — the custodian's own token opens nothing", async () => {
+    const root = await newTenant("escrow-nest", "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const outer = await req("POST", "/api/escrow", { token: root.token, body: openBody({ amount: 100 }) });
+    expect(outer.status).toBe(201);
+    expect((await req("GET", "/api/grants/verify", { token: outer.json.token })).json.caps).toEqual(["escrow.hold"]);
+    // Refused whatever the request says, good or bad: who is asking is checked first.
+    for (const over of [{}, { amount: 1 }, { condition: { kind: "receipt:mesh" } }, { payee_tenant: "t_other" }, { amount: 0 }, { deadline: "soon" }]) {
+      const inner = await req("POST", "/api/escrow", { token: outer.json.token, body: openBody({ amount: 100, ...over }) });
+      expect([JSON.stringify(over), inner.status, inner.json.error]).toEqual([JSON.stringify(over), 403, "escrow_custodian_cannot_pay"]);
+    }
+    // Nothing was pledged out of the hold, and the payer is out exactly the one hold.
+    expect((await remainingOf(outer.json.token)).usd_cents).toBe(100);
+    expect((await remainingOf(root.token)).usd_cents).toBe(before - 100);
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [outer.json.escrow.grant_id])).rows[0].n).toBe(0);
+    // The payer's own key still opens holds as before.
+    expect((await req("POST", "/api/escrow", { token: root.token, body: openBody({ amount: 100 }) })).status).toBe(201);
+  });
+
+  test("CONTROL: a hold opened on the owner's approval cannot pay for another hold either, and nothing is filed", async () => {
+    const root = await newTenant("escrow-nest-ask", "pro");
+    const asker = await req("POST", "/api/grants", {
+      token: root.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const filed = await req("POST", "/api/escrow", { token: asker.json.token, body: openBody({ amount: 100 }) });
+    expect(filed.status).toBe(202);
+    const ok = await req("POST", `/api/approvals/${filed.json.approval.id}`, { token: root.token, body: { decision: "approve" } });
+    expect(ok.json.status).toBe("executed");
+    // The hold's token inherits the "ask" dial. It must be refused BEFORE anything is filed for the owner.
+    const inner = await req("POST", "/api/escrow", { token: ok.json.result.token, body: openBody({ amount: 100 }) });
+    expect([inner.status, inner.json.error]).toEqual([403, "escrow_custodian_cannot_pay"]);
+    expect((await req("GET", "/api/approvals", { token: root.token })).json.approvals.length).toBe(1); // only the one that ran
+    expect((await remainingOf(asker.json.token)).usd_cents).toBe(400);
+  });
+
   test("CONTROL: a plain grant is not an escrow; an unknown id is not found", async () => {
     const root = await newTenant("escrow-notesc", "pro");
     expect((await req("GET", "/api/escrow/" + root.grantId, { token: root.token })).status).toBe(404); // the root grant is not an escrow
@@ -2613,6 +2653,93 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     expect(retry.json.escrow.captured).toBe(true);
     expect((await req("GET", "/api/escrow/" + gid, { token: root.token })).json.escrow.state).toBe("captured");
     expect(await creditRows("t_payeeRT", esId)).toEqual({ n: 1, cents: 500 });
+  });
+
+  // A hold under a hold cannot be opened any more (section 19), so these tests build the rows an
+  // older one would have left: two holds opened side by side, then the second moved under the
+  // first exactly as if the first hold's own token had opened it (its reservation sits on the
+  // first hold, not on the payer).
+  const nested = async (name, outerAmount, innerAmount) => {
+    const root = await newTenant(name, "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const outer = await openEscrow(root.token, { amount: outerAmount, payee_tenant: "t_outer_" + name });
+    const inner = await openEscrow(root.token, { amount: innerAmount, payee_tenant: "t_inner_" + name });
+    expect([outer.status, inner.status]).toEqual([201, 201]);
+    const held = async (id) => { const v = (await dbQuery("SELECT reserved FROM grants WHERE id = $1", [id])).rows[0].reserved; return typeof v === "string" ? JSON.parse(v) : v || {}; };
+    const setHeld = (id, r) => dbQuery("UPDATE grants SET reserved = $2::jsonb WHERE id = $1", [id, JSON.stringify({ usd_cents: r.usd_cents || 0, calls: r.calls || 0, deploys: r.deploys || 0 })]);
+    const p = await held(root.grantId), o = await held(outer.json.escrow.grant_id);
+    await setHeld(root.grantId, { ...p, usd_cents: p.usd_cents - innerAmount });
+    await setHeld(outer.json.escrow.grant_id, { ...o, usd_cents: (o.usd_cents || 0) + innerAmount });
+    await dbQuery("UPDATE grants SET parent = $2, depth = depth + 1 WHERE id = $1", [inner.json.escrow.grant_id, outer.json.escrow.grant_id]);
+    // It reads as nested: the payer is out the outer amount only, and the outer hold has pledged the inner amount on.
+    expect((await remainingOf(root.token)).usd_cents).toBe(before - outerAmount);
+    expect((await remainingOf(outer.json.token)).usd_cents).toBe(outerAmount - innerAmount);
+    const credited = async (payee) => (await dbQuery("SELECT coalesce(sum(usd_cents),0)::int AS cents FROM ledger WHERE tenant=$1 AND kind='mesh-credit'", [payee])).rows[0].cents;
+    return {
+      root, before, outer: outer.json.escrow, inner: inner.json.escrow,
+      paid: async () => before - (await remainingOf(root.token)).usd_cents,
+      // how the payer's own row books it: what it settled itself, and what is still held on it
+      books: async () => {
+        const row = (await dbQuery("SELECT reserved, settled FROM grants WHERE id = $1", [root.grantId])).rows[0];
+        const cents = (v) => (typeof v === "string" ? JSON.parse(v) : v || {}).usd_cents || 0;
+        return { settled: cents(row.settled), held: cents(row.reserved) };
+      },
+      credits: async () => ({ outer: await credited("t_outer_" + name), inner: await credited("t_inner_" + name) }),
+      stateOf: async (e) => (await req("GET", "/api/escrow/" + e.grant_id, { token: root.token })).json.escrow.state,
+    };
+  };
+  let rc = 0;
+  const receiptFor = (escrow) => meshReceipt({ receipt_id: "rc-nest-" + ++rc, escrow_id: escrow.id });
+
+  // This is the bug as it was found: outer hold 100, inner hold 100 opened with the outer hold's
+  // token, both captured. Payees were credited 200 for a payer who paid 100.
+  test("CONTROL: two captures never credit more than the payer paid — a hold fully pledged to a hold below pays nothing itself", async () => {
+    const n = await nested("nest-full", 100, 100);
+    const first = await receiptFor(n.outer); // the outer hold's delivery arrives first
+    expect(first.json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" });
+    expect(await n.stateOf(n.outer)).toBe("open"); // it waits; it did not end as a capture of nothing
+    expect((await receiptFor(n.inner)).json.escrow).toMatchObject({ captured: true, amount: 100 });
+    const again = await receiptFor(n.outer); // and now its value has been paid out below
+    expect(again.json.escrow).toMatchObject({ captured: false, reason: "nothing_left_to_capture" });
+    expect(await n.credits()).toEqual({ outer: 0, inner: 100 });
+    expect(await n.paid()).toBe(100);
+  });
+
+  test("CONTROL: a hold partly pledged below pays only the rest, in either order of delivery", async () => {
+    // inner delivered first, then outer
+    const a = await nested("nest-part-a", 100, 40);
+    expect((await receiptFor(a.inner)).json.escrow).toMatchObject({ captured: true, amount: 40 });
+    expect((await receiptFor(a.outer)).json.escrow).toMatchObject({ captured: true, amount: 60 });
+    expect(await a.credits()).toEqual({ outer: 60, inner: 40 });
+    expect(await a.paid()).toBe(100);
+    // The payer's own row settles only the 60 its hold captured. The 40 paid out under that hold
+    // stays held on the payer, which is how spend below a grant is counted everywhere else.
+    expect(await a.books()).toEqual({ settled: 60, held: 40 });
+    // outer delivered first: it waits while part of it is still pledged, then pays the rest
+    const b = await nested("nest-part-b", 100, 40);
+    expect((await receiptFor(b.outer)).json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" });
+    expect(await b.credits()).toEqual({ outer: 0, inner: 0 });
+    expect((await receiptFor(b.inner)).json.escrow).toMatchObject({ captured: true, amount: 40 });
+    expect((await receiptFor(b.outer)).json.escrow).toMatchObject({ captured: true, amount: 60 });
+    expect(await b.credits()).toEqual({ outer: 60, inner: 40 });
+    expect(await b.paid()).toBe(100);
+  });
+
+  test("CONTROL: when the hold below is refunded instead, the hold above pays in full, once", async () => {
+    const n = await nested("nest-refund", 100, 40);
+    const rev = await req("POST", "/api/grants/" + n.inner.grant_id + "/revoke", { token: n.root.token, body: { reason: "inner not delivered" } });
+    expect(rev.json.revoked).toContain(n.inner.grant_id);
+    expect((await receiptFor(n.outer)).json.escrow).toMatchObject({ captured: true, amount: 100 });
+    expect((await receiptFor(n.inner)).json.escrow.captured).toBe(false); // refunded: it can never capture
+    expect(await n.credits()).toEqual({ outer: 100, inner: 0 });
+    expect(await n.paid()).toBe(100);
+  });
+
+  // The same rule on the running build, where no request can make such rows: /selftest.
+  test("the runtime's own self-test carries the control: a hold cannot pay for a hold, a capture never pays out what was passed on", async () => {
+    const r = await req("GET", "/selftest");
+    const name = "payment hold cannot pay for another hold, and a capture never pays out what was passed on";
+    expect(r.json.results.find((c) => c.name === name)).toEqual({ name, pass: true });
   });
 
   test("CONTROL (fix): a receipt naming a different payee does not settle to the escrow's payee", async () => {
