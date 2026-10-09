@@ -69,14 +69,29 @@ export async function writeMemory(e, t, a, n, r, s, auth = null) {
   if (!gx) await enqueueOutbox("memory.sync", toSyncRecord(i[0]));
   return o;
 }
+// LIKE with the prefix's own % and _ taken literally (a partition may contain them).
+var likeLiteral = (e) => e.replace(/[\\%_]/g, "\\$&");
+// `a` is the scope prefix to search under. The match is the SAME boundary rule as
+// partitionCovers (policy.js), so listing can never reach further than assertMemoryScope
+// allows: the prefix itself, or the prefix followed by a real separator. A bare
+// `LIKE prefix%` let a key scoped to "article:job4" list "article:job42" too.
+// No prefix at all (a key whose memory scope is the empty list) lists nothing: the old
+// `undefined + "%"` only returned nothing by accident, and DID return a partition whose
+// name happened to start with "undefined".
 export async function searchMemories(e, t, a, n) {
+  if (a === void 0 || a === null) return [];
   let r = Math.min(50, Math.max(1, Math.floor(n || 10))),
-    s = a + "%";
+    p = String(a),
+    l = likeLiteral(p),
+    open = p === "" || /[:/-]$/.test(p),
+    s1 = open ? l + "%" : l + ":%",
+    s2 = open ? s1 : l + "/%",
+    s3 = open ? s1 : l + "-%";
   return (
     t.trim()
-      ? await sql`SELECT * FROM memories WHERE tenant = ${e} AND deleted = false AND partition LIKE ${s} AND (to_tsvector('english', content) @@ plainto_tsquery('english', ${t}) OR content ILIKE ${"%" + t + "%"})
+      ? await sql`SELECT * FROM memories WHERE tenant = ${e} AND deleted = false AND (partition = ${p} OR partition LIKE ${s1} OR partition LIKE ${s2} OR partition LIKE ${s3}) AND (to_tsvector('english', content) @@ plainto_tsquery('english', ${t}) OR content ILIKE ${"%" + t + "%"})
         ORDER BY ts_rank(to_tsvector('english', content), plainto_tsquery('english', ${t})) DESC, updated_at DESC LIMIT ${r}`
-      : await sql`SELECT * FROM memories WHERE tenant = ${e} AND deleted = false AND partition LIKE ${s} ORDER BY updated_at DESC LIMIT ${r}`
+      : await sql`SELECT * FROM memories WHERE tenant = ${e} AND deleted = false AND (partition = ${p} OR partition LIKE ${s1} OR partition LIKE ${s2} OR partition LIKE ${s3}) ORDER BY updated_at DESC LIMIT ${r}`
   ).map(serializeMemory);
 }
 export async function forgetMemory(e, t, auth = null) {
