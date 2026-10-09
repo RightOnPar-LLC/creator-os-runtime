@@ -2,7 +2,7 @@
 import { HttpError, nowSec, parseJson, withRedactedIntent } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "../db.js";
 import { normalizeUsage, remainingBudget, TIERS } from "../policy.js";
-import { issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
+import { endedAbove, issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
 import { HOST_DEFAULT_BUDGET, HOST_DEFAULT_CAPS, HOST_DEFAULTS, HOST_TIERS, hostLimits, hostName } from "../hostpolicy.js";
 import { AUTONOMY_LEVELS, autonomyOf } from "../autonomy.js";
 import { openEscrow, serializeEscrow } from "../escrow.js";
@@ -247,13 +247,15 @@ app.post("/api/approvals/:id", requireGrant(null), async (e) => {
     return e.json({ id: ap.id, status: "denied" });
   }
   // Approved: run the exact intent the agent asked for, under the agent's own grant —
-  // which must still be live. The kill switch stops approved actions too.
+  // which must still be live, and so must every grant above it (grants.js, endedAbove: this
+  // path does not come through verifyGrant, and a deploy is created before it is charged).
+  // The kill switch stops approved actions too.
   let fail = async (reason) => {
     await sql`UPDATE approvals SET status = 'failed', result = ${{ reason }}::jsonb WHERE id = ${ap.id}`;
     throw new HttpError(409, reason);
   };
   if (await isKillSwitchOn()) await fail("kill_switch_on");
-  if (!g || g.status !== "active" || Number(g.exp) <= nowSec()) await fail("requesting_grant_not_active");
+  if (!g || g.status !== "active" || Number(g.exp) <= nowSec() || (await endedAbove(sql, g.id))) await fail("requesting_grant_not_active");
   let tenant = await getTenant(g.tenant),
     intent = parseJson(ap.intent),
     result;

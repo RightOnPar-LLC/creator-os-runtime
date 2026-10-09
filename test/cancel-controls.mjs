@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // Do the cancel tests (section 18c of runtime.test.js) really test anything? For each rule that the 2026-10-09
-// change put into src/grants.js this takes the rule OUT of the source, runs those tests, and expects them to
+// change put into src/grants.js (and one line of src/routes/grants.js) this takes the rule OUT of the source, runs those tests, and expects them to
 // FAIL. A rule whose removal nothing notices is a rule with no test. Same method as tours-controls.mjs.
 //
 //   node test/cancel-controls.mjs        (from the repo root; about a minute)
 //
-// It edits src/grants.js and always puts it back (also on Ctrl-C). It first runs the tests untouched and expects
+// It edits those files and always puts them back (also on Ctrl-C). It first runs the tests untouched and expects
 // them to PASS, so a red result below means "the break was noticed", not "the tests were already red".
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -48,6 +48,10 @@ const BREAKS = [
     "src/grants.js",
     "      if (!P || P.status !== \"active\" || (await endedAbove(H, P.id)))",
     "      if (!P || P.status !== \"active\")"],
+  ["the owner's approval runs a request for a key whose grant above has ended",
+    "src/routes/grants.js",
+    " || (await endedAbove(sql, g.id))) await fail(\"requesting_grant_not_active\");",
+    ") await fail(\"requesting_grant_not_active\");"],
   ["a cancel that loses a lock wait is not tried again",
     "src/grants.js",
     "      if (!isDeadlock(err) || attempt >= CANCEL_TRIES) throw err;",

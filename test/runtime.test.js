@@ -3462,6 +3462,34 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
     expect(await statusOf(deep.json.id)).toBe("revoked");
   });
 
+  test("the owner's approval does not run a request filed by a key whose grant above has since ended", async () => {
+    // An approval is run under the grant that asked, without coming through the door. So it looks above that grant
+    // itself, before anything is done (a deploy is created first and charged after).
+    const root = await newTenant("cancel-orphan-approval", "pro");
+    const grant = (token, sub, caps, constraints) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, ...(constraints ? { constraints } : {}) } });
+    const mid = await grant(root.token, "agent:mid", ["grant.issue", "grant.read", "escrow.hold"]);
+    const asker = await grant(mid.json.token, "agent:asker", ["escrow.hold", "grant.read"], { autonomy: "ask" });
+    expect(asker.status).toBe(201);
+    const ask = () => req("POST", "/api/escrow", { token: asker.json.token, body: { amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" } } });
+    const decide = (id) => req("POST", `/api/approvals/${id}`, { token: root.token, body: { decision: "approve" } });
+    const filed = await ask();
+    expect(filed.status).toBe(202);
+    await dbQuery("UPDATE grants SET status = 'revoked' WHERE id = $1", [mid.json.id]);
+    const refused = await decide(filed.json.approval.id);
+    expect(refused.status).toBe(409);
+    expect(refused.json.error).toBe("requesting_grant_not_active");
+    const row = (await dbQuery("SELECT status, result FROM approvals WHERE id = $1", [filed.json.approval.id])).rows[0];
+    expect(row.status).toBe("failed");
+    expect((await rowOf(asker.json.id)).reserved.usd_cents).toBe(0); // nothing was held
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [asker.json.id])).rows[0].n).toBe(0);
+    // control: with the grant above it active, the same request is approved and the hold opens
+    await dbQuery("UPDATE grants SET status = 'active' WHERE id = $1", [mid.json.id]);
+    const again = await ask();
+    expect(again.status).toBe(202);
+    expect((await decide(again.json.approval.id)).status).toBe(200);
+    expect((await rowOf(asker.json.id)).reserved.usd_cents).toBe(100);
+  });
+
   test("a cancel that loses a lock wait starts again and lets go exactly once; it gives up after three tries with nothing changed; any other failure is not tried again", async () => {
     const root = await newTenant("cancel-retry", "studio");
     const before = await left(root.token);

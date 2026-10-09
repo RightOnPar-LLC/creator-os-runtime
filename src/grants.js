@@ -264,14 +264,14 @@ function unusedOf(g, heldNow) {
 // DEFENCE IN DEPTH: a grant is only as alive as everything above it. Cancelling a grant cancels everything under
 // it (revokeGrantTree), so an ACTIVE grant under one that has ended should not exist. If one ever does (a row left
 // by the gap revokeGrantTree had until 2026-10-09, or by a mistake still to be made), it must not work:
-// verifyGrant, settleGrantUsage and issueChildGrant all refuse it. "Ended" is any status but active: cancelled,
-// run out, captured. The walk goes up the parent chain: one primary-key look-up per step and at most as many
-// steps as the tier's maxDepth (6 today). `parent` is written once, when a row is made, and points at a row that
-// already exists, so the chain cannot loop.
+// verifyGrant, settleGrantUsage and issueChildGrant all refuse it, and the owner's approval does not run a request
+// it filed (routes/grants.js). "Ended" is any status but active: cancelled, run out, captured. The walk goes up
+// the parent chain: one primary-key look-up per step and at most as many steps as the tier's maxDepth (6 today).
+// `parent` is written once, when a row is made, and points at a row that already exists, so the chain cannot loop.
 //
-// The nearest ended grant above `id`, or null. `q` is the transaction to read in: the two write paths look AFTER
-// they hold their own row's lock.
-async function endedAbove(q, id) {
+// The nearest ended grant above `id`, or null. `q` is what to read with: the two write paths pass their own
+// transaction, so that they look AFTER they hold their own row's lock.
+export async function endedAbove(q, id) {
   return (
     (
       await q`WITH RECURSIVE up AS (SELECT p.id, p.parent, p.status, 1 AS hop FROM grants c JOIN grants p ON p.id = c.parent WHERE c.id = ${id}
