@@ -7,7 +7,7 @@ import { verifyTimestampedSignature } from "../webhooks.js";
 import { app, routeInventory } from "../http.js";
 import { MCP_TOOLS } from "../mcp.js";
 import { buildAgentCard, validateAgentCard } from "../a2a.js";
-import { buildEscrow } from "../escrow.js";
+import { buildEscrow, captureAmount } from "../escrow.js";
 
 app.get("/routes", (e) => {
   let t = routeInventory();
@@ -317,6 +317,48 @@ app.get("/selftest", async (e) => {
           readable,
           unreadable,
         }
+      );
+    }),
+    // A hold opened with another hold's token cannot be made any more (buildEscrow refuses), so the
+    // rule that keeps two captures from paying twice is proven here on such rows.
+    a("payment hold cannot pay for another hold, and a capture never pays out what was passed on", () => {
+      let ask = { amount: 1, payee_tenant: "t_y", condition: { kind: "receipt:mesh" } },
+        asHold = (mark) => ({ ...n, scope: { ...n.scope, escrow: mark } }),
+        refusal = (row) => {
+          try {
+            return (buildEscrow(row, ask, "starter"), null);
+          } catch (err) {
+            return err?.code || String(err?.message || err);
+          }
+        },
+        row = (budget, reserved, settled) => ({ budget: { usd_cents: budget }, reserved: { usd_cents: reserved }, settled: { usd_cents: settled } }),
+        got = {
+          plainKeyPays: refusal(n),
+          // a hold, however its mark reads (only an object is ever written; a damaged one is still a hold)
+          holdPays: [{ escrow_id: "es_x", payee_tenant: "t_z" }, {}, [], "x", !0, 1, null].map((mark) => refusal(asHold(mark))),
+          holdAsText: refusal({ ...n, scope: JSON.stringify({ ...n.scope, escrow: { escrow_id: "es_x" } }) }),
+          whole: captureAmount(row(100, 0, 0)), // nothing under it: all of it
+          allHeldBelow: captureAmount(row(100, 100, 0)), // all of it held for what is under it: none of it
+          partHeldBelow: captureAmount(row(100, 40, 0)), // 40 held for what is under it: the other 60
+          paidBelow: captureAmount(row(100, 0, 100)), // all of it already paid out below: nothing left
+          partPaidBelow: captureAmount(row(100, 0, 40)), // 40 paid out below: the other 60
+          threeDeep: captureAmount(row(100, 20, 20)), // 20 captured right under it, 20 spent two levels down: 60
+          overdrawn: captureAmount(row(100, 80, 40)), // books that do not add up never go below nothing
+          asText: captureAmount({ budget: '{"usd_cents":100}', reserved: '{"usd_cents":20}', settled: '{"usd_cents":20}' }),
+        };
+      return (
+        (got.plainKeyPays === null &&
+          got.holdPays.every((x) => x === "escrow_custodian_cannot_pay") &&
+          got.holdAsText === "escrow_custodian_cannot_pay" &&
+          got.whole === 100 &&
+          got.allHeldBelow === 0 &&
+          got.partHeldBelow === 60 &&
+          got.paidBelow === 0 &&
+          got.partPaidBelow === 60 &&
+          got.threeDeep === 60 &&
+          got.overdrawn === 0 &&
+          got.asText === 60) ||
+        got
       );
     }),
     // The rule issueChildGrant uses where a hold's end is written: holdExpiry(asked, now, limit).

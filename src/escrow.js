@@ -21,9 +21,22 @@ export const ESCROW_CUSTODY_CAP = "escrow.hold";
 // "", false and [] as 0, so those are not numbers here.
 var numberFrom = (v) => (typeof v === "number" || (typeof v === "string" && v.trim() !== "") ? Number(v) : NaN);
 
+// Is this grant a hold? Any `escrow` mark in its scope counts, whatever its shape (issueChildGrant
+// only ever writes an object there; a mark that was damaged must still read as a hold, so that a
+// hold is never taken for an ordinary key).
+var isHold = (grantRow) => {
+  let scope = parseJson(grantRow?.scope);
+  return !!scope && typeof scope === "object" && scope.escrow !== undefined;
+};
+
 // Validate the open request and shape the custodian child spec + the scope.escrow block.
 // Throws HttpError on any bad input; never partially opens. `tier` is the payer tenant's tier.
 export function buildEscrow(payerRow, params, tier) {
+  // A hold cannot pay for another hold. POST /api/escrow hands the custodian's token back to
+  // the payer, and the custodian's one capability (escrow.hold, a marker) is the same one that
+  // route asks for. Without this check that token could pledge the held value a second time:
+  // two holds, two captures, two credits, one payment.
+  if (isHold(payerRow)) throw new HttpError(403, "escrow_custodian_cannot_pay");
   let p = params && typeof params === "object" && !Array.isArray(params) ? params : {};
   // amount: MESH-denominated commit, carried in usd_cents (the model's value slot). > 0.
   let amount = Math.floor(Number(p.amount ?? p.usd_cents ?? 0));
@@ -149,6 +162,26 @@ export function serializeEscrow(grantRow) {
   };
 }
 
+// What a capture pays the payee: the value this hold still holds ITSELF. For every hold opened
+// since a hold stopped being able to pay for another one (buildEscrow), that is all of it. It is
+// less only when value was passed on under the hold: what was captured directly under it is in
+// `settled`, and whatever is held on it is either still pledged to a hold underneath or was
+// spent further down (a grant keeps what the keys under it used held, see unusedOf in grants.js).
+// Neither is this hold's to pay. (captureEscrow also waits while anything under the hold is still
+// open.) On rows that only this code has touched, captures therefore never credit more than the
+// payer paid, whatever is under a hold. NOT covered: a hold left OPEN under a hold that older code
+// had already ended. That code paid out, or gave back, the upper hold's whole amount, the lower
+// hold's part included, so capturing the lower hold credits that part a second time. A rule for
+// it was tried and taken out again (it only looked one level up, and it turned away a delivery
+// that should be paid when the hold above had merely been cancelled). The live runtime had no
+// such row when this went live, and none can be made now: a hold cannot open a hold.
+export function captureAmount(grantRow) {
+  let budget = normalizeUsage(parseJson(grantRow.budget)).usd_cents,
+    held = normalizeUsage(parseJson(grantRow.reserved)).usd_cents,
+    paid = normalizeUsage(parseJson(grantRow.settled)).usd_cents;
+  return Math.max(0, budget - paid - held);
+}
+
 // Resolve either the custodian grant id (gr_...) OR the stable escrow id (es_...) to the escrow
 // grant row. Only try the grants PK lookup for a gr_ id — a receipt carries the es_ id, which can
 // never be a grant PK, so an unconditional getGrant was a wasted round-trip on every receipt. The
@@ -180,13 +213,25 @@ export async function captureEscrow(idOrEscrowId, { source = "capture", ref = nu
   await sql.begin(async (tx) => {
     let g = (await tx`SELECT * FROM grants WHERE id = ${g0.id} FOR UPDATE`)[0];
     if (!g || g.status !== "active") return void (out.reason = "not_active:" + (g?.status || "gone"));
+    // A hold waits while anything under it is still open, exactly as a grant waits before it
+    // lets go (releaseExpiredGrant): until then the value pledged below may yet come back, and a
+    // hold that had already ended as captured could never pay it or give it back. This only
+    // LOOKS at the grants below; it locks none of them (child, then parent, is the only order).
+    let below = await tx`SELECT 1 FROM grants WHERE parent = ${g.id} AND status = 'active' LIMIT 1`;
+    if (below.length) return void (out.reason = "pledged_to_a_hold_below");
+    // Worked out from the row as it is now, under the lock, and BEFORE the flip: a hold with
+    // nothing of its own left to pay stays open (it is refunded at its deadline, which gives
+    // back nothing it does not have) instead of ending as a capture of nothing.
+    let amount = captureAmount(g),
+      d = { usd_cents: amount, calls: 0, deploys: 0 };
+    if (amount <= 0) return void (out.reason = "nothing_left_to_capture");
     let flipped = await tx`UPDATE grants SET status = 'captured' WHERE id = ${g.id} AND status = 'active' RETURNING id`;
     if (flipped.length !== 1) return void (out.reason = "already_resolved"); // someone else resolved it
-    let amount = normalizeUsage(parseJson(g.budget)).usd_cents,
-      d = { usd_cents: amount, calls: 0, deploys: 0 };
     // The payer PAID: convert the held reservation into a settlement on the parent — reserved down
     // (no longer held), settled up (spent). remaining is unchanged (the payer lost access at open);
-    // this is the OPPOSITE of refund, which returns reserved to the payer.
+    // this is the OPPOSITE of refund, which returns reserved to the payer. Only `amount` moves:
+    // anything paid out under this hold stays held on the parent, which is how spend below a
+    // grant is counted (unusedOf in grants.js).
     if (g.parent) {
       let p = (await tx`SELECT reserved, settled FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0];
       if (p) {
