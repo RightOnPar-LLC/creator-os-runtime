@@ -1,5 +1,5 @@
 // Routes: grant-holder API: grants, cog, deploys, ledger, events, tenant. Registration order is significant.
-import { HttpError, nowSec, parseJson } from "../util.js";
+import { HttpError, nowSec, parseJson, withRedactedIntent } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "../db.js";
 import { normalizeUsage, remainingBudget, TIERS } from "../policy.js";
 import { issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
@@ -155,8 +155,9 @@ app.get("/api/deploys", requireGrant("worker.status"), async (e) => {
 });
 app.get("/api/deploys/:id", requireGrant("worker.status"), async (e) => {
   let t = e.get("auth");
+  // The stored intent's env values never leave (util.js redactIntent).
   return e.json({
-    deploy: await refreshDeployStatus(t, e.req.param("id")),
+    deploy: withRedactedIntent(await refreshDeployStatus(t, e.req.param("id"))),
   });
 });
 app.post("/api/deploys/:id/restart", requireGrant("worker.restart"), async (e) => {
@@ -218,10 +219,12 @@ app.get("/api/approvals", requireGrant(null), async (e) => {
   let t = e.get("auth");
   // Subtree-scoped like /api/ledger: a caller sees approvals for its own grant and
   // its descendants; the root sees the whole tenant.
+  // A pending deploy's intent carries its env values; readers get the names only.
   return e.json({
-    approvals:
+    approvals: (
       await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${t.row.id} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
-      SELECT * FROM approvals WHERE tenant = ${t.tenant.id} AND grant_id IN (SELECT id FROM sub) ORDER BY created_at DESC LIMIT 100`,
+      SELECT * FROM approvals WHERE tenant = ${t.tenant.id} AND grant_id IN (SELECT id FROM sub) ORDER BY created_at DESC LIMIT 100`
+    ).map(withRedactedIntent),
   });
 });
 app.post("/api/approvals/:id", requireGrant(null), async (e) => {
