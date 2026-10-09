@@ -4171,6 +4171,42 @@ describe("18d. the count of keys left under an ended grant, and of budget still 
     expect(mine(await count(), root).withheld).toEqual([]);
   });
 
+  test("the same bound in usd_cents and deploys, with what the grant used itself and a key still active below", async () => {
+    // owner -> x -> c -> j (ended) and k (active). c lets go under the old sum after x let go under today's.
+    // Self-settle meters calls only, so what was used in usd_cents and deploys is written on the rows by hand,
+    // as a paid hold or a charged deploy would have left it.
+    const remaining = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
+    const give = (token, sub, budget, caps = ["grant.issue", "grant.read"]) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget } });
+    const used = (id, u) => dbQuery("UPDATE grants SET settled = $2::jsonb WHERE id = $1", [id, JSON.stringify(u)]);
+    const root = await newTenant("count-withheld-bound-money", "studio");
+    const before = await remaining(root.token);
+    const x = await give(root.token, "agent:x", { usd_cents: 1000, calls: 50, deploys: 10 });
+    const c = await give(x.json.token, "agent:c", { usd_cents: 600, calls: 20, deploys: 6 });
+    const j = await give(c.json.token, "agent:j", { usd_cents: 200, calls: 8, deploys: 3 }, ["grant.read"]);
+    const k = await give(c.json.token, "agent:k", { usd_cents: 150, calls: 6, deploys: 1 }, ["grant.read"]);
+    expect(k.status).toBe(201);
+    await used(x.json.id, { usd_cents: 50, calls: 3, deploys: 1 });
+    await used(j.json.id, { usd_cents: 100, calls: 5, deploys: 2 });
+    expect((await cancel(root.token, j.json.id)).json.revoked).toEqual([j.json.id]);
+    // x under today's sum, missing c: it gives back 1000 - 50 - 600, 50 - 3 - 20, 10 - 1 - 6
+    await cancelMissing(c.json.id, x.json.id, "now", () => cancel(root.token, x.json.id));
+    // c under the old sum, missing k: it gives back all it was given (it settled nothing itself)
+    await cancelMissing(k.json.id, c.json.id, "old", () => cancel(root.token, c.json.id));
+    const answer = mine(await count(), root);
+    expect(answer.withheld).toEqual([{
+      id: x.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", releases: 1,
+      gave_back: { usd_cents: 350, calls: 27, deploys: 3 },
+      would_give_back_now: { usd_cents: 950, calls: 47, deploys: 9 }, // its row: nothing is held on it any more
+      // really used at or under it: 50/3/1 by x itself, 100/5/2 by j, and k's whole 150/6/1 are still out
+      never_used: { usd_cents: 700, calls: 36, deploys: 6 },
+      short: { usd_cents: 350, calls: 9, deploys: 3 },
+    }]);
+    await passOn(answer.withheld[0]);
+    // the owner is left holding exactly what was used and what is still out: 300 / 14 / 4
+    expect(await remaining(root.token)).toEqual({ usd_cents: before.usd_cents - 300, calls: before.calls - 14, deploys: before.deploys - 4 });
+    expect(mine(await count(), root).withheld).toEqual([]);
+  });
+
   test("a grant that ended under the sum used before 2026-10-09 is never shown as holding anything back", async () => {
     // That sum gave back budget less settled, whatever was held on the grant: the missed key's whole budget went
     // back up with it, although the key could go on spending. So nothing is held above for such a key, and the
