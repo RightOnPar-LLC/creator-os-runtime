@@ -2,8 +2,9 @@
 // Do the cancel tests (section 18c of runtime.test.js) really test anything? For each rule that the 2026-10-09
 // change put into src/grants.js (and one line each of three files under src/routes) this takes the rule OUT of the source, runs those tests, and expects them to
 // FAIL. A rule whose removal nothing notices is a rule with no test. Same method as tours-controls.mjs.
-// The last eight are the rules of a refresh token used twice (src/routes/oauth.js): every grant of that client is
-// tried even when one cancel fails, the request then fails, and the same token used again takes what was left.
+// The last sixteen are the rules of a refresh token used twice (src/routes/oauth.js): every grant of that client is
+// tried even when one cancel fails, the request then fails, the same token used again takes what was left, and
+// nothing of another client is touched.
 //
 //   node test/cancel-controls.mjs        (from the repo root; about a minute)
 //
@@ -117,7 +118,7 @@ const BREAKS = [
   // A refresh token used twice (src/routes/oauth.js): every grant of that client is cancelled, also when one cancel fails.
   ["a refresh token used twice: the first cancel that fails ends the pass, and the grants after it stay live",
     "src/routes/oauth.js",
-    "          errors.push(err);\n          failed.push({ id, error: String(err?.message || err).slice(0, 200) });\n",
+    "          errors.push(err);\n          failed.push(id);\n",
     "          throw err;\n"],
   ["a refresh token used twice: a pass that left a grant answers as if every grant had been cancelled",
     "src/routes/oauth.js",
@@ -127,26 +128,58 @@ const BREAKS = [
     "src/routes/oauth.js",
     "      if (errors.length) throw errors[0];\n",
     "      if (errors.length) throw errors[errors.length - 1];\n"],
+  ["a refresh token used twice: a record that cannot be written is passed over, and the answer is \"grant revoked\"",
+    "src/routes/oauth.js",
+    "      } catch (err) {\n        errors.push(err);\n      }\n",
+    "      } catch (err) {}\n"],
   ["a refresh token used again does not find a grant an earlier pass left (it goes by the mark on the refresh rows)",
     "src/routes/oauth.js",
-    ", ...left.map((r) => r.grant_id)])],",
-    "])],"],
+    "          SELECT grant_id FROM marked\n          UNION SELECT r.grant_id FROM oauth_refresh r JOIN grants g ON g.id = r.grant_id WHERE r.client_id = ${existing.client_id} AND g.status = 'active'`,",
+    "          SELECT grant_id FROM marked`,"],
+  ["a refresh token used twice leaves a grant the client was moved off earlier (it takes only grants with over an hour left)",
+    "src/routes/oauth.js",
+    "WHERE r.client_id = ${existing.client_id} AND g.status = 'active'`,",
+    "WHERE r.client_id = ${existing.client_id} AND g.status = 'active' AND g.exp > ${nowSec() + 3600}`,"],
+  ["a refresh token used twice leaves the client's grants in another tenant that an earlier pass left",
+    "src/routes/oauth.js",
+    "WHERE r.client_id = ${existing.client_id} AND g.status = 'active'`,",
+    "WHERE r.client_id = ${existing.client_id} AND r.tenant = ${existing.tenant} AND g.status = 'active'`,"],
   ["a refresh token used again goes over every grant the client ever had, ended ones too",
     "src/routes/oauth.js",
     "WHERE r.client_id = ${existing.client_id} AND g.status = 'active'`,",
     "WHERE r.client_id = ${existing.client_id}`,"],
+  ["a refresh token used twice does not go after the grant of a row it marks when that grant has ended (nothing looks under it)",
+    "src/routes/oauth.js",
+    "          SELECT grant_id FROM marked\n          UNION SELECT r.grant_id",
+    "          SELECT r.grant_id"],
+  ["a refresh token used twice ends other clients' grants too (the list is not kept to that client)",
+    "src/routes/oauth.js",
+    "WHERE r.client_id = ${existing.client_id} AND g.status = 'active'`,",
+    "WHERE g.status = 'active'`,"],
+  ["a refresh token used twice marks other clients' refresh rows too, and ends their grants",
+    "src/routes/oauth.js",
+    "WHERE client_id = ${existing.client_id} AND revoked = false RETURNING grant_id)",
+    "WHERE revoked = false RETURNING grant_id)"],
   ["a refresh token used twice: the record does not say which grants were left",
     "src/routes/oauth.js",
-    "          cancelled,\n          failed,\n",
-    "          cancelled,\n          failed: [],\n"],
+    "            cancelled,\n            failed,\n",
+    "            cancelled,\n            failed: [],\n"],
   ["a refresh token used twice: the record does not say which grants were cancelled",
     "src/routes/oauth.js",
-    "          cancelled,\n          failed,\n",
-    "          cancelled: [],\n          failed,\n"],
+    "            cancelled,\n            failed,\n",
+    "            cancelled: [],\n            failed,\n"],
+  ["a refresh token used twice: the record, which a tenant's own key can read, names the keys under a grant and carries the database's words",
+    "src/routes/oauth.js",
+    "          if ((await revokeGrantTree(id, \"refresh_token_reuse_detected\", \"oauth\")).includes(id)) cancelled.push(id);\n        } catch (err) {\n          errors.push(err);\n          failed.push(id);\n",
+    "          cancelled.push(...(await revokeGrantTree(id, \"refresh_token_reuse_detected\", \"oauth\")));\n        } catch (err) {\n          errors.push(err);\n          failed.push({ id, error: String(err?.message || err) });\n"],
   ["a refresh token used twice: the log does not say that a grant was left",
     "src/routes/oauth.js",
     "      if (failed.length) console.error(`[oauth] refresh token reuse: ",
     "      if (0) console.error(`[oauth] refresh token reuse: "],
+  ["a refresh token used twice: the log names only the first grant that was left",
+    "src/routes/oauth.js",
+    "grants NOT cancelled: ${failed.join(\", \")};",
+    "grants NOT cancelled: ${failed[0]};"],
 ];
 
 const once = () => spawnSync(bun, ["test", "runtime.test.js", "-t", "18c\\. a cancel"], { cwd: here, env: { ...process.env, RUNTIME_ENTRY: "" }, encoding: "utf8", timeout: 300000 });
