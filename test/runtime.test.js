@@ -764,7 +764,7 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     for (const deadline of [now() + 600, String(now() + 600)]) {
       const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline }) });
       expect(r.status).toBe(201);
-      expect(Math.abs(r.json.escrow.deadline - Number(deadline))).toBeLessThanOrEqual(1);
+      expect(r.json.escrow.deadline).toBe(Number(deadline)); // to the second
     }
   });
 
@@ -835,6 +835,15 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     expect(check).toEqual({ name: "payment hold refused when the payer key's end cannot be read", pass: true });
   });
 
+  // The rule used where a hold's end is written (holdExpiry, policy.js): exactly the time asked,
+  // refused if a limit would end it sooner. /selftest runs it with a clock that moved on between
+  // the asking and the writing, which no request here can arrange.
+  test("where a hold's end is written, it is the time asked or a refusal, never sooner and never later", async () => {
+    const r = await req("GET", "/selftest");
+    const check = r.json.results.find((c) => c.name === "payment hold ends at the time asked, or is refused, never sooner");
+    expect(check).toEqual({ name: "payment hold ends at the time asked, or is refused, never sooner", pass: true });
+  });
+
   // The tier's longest lifetime was the other thing that cut a hold short without a word: the
   // owner's key asking for 20 days on a 7-day tier got a 201 and a 7-day hold.
   test("a payment hold asked to outlast the tier's longest lifetime is refused, never quietly shortened", async () => {
@@ -861,7 +870,7 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     expect(full.json.escrow.deadline).toBeGreaterThan(now() + week - 5);
     const byName = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: named }) });
     expect(byName.status).toBe(201);
-    expect(Math.abs(byName.json.escrow.deadline - named)).toBeLessThanOrEqual(1);
+    expect(byName.json.escrow.deadline).toBe(named);
   });
 
   // A key handed out on a bigger tier can outlive a move to a smaller one. Its holds follow the
@@ -892,6 +901,110 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     expect(ok.status).toBe(409);
     expect(ok.json.error).toBe("escrow_deadline_exceeds_tier_max");
     expect((await req("GET", "/api/grants/verify", { token: asker.json.token })).json.remaining.usd_cents).toBe(500); // nothing was held
+  });
+
+  // The tier is read more than once while a hold opens (the key check, the hold's own check,
+  // the issuing). If the tenant moves to a smaller tier between any two of those reads, the hold
+  // must be refused or kept whole. It used to come back 201, cut to the smaller tier's limit.
+  // One request cannot land in the middle of another here (one database session), so for this
+  // test `tenants` is a view that answers studio for the first K reads of this tenant and pro
+  // after that. Every K is tried, on the direct path and on the approvals path.
+  test("a tier that moves while a hold is being opened never cuts the hold short", async () => {
+    const t = await newTenant("hold-tier-races", "studio");
+    const day = 86400;
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 7 * day, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const held = async () => (await dbQuery("SELECT count(*)::int AS n FROM grants WHERE tenant = $1 AND sub LIKE 'escrow:%'", [t.id])).rows[0].n;
+    const cols = (await dbQuery("SELECT column_name FROM information_schema.columns WHERE table_name = 'tenants' ORDER BY ordinal_position")).rows.map((r) => r.column_name);
+    await dbQuery("CREATE TABLE tier_flip (after int NOT NULL, seen int NOT NULL)");
+    await dbQuery("INSERT INTO tier_flip VALUES (1000000, 0)");
+    await dbQuery(`CREATE FUNCTION tier_seen(tid text, real_tier text) RETURNS text LANGUAGE plpgsql VOLATILE AS $f$
+      DECLARE flipped boolean;
+      BEGIN
+        IF tid <> '${t.id}' THEN RETURN real_tier; END IF;
+        UPDATE tier_flip SET seen = seen + 1 RETURNING seen > after INTO flipped;
+        RETURN CASE WHEN flipped THEN 'pro' ELSE real_tier END;
+      END $f$`);
+    await dbQuery("ALTER TABLE tenants RENAME TO tenants_real");
+    await dbQuery(`CREATE VIEW tenants AS SELECT ${cols.map((c) => (c === "tier" ? "tier_seen(id, tier) AS tier" : c)).join(", ")} FROM tenants_real`);
+    const flipAfter = (k) => dbQuery("UPDATE tier_flip SET after = $1, seen = 0", [k]);
+    const direct = [], approved = [];
+    try {
+      for (let k = 0; k <= 6; k++) {
+        const before = await held();
+        const asked = now() + 3 * day; // fine on studio (7 days), too long for pro (1 day)
+        await flipAfter(k);
+        const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: asked }) });
+        await flipAfter(1000000);
+        if (r.status === 201) {
+          expect([k, r.json.escrow.deadline]).toEqual([k, asked]); // kept whole, to the second
+          expect(await held()).toBe(before + 1);
+        } else {
+          expect([k, r.status, r.json.error]).toEqual([k, 409, "escrow_deadline_exceeds_tier_max"]);
+          expect(r.json.detail.max_ttl_sec).toBe(day);
+          expect(await held()).toBe(before); // refused: nothing held
+        }
+        direct.push(r.status);
+      }
+      for (let k = 0; k <= 6; k++) {
+        const before = await held();
+        const asked = now() + 3 * day;
+        const filed = await req("POST", "/api/escrow", { token: asker.json.token, body: body({ deadline: asked }) });
+        expect(filed.status).toBe(202);
+        await flipAfter(k);
+        const r = await req("POST", `/api/approvals/${filed.json.approval.id}`, { token: t.token, body: { decision: "approve" } });
+        await flipAfter(1000000);
+        if (r.status === 200) {
+          expect([k, r.json.status, r.json.result.escrow.deadline]).toEqual([k, "executed", asked]);
+          expect(await held()).toBe(before + 1);
+        } else {
+          expect([k, r.status, r.json.error]).toEqual([k, 409, "escrow_deadline_exceeds_tier_max"]);
+          expect(await held()).toBe(before);
+        }
+        approved.push(r.status);
+      }
+    } finally {
+      await dbQuery("DROP VIEW tenants");
+      await dbQuery("ALTER TABLE tenants_real RENAME TO tenants");
+      await dbQuery("DROP FUNCTION tier_seen(text, text)");
+      await dbQuery("DROP TABLE tier_flip");
+    }
+    // The sweep really crossed the window: early moves are refused, late ones (after the last
+    // read) open, and once K is past the last read it stays open.
+    for (const seen of [direct, approved]) {
+      expect(seen[0]).toBe(409);
+      expect(seen[6] === 201 || seen[6] === 200).toBe(true);
+      const firstOpen = seen.findIndex((x) => x !== 409);
+      expect(seen.slice(firstOpen).every((x) => x !== 409)).toBe(true);
+    }
+    // and the table is back: a new tenant can be made
+    expect((await newTenant("hold-tier-races-after", "pro")).id).toBeTruthy();
+  });
+
+  // A tier name the runtime does not know (a wrong name in the price map, say) used to answer
+  // 500 for the owner's key and file an approval that could never open for an "ask" key.
+  test("no hold opens under a tier the runtime does not know, and the owner is not asked", async () => {
+    const t = await newTenant("hold-tier-unknown", "pro");
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    await dbQuery("UPDATE tenants SET tier = 'bogus' WHERE id = $1", [t.id]);
+    for (const token of [t.token, asker.json.token]) {
+      for (const over of [{}, { ttlSec: 600 }]) {
+        const r = await req("POST", "/api/escrow", { token, body: body(over) });
+        expect([r.status, r.json.error]).toEqual([403, "unknown_tier"]);
+      }
+    }
+    expect((await req("GET", "/api/approvals", { token: t.token })).json.approvals.length).toBe(0);
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE tenant = $1 AND sub LIKE 'escrow:%'", [t.id])).rows[0].n).toBe(0);
   });
 
   test("a lifetime that is not a number is a clean 400, not a server error", async () => {

@@ -12,6 +12,7 @@ import {
   attenuationViolations,
   CAPS,
   clampConstraints,
+  holdExpiry,
   memoryPartitions,
   normalizeUsage,
   remainingBudget,
@@ -113,8 +114,23 @@ export async function issueChildGrant(e, t, a, w = {}) {
     // and leave a later, valid delivery unpaid).
     o = Math.min(Math.max(60, Math.floor(ttlOf(t.ttlSec))), r.maxTtlSec, Number(e.depth) >= 1 && !w?.escrow ? AGENT_ISSUED_MAX_TTL_SEC : Infinity),
     l = nowSec(),
-    c = Math.min(l + o, Number(e.exp)),
-    E = {
+    c = Math.min(l + o, Number(e.exp));
+  // A payment hold that asked for a time (w.heldUntil, from openEscrow) ends at exactly that
+  // time and is never cut short. buildEscrow has already refused a time past the payer key's
+  // end or the tier's longest lifetime, but it read the tier before this function did. This is
+  // the last word, on the tier (`r`) and the clock (`l`) read just above: if the tier moved in
+  // between, the hold is refused here, not shortened.
+  let heldUntil = w?.escrow ? Number(w.heldUntil) || 0 : 0;
+  if (heldUntil) {
+    let limit = Math.min(l + r.maxTtlSec, Number(e.exp)),
+      end = holdExpiry(heldUntil, l, limit);
+    if (end === null)
+      throw Number(e.exp) < heldUntil
+        ? new HttpError(409, "escrow_deadline_exceeds_payer_key", { payer_exp: Number(e.exp) })
+        : new HttpError(409, "escrow_deadline_exceeds_tier_max", { max_ttl_sec: r.maxTtlSec, latest_deadline: limit });
+    c = end;
+  }
+  let E = {
       railway: {
         projects: t.scope?.railway?.projects ?? s.railway?.projects ?? [],
         environments: t.scope?.railway?.environments ?? s.railway?.environments ?? [],

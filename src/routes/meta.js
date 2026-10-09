@@ -2,7 +2,7 @@
 import { SERVICE_NAME } from "../config.js";
 import { hmacSha256, nowSec } from "../util.js";
 import { parseGrantToken, signGrantToken, vaultDecrypt, vaultEncrypt, vaultKey } from "../tokens.js";
-import { attenuationViolations, gatehouseEvaluate, zeroUsage } from "../policy.js";
+import { attenuationViolations, gatehouseEvaluate, holdExpiry, zeroUsage } from "../policy.js";
 import { verifyTimestampedSignature } from "../webhooks.js";
 import { app, routeInventory } from "../http.js";
 import { MCP_TOOLS } from "../mcp.js";
@@ -298,19 +298,47 @@ app.get("/selftest", async (e) => {
         ).length === 0,
     ),
     // No request can reach this (grants.exp is BIGINT NOT NULL), so it is proven here: a payer
-    // key whose end cannot be read must refuse the hold, never wave it through.
+    // key whose end cannot be read must refuse the hold, never wave it through. The key's end
+    // arrives from the database as a number, a numeric string or a bigint; all three must read.
     a("payment hold refused when the payer key's end cannot be read", () => {
-      let ask = { amount: 1, payee_tenant: "t_y", condition: { kind: "receipt:mesh" }, ttlSec: 600 },
-        refusal = (row) => {
+      let hold = { amount: 1, payee_tenant: "t_y", condition: { kind: "receipt:mesh" } },
+        refusal = (exp, over) => {
           try {
-            return (buildEscrow(row, ask, "starter"), null);
+            return (buildEscrow({ ...n, exp }, { ...hold, ...over }, "starter"), null);
           } catch (err) {
             return err?.code || String(err?.message || err);
           }
         },
-        readable = refusal(n),
-        unreadable = refusal({ ...n, exp: void 0 });
-      return (readable === null && unreadable === "escrow_deadline_exceeds_payer_key") || { readable, unreadable };
+        both = (exp) => [refusal(exp, { ttlSec: 600 }), refusal(exp, {})],
+        readable = [n.exp, String(n.exp), BigInt(n.exp)].flatMap(both),
+        unreadable = [void 0, null, "", "abc", "1e999", NaN, {}, [], !1].flatMap(both);
+      return (
+        (readable.every((x) => x === null) && unreadable.every((x) => x === "escrow_deadline_exceeds_payer_key")) || {
+          readable,
+          unreadable,
+        }
+      );
+    }),
+    // The rule issueChildGrant uses where a hold's end is written: holdExpiry(asked, now, limit).
+    a("payment hold ends at the time asked, or is refused, never sooner", () => {
+      let t0 = 1000000,
+        got = {
+          exact: holdExpiry(t0 + 600, t0 + 2, t0 + 3602), // the limits allow more: still the time asked
+          atLimit: holdExpiry(t0 + 600, t0 + 2, t0 + 600), // the limit IS the time asked
+          cut: holdExpiry(t0 + 600, t0 + 2, t0 + 599), // the limits would end it a second sooner
+          unread: holdExpiry(t0 + 600, t0 + 2, NaN), // limits that cannot be read
+          soon: holdExpiry(t0 + 5, t0 + 2, t0 + 3602), // under a minute away: the minute every key gets
+          soonAtLimit: holdExpiry(t0 + 5, t0 + 2, t0 + 30), // ...unless the limits end before that minute
+        };
+      return (
+        (got.exact === t0 + 600 &&
+          got.atLimit === t0 + 600 &&
+          got.cut === null &&
+          got.unread === null &&
+          got.soon === t0 + 62 &&
+          got.soonAtLimit === t0 + 30) ||
+        got
+      );
     }));
   let s = t.every((i) => i.pass || String(i.info || "").startsWith("skipped"));
   return e.json(

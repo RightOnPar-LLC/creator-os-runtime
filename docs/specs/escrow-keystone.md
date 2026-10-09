@@ -67,12 +67,16 @@ everything; add one scope block and two terminal statuses.
      for the default hour.
    - `ttlSec`, when given, must be a number (or a string that reads as one): else `400 ttl_invalid`.
    - A time asked for past the payer key's own end is refused: `409 escrow_deadline_exceeds_payer_key`
-     (`detail.payer_exp`). If the payer key's end cannot be read, nothing opens.
+     (`detail.payer_exp`). If the payer key's end cannot be read, or is not still ahead, nothing opens.
    - A time asked for past the tier's longest lifetime is refused the same way:
      `409 escrow_deadline_exceeds_tier_max` (`detail.max_ttl_sec`, and `detail.latest_deadline`, the
      latest time this key can ask for right now). It used to be cut to the tier's limit with a 201.
-     A time that was asked for is never cut short: it is kept or refused. One less than a minute
-     away is rounded up to the minute every key gets.
+   - A time that was asked for is never cut short: the hold ends at exactly that time, or the open
+     is refused. The check runs in `buildEscrow` and once more where the hold's end is written
+     (`holdExpiry` in `src/policy.js`, called by `issueChildGrant` on its own read of the tier and the clock), so a
+     tier that moves in the middle of a request refuses the hold instead of shortening it. A time
+     less than a minute away is rounded up to the minute every key gets.
+   - Nothing opens under a tier the runtime does not know: `403 unknown_tier`.
    - The default hour is not a promise. It still ends at the payer key's own end or at the tier's
      longest lifetime, whichever comes first. The answer carries the deadline the hold really got.
 2. **refund** = revoke, or let it expire. Release returns the held value to the payer. **Reuse
