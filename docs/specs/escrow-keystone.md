@@ -108,7 +108,13 @@ everything; add one scope block and two terminal statuses.
    - Then it pays the hold's amount less everything that was passed on: what was captured directly
      under it (`settled`) and what is held on it for spend further down (`reserved`; a grant keeps
      what the keys under it used held). `nothing_left_to_capture` if that was all of it.
-   - So captures can never credit more than the payer paid, at any depth and in any order.
+   - A hold whose hold above has already ended pays nothing (`hold_above_has_ended`). A hold above
+     waits for the holds under it, so one that ended first was ended by older code, which paid out
+     or gave back its whole amount, the part under it included.
+   - So a capture made under these rules never credits more than the payer paid, at any depth and
+     in any order.
+   - A capture that waited is not tried again by the runtime. The same receipt, sent again, is.
+     If it never is, the hold is refunded at its deadline.
 
 ## Condition kinds (start with two)
 

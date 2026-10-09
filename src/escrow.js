@@ -21,6 +21,14 @@ export const ESCROW_CUSTODY_CAP = "escrow.hold";
 // "", false and [] as 0, so those are not numbers here.
 var numberFrom = (v) => (typeof v === "number" || (typeof v === "string" && v.trim() !== "") ? Number(v) : NaN);
 
+// Is this grant a hold? Any `escrow` mark in its scope counts, whatever its shape (issueChildGrant
+// only ever writes an object there; a mark that was damaged must still read as a hold, so that a
+// hold is never taken for an ordinary key).
+var isHold = (grantRow) => {
+  let scope = parseJson(grantRow?.scope);
+  return !!scope && typeof scope === "object" && scope.escrow !== undefined;
+};
+
 // Validate the open request and shape the custodian child spec + the scope.escrow block.
 // Throws HttpError on any bad input; never partially opens. `tier` is the payer tenant's tier.
 export function buildEscrow(payerRow, params, tier) {
@@ -28,7 +36,7 @@ export function buildEscrow(payerRow, params, tier) {
   // the payer, and the custodian's one capability (escrow.hold, a marker) is the same one that
   // route asks for. Without this check that token could pledge the held value a second time:
   // two holds, two captures, two credits, one payment.
-  if (escrowBlock(payerRow)) throw new HttpError(403, "escrow_custodian_cannot_pay");
+  if (isHold(payerRow)) throw new HttpError(403, "escrow_custodian_cannot_pay");
   let p = params && typeof params === "object" && !Array.isArray(params) ? params : {};
   // amount: MESH-denominated commit, carried in usd_cents (the model's value slot). > 0.
   let amount = Math.floor(Number(p.amount ?? p.usd_cents ?? 0));
@@ -159,8 +167,9 @@ export function serializeEscrow(grantRow) {
 // less only when value was passed on under the hold: what was captured directly under it is in
 // `settled`, and whatever is held on it is either still pledged to a hold underneath or was
 // spent further down (a grant keeps what the keys under it used held, see unusedOf in grants.js).
-// Neither is this hold's to pay. So captures can never credit more than the payer paid,
-// whatever is under a hold. (captureEscrow also waits while anything under the hold is still open.)
+// Neither is this hold's to pay. So a capture made under this rule never credits more than the
+// payer paid, whatever is under the hold. (captureEscrow also waits while anything under the hold
+// is still open, and pays nothing to a hold whose hold above has already ended.)
 export function captureAmount(grantRow) {
   let budget = normalizeUsage(parseJson(grantRow.budget)).usd_cents,
     held = normalizeUsage(parseJson(grantRow.reserved)).usd_cents,
@@ -211,6 +220,13 @@ export async function captureEscrow(idOrEscrowId, { source = "capture", ref = nu
     let amount = captureAmount(g),
       d = { usd_cents: amount, calls: 0, deploys: 0 };
     if (amount <= 0) return void (out.reason = "nothing_left_to_capture");
+    // The grant this hold sits under, locked here: child, then parent, the order every writer
+    // takes. If that grant is itself a hold and has already ended, this hold pays nothing. A hold
+    // above waits for the holds under it (just above), so one that ended while this one was
+    // still open was ended by older code, which paid out or gave back its WHOLE amount, this
+    // hold's part included. Paying this one as well is the double credit.
+    let p = g.parent ? (await tx`SELECT status, scope, reserved, settled FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0] : null;
+    if (p && p.status !== "active" && isHold(p)) return void (out.reason = "hold_above_has_ended");
     let flipped = await tx`UPDATE grants SET status = 'captured' WHERE id = ${g.id} AND status = 'active' RETURNING id`;
     if (flipped.length !== 1) return void (out.reason = "already_resolved"); // someone else resolved it
     // The payer PAID: convert the held reservation into a settlement on the parent — reserved down
@@ -218,13 +234,10 @@ export async function captureEscrow(idOrEscrowId, { source = "capture", ref = nu
     // this is the OPPOSITE of refund, which returns reserved to the payer. Only `amount` moves:
     // anything paid out under this hold stays held on the parent, which is how spend below a
     // grant is counted (unusedOf in grants.js).
-    if (g.parent) {
-      let p = (await tx`SELECT reserved, settled FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0];
-      if (p) {
-        let rem = subtractUsage(normalizeUsage(parseJson(p.reserved)), d),
-          set = addUsage(normalizeUsage(parseJson(p.settled)), d);
-        await tx`UPDATE grants SET reserved = ${{ usd_cents: Math.max(0, rem.usd_cents), calls: Math.max(0, rem.calls), deploys: Math.max(0, rem.deploys) }}::jsonb, settled = ${set}::jsonb WHERE id = ${g.parent}`;
-      }
+    if (p) {
+      let rem = subtractUsage(normalizeUsage(parseJson(p.reserved)), d),
+        set = addUsage(normalizeUsage(parseJson(p.settled)), d);
+      await tx`UPDATE grants SET reserved = ${{ usd_cents: Math.max(0, rem.usd_cents), calls: Math.max(0, rem.calls), deploys: Math.max(0, rem.deploys) }}::jsonb, settled = ${set}::jsonb WHERE id = ${g.parent}`;
     }
     // Two ledger rows are the durable record of truth (not the generic outbox, whose env-guard would
     // drop a cross-tenant credit and whose deliverer would reject the kind): the payer's spend, and

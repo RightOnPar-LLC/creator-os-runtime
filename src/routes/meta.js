@@ -323,7 +323,7 @@ app.get("/selftest", async (e) => {
     // rule that keeps two captures from paying twice is proven here on such rows.
     a("payment hold cannot pay for another hold, and a capture never pays out what was passed on", () => {
       let ask = { amount: 1, payee_tenant: "t_y", condition: { kind: "receipt:mesh" } },
-        asHold = { ...n, scope: { ...n.scope, escrow: { escrow_id: "es_x", payee_tenant: "t_z" } } },
+        asHold = (mark) => ({ ...n, scope: { ...n.scope, escrow: mark } }),
         refusal = (row) => {
           try {
             return (buildEscrow(row, ask, "starter"), null);
@@ -334,7 +334,9 @@ app.get("/selftest", async (e) => {
         row = (budget, reserved, settled) => ({ budget: { usd_cents: budget }, reserved: { usd_cents: reserved }, settled: { usd_cents: settled } }),
         got = {
           plainKeyPays: refusal(n),
-          holdPays: refusal(asHold),
+          // a hold, however its mark reads (only an object is ever written; a damaged one is still a hold)
+          holdPays: [{ escrow_id: "es_x", payee_tenant: "t_z" }, {}, [], "x", !0, 1, null].map((mark) => refusal(asHold(mark))),
+          holdAsText: refusal({ ...n, scope: JSON.stringify({ ...n.scope, escrow: { escrow_id: "es_x" } }) }),
           whole: captureAmount(row(100, 0, 0)), // nothing under it: all of it
           allHeldBelow: captureAmount(row(100, 100, 0)), // all of it held for what is under it: none of it
           partHeldBelow: captureAmount(row(100, 40, 0)), // 40 held for what is under it: the other 60
@@ -346,7 +348,8 @@ app.get("/selftest", async (e) => {
         };
       return (
         (got.plainKeyPays === null &&
-          got.holdPays === "escrow_custodian_cannot_pay" &&
+          got.holdPays.every((x) => x === "escrow_custodian_cannot_pay") &&
+          got.holdAsText === "escrow_custodian_cannot_pay" &&
           got.whole === 100 &&
           got.allHeldBelow === 0 &&
           got.partHeldBelow === 60 &&

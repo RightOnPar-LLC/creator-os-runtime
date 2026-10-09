@@ -3420,6 +3420,22 @@ describe("19. escrow keystone (stage 1: open + read)", () => {
     expect((await remainingOf(asker.json.token)).usd_cents).toBe(400);
   });
 
+  // A request a hold's own token filed BEFORE this rule existed, approved after it: the approval
+  // runs the same check (it is in buildEscrow, not only on the route), fails, and opens nothing.
+  test("CONTROL: an approval that a hold's token filed earlier opens nothing when the owner approves it", async () => {
+    const root = await newTenant("escrow-nest-old-ask", "pro");
+    const outer = await req("POST", "/api/escrow", { token: root.token, body: openBody({ amount: 100 }) });
+    expect(outer.status).toBe(201);
+    await dbQuery("INSERT INTO approvals (id, tenant, grant_id, action, intent, autonomy, requested_by) VALUES ($1, $2, $3, 'escrow.open', $4::jsonb, 1, 'escrow:agent:q')",
+      ["ap_old_hold_ask", root.id, outer.json.escrow.grant_id, JSON.stringify(openBody({ amount: 100 }))]);
+    const ok = await req("POST", "/api/approvals/ap_old_hold_ask", { token: root.token, body: { decision: "approve" } });
+    expect([ok.status, ok.json.error]).toEqual([403, "escrow_custodian_cannot_pay"]);
+    const row = (await req("GET", "/api/approvals", { token: root.token })).json.approvals.find((a) => a.id === "ap_old_hold_ask");
+    expect(row.status).toBe("failed");
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [outer.json.escrow.grant_id])).rows[0].n).toBe(0);
+    expect((await remainingOf(outer.json.token)).usd_cents).toBe(100);
+  });
+
   test("CONTROL: a plain grant is not an escrow; an unknown id is not found", async () => {
     const root = await newTenant("escrow-notesc", "pro");
     expect((await req("GET", "/api/escrow/" + root.grantId, { token: root.token })).status).toBe(404); // the root grant is not an escrow
@@ -3626,8 +3642,10 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
 
   // A hold under a hold cannot be opened any more (section 19), so these tests build the rows an
   // older one would have left: two holds opened side by side, then the second moved under the
-  // first exactly as if the first hold's own token had opened it (its reservation sits on the
-  // first hold, not on the payer).
+  // first. What capture, refund and the sweep read is then as the first hold's own token would
+  // have left it: parent, depth, and the second hold's reservation held on the first, not on
+  // the payer. (Fields none of them reads are left as they were: issued_by, the stored token,
+  // the note of the payer inside the hold's own mark, the reserve row in the ledger.)
   const nested = async (name, outerAmount, innerAmount) => {
     const root = await newTenant(name, "pro");
     const before = (await remainingOf(root.token)).usd_cents;
@@ -3670,6 +3688,7 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     expect((await receiptFor(n.inner)).json.escrow).toMatchObject({ captured: true, amount: 100 });
     const again = await receiptFor(n.outer); // and now its value has been paid out below
     expect(again.json.escrow).toMatchObject({ captured: false, reason: "nothing_left_to_capture" });
+    expect(await n.stateOf(n.outer)).toBe("open"); // still open: it did not end as a capture of nothing
     expect(await n.credits()).toEqual({ outer: 0, inner: 100 });
     expect(await n.paid()).toBe(100);
   });
@@ -3704,6 +3723,32 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     expect(await n.paid()).toBe(100);
   });
 
+  // What older code could leave behind: the hold above already ended, paid out or given back
+  // WHOLE, while the hold under it was still open. The hold under it must not be paid as well.
+  test("CONTROL: a hold whose hold above already ended (older code paid or refunded it whole) pays nothing", async () => {
+    const setCol = (id, col, cents) => dbQuery(`UPDATE grants SET ${col} = $2::jsonb WHERE id = $1`, [id, JSON.stringify({ usd_cents: cents, calls: 0, deploys: 0 })]);
+    // the hold above was CAPTURED whole: the payer settled 100 and its payee was credited 100
+    const cap = await nested("above-captured", 100, 100);
+    const payer = await cap.books();
+    await dbQuery("UPDATE grants SET status = 'captured' WHERE id = $1", [cap.outer.grant_id]);
+    await setCol(cap.root.grantId, "reserved", payer.held - 100);
+    await setCol(cap.root.grantId, "settled", payer.settled + 100);
+    await dbQuery("INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note) VALUES ($1, $2, $3, 'mesh-credit', 100, 0, 0, $4, 'as older code wrote it')", ["t_outer_above-captured", cap.outer.grant_id, cap.root.grantId, cap.outer.id]);
+    expect(await cap.credits()).toEqual({ outer: 100, inner: 0 });
+    expect((await receiptFor(cap.inner)).json.escrow).toMatchObject({ captured: false, reason: "hold_above_has_ended" });
+    expect(await cap.credits()).toEqual({ outer: 100, inner: 0 }); // not 100 + 100
+    expect(await cap.paid()).toBe(100);
+    // the hold above was REFUNDED whole: the payer has all of it back, so nobody may be paid from it
+    const ref = await nested("above-refunded", 100, 100);
+    const payer2 = await ref.books();
+    await dbQuery("UPDATE grants SET status = 'expired' WHERE id = $1", [ref.outer.grant_id]);
+    await setCol(ref.root.grantId, "reserved", payer2.held - 100);
+    expect(await ref.paid()).toBe(0);
+    expect((await receiptFor(ref.inner)).json.escrow).toMatchObject({ captured: false, reason: "hold_above_has_ended" });
+    expect(await ref.credits()).toEqual({ outer: 0, inner: 0 });
+    expect(await ref.paid()).toBe(0);
+  });
+
   // Any shape of holds under holds, built the same way: each hold in `plan` is { amount, under }
   // where `under` is the index of an earlier hold in the plan, or null for the payer itself.
   const tree = async (name, plan) => {
@@ -3735,6 +3780,8 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
       credits: async () => { const out = []; for (const h of holds) out.push(await credited(h.payee)); return out; },
       statusOf: async (h) => (await dbQuery("SELECT status FROM grants WHERE id = $1", [h.grant_id])).rows[0].status,
       revoke: (h) => admin("POST", "/api/admin/grants/" + h.grant_id + "/revoke", { body: { reason: "test refund" } }),
+      // its deadline goes by and the sweep runs (the sweep leaves it alone while anything under it is open)
+      expire: async (h) => { await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [h.grant_id, Math.floor(Date.now() / 1000) - 10]); return admin("POST", "/api/admin/grants/reap"); },
     };
   };
 
@@ -3763,7 +3810,7 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
   });
 
   // Every shape and every order at once. Random trees of holds under holds (a fixed seed, so a
-  // failure repeats), then deliveries and refunds in random order until nothing is open.
+  // failure repeats), then deliveries, refunds and deadlines in random order until nothing is open.
   // Two things must hold: payees are never credited more than the payer is out, at any moment;
   // and when everything has ended the two are EQUAL (nothing made, nothing lost).
   test("CONTROL: any tree of holds, any order of deliveries and refunds — credits never pass what the payer paid, and end equal to it", async () => {
@@ -3775,7 +3822,7 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
       x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x;
       return ((x ^ (x >>> 14)) >>> 0) % n;
     };
-    const shapes = { nested: 0, threeDeep: 0, waited: 0, deliveries: 0, refunds: 0 };
+    const shapes = { nested: 0, threeDeep: 0, waited: 0, deliveries: 0, refunds: 0, deadlines: 0 };
     for (let round = 0; round < 24; round++) {
       const plan = [], free = [];
       const count = 2 + rnd(4); // 2 to 5 holds
@@ -3798,7 +3845,9 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
         for (const h of t.holds) if ((await t.statusOf(h)) === "active") open.push(h);
         if (!open.length) break;
         const h = open[rnd(open.length)];
-        if (rnd(3) === 0) (shapes.refunds++, await t.revoke(h));
+        const op = rnd(5);
+        if (op === 0) (shapes.refunds++, await t.revoke(h));
+        else if (op === 1) (shapes.deadlines++, await t.expire(h));
         else {
           const r = await receiptFor(h);
           shapes.deliveries++;
@@ -3824,6 +3873,7 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     expect(shapes.waited).toBeGreaterThan(3);
     expect(shapes.deliveries).toBeGreaterThan(20);
     expect(shapes.refunds).toBeGreaterThan(5);
+    expect(shapes.deadlines).toBeGreaterThan(5);
   }, 30000); // about a second here; the default limit of five leaves too little room on a slow machine
 
   // The same rule on the running build, where no request can make such rows: /selftest.
