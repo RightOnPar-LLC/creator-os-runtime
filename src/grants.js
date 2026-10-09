@@ -245,16 +245,35 @@ export async function issueChildGrant(e, t, a, w = {}) {
     }
   );
 }
+// What a grant has NOT used, which is what goes back to its parent when it ends: what it was given, less
+// what it settled itself, less what is still held on it for the keys under it. Once those keys have
+// ended, what is still held IS what they used. So a key's spend counts against every grant above it, all
+// the way up. (Before 2026-10-09 the last term was missing: spend two levels down was forgotten the
+// moment the grant in between ended, and the grant above got its whole budget back.)
+function unusedOf(g, heldNow) {
+  let u = subtractUsage(subtractUsage(normalizeUsage(parseJson(g.budget)), normalizeUsage(parseJson(g.settled))), normalizeUsage(parseJson(heldNow)));
+  return { usd_cents: Math.max(0, u.usd_cents), calls: Math.max(0, u.calls), deploys: Math.max(0, u.deploys) };
+}
 export async function revokeGrantTree(e, t, a) {
   let n = [];
   if (
     (await sql.begin(async (r) => {
-      let s = await r`WITH RECURSIVE sub AS (SELECT * FROM grants WHERE id = ${e}
-      UNION ALL SELECT g.* FROM grants g JOIN sub ON g.parent = sub.id) SELECT * FROM sub ORDER BY depth DESC FOR UPDATE`;
-      for (let i of s) {
-        if (i.status !== "active") continue;
-        await r`UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = ${t} WHERE id = ${i.id}`;
-        let o = subtractUsage(normalizeUsage(parseJson(i.budget)), normalizeUsage(parseJson(i.settled)));
+      // Deepest first, so that by the time a grant is reached everything under it THAT WAS IN THIS LIST has let
+      // go. This is only the list: it locks nothing (the FOR UPDATE that used to sit here was on a WITH query,
+      // which Postgres does not lock), so each grant is taken and flipped below in ONE statement.
+      // KNOWN GAP, older than this note and now failing safe: a child issued under a grant AFTER the list was read
+      // and before that grant is flipped is not in the list. It stays live under a cancelled parent, and its whole
+      // budget stays held on the grant above for good (before 2026-10-09 it was handed out a second time instead).
+      // Closing it means re-listing a grant's children after its flip; see the follow-up on the pull request.
+      let s = await r`WITH RECURSIVE sub AS (SELECT id, depth FROM grants WHERE id = ${e}
+      UNION ALL SELECT g.id, g.depth FROM grants g JOIN sub ON g.parent = sub.id) SELECT id FROM sub ORDER BY depth DESC`;
+      for (let { id } of s) {
+        // Only the caller that really moves the row from active lets it go (a sweep may have got there first: never
+        // release twice), and what it gives back is worked out from the row AS IT IS NOW (a settle may have landed,
+        // and the grants under it have let go, since the list was read).
+        let i = (await r`UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = ${t} WHERE id = ${id} AND status = 'active' RETURNING *`)[0];
+        if (!i) continue;
+        let o = unusedOf(i, i.reserved);
         if (i.parent) {
           let l = (await r`SELECT reserved FROM grants WHERE id = ${i.parent} FOR UPDATE`)[0],
             c = subtractUsage(normalizeUsage(parseJson(l.reserved)), o);
@@ -359,17 +378,25 @@ export async function lowerGrantAutonomy(caller, targetId, level) {
   await recordEvent("grant.autonomy_lowered", { id: targetId, from: current, to: next, cascaded: changed.length }, t.tenant, caller.sub);
   return { id: targetId, from: AUTONOMY_LEVELS[current], to: AUTONOMY_LEVELS[next], grantsChanged: changed.length };
 }
-// Release a child grant's UNSPENT reservation (budget - settled, the same amount
-// revokeGrantTree computes) back to its parent when it transitions active->expired.
-// The `RETURNING id` length guard is the idempotency lever: only the call that
+// Release a grant's UNUSED reservation (unusedOf: budget - settled - what is still held on it for the keys
+// under it; the same amount revokeGrantTree computes) back to its parent when it transitions active->expired.
+// The `RETURNING` row-count guard is the idempotency lever: only the call that
 // actually flips the row releases, so a second sweep, the lazy verify path, and a
 // later revoke can never double-credit the parent. Mirrors revokeGrantTree's
 // release (same math, same 'release' ledger row).
 async function releaseExpiredGrant(tx, g) {
-  let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING id`;
+  // A grant lets go only AFTER everything under it has. Until then what is held on it is not yet "what the keys
+  // under it used", so it waits: the sweep goes deepest first, and a child never outlives its parent, so anything
+  // still active under an expired grant is itself due for the sweep (this pass, or the next if another writer held
+  // it). This only LOOKS at the children; it never locks one. The transaction holds one grant and then its parent
+  // and nothing else: child, then parent. (revokeGrantTree is the one writer that does hold a parent while taking
+  // the next sibling; that is as it was, and a deadlock there aborts one side without changing any balance.)
+  let waiting = await tx`SELECT 1 FROM grants WHERE parent = ${g.id} AND status = 'active' LIMIT 1`;
+  if (waiting.length) return !1;
+  let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING reserved`;
   if (flipped.length !== 1) return !1; // someone else already moved it (revoked/expired) — never double-release
   if (!g.parent) return !0; // a root holds no reservation upward
-  let unspent = subtractUsage(normalizeUsage(parseJson(g.budget)), normalizeUsage(parseJson(g.settled))),
+  let unspent = unusedOf(g, flipped[0].reserved),
     p = (await tx`SELECT reserved FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0];
   if (p) {
     let c = subtractUsage(normalizeUsage(parseJson(p.reserved)), unspent);
@@ -446,7 +473,8 @@ export async function verifyGrant(e, t, a, countRate = !0) {
     if (Number(r.exp) <= nowSec()) {
       // lazy release: a re-presented expired token frees its reservation now, via
       // the SAME helper the sweep uses (idempotent — the RETURNING guard means the
-      // sweep won't release it again).
+      // sweep won't release it again). If a key under it is still waiting for the
+      // sweep, nothing is freed here: the sweep takes both, lower one first.
       await sql.begin(async (tx) => {
         let g = (await tx`SELECT * FROM grants WHERE id = ${r.id} FOR UPDATE`)[0];
         if (g) await releaseExpiredGrant(tx, g);
