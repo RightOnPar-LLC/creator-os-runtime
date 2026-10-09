@@ -81,6 +81,17 @@ CREATE TABLE IF NOT EXISTS approvals (
   autonomy INT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', requested_by TEXT, approver TEXT,
   created_at TIMESTAMPTZ DEFAULT now(), decided_at TIMESTAMPTZ, result JSONB);
 CREATE INDEX IF NOT EXISTS approvals_tenant_status ON approvals(tenant, status);
+-- Tours (tours.js): the record that lets one named agent keep renewing a 24-hour key until its end date.
+-- grant_id is the holding grant (never a credential). current_key is the one live day key, or NULL
+-- while a renewal is in hand, after a freeze, or after the end.
+CREATE TABLE IF NOT EXISTS tours (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL, grant_id TEXT NOT NULL REFERENCES grants(id), agent TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active', current_key TEXT, renewals INT NOT NULL DEFAULT 0,
+  opened_at BIGINT NOT NULL, until BIGINT NOT NULL, last_renewed_at BIGINT NOT NULL, opened_by TEXT, frozen_reason TEXT,
+  created_at TIMESTAMPTZ DEFAULT now());
+CREATE INDEX IF NOT EXISTS tours_tenant ON tours(tenant);
+CREATE INDEX IF NOT EXISTS tours_current_key ON tours(current_key);
+CREATE INDEX IF NOT EXISTS tours_grant ON tours(grant_id);
 `;
 export async function migrateSchema() {
   for (let e of SCHEMA_SQL.split(";")

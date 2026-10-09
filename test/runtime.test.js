@@ -1068,6 +1068,259 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
 });
 
 // ------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------
+// Tours (src/tours.js, docs/specs/tours.md): more TIME for an agent without a longer key.
+describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the owner set", () => {
+  const DAY = 86400;
+  const now = () => Math.floor(Date.now() / 1000);
+  const SPEC = { agent: "report.agent", days: 3, caps: ["memory.read", "memory.write", "grant.read", "ledger.read"], budget: { usd_cents: 0, calls: 100, deploys: 0 } };
+  const open = (t, over = {}) => req("POST", "/api/tours", { token: t.token, body: { ...SPEC, ...over } });
+  const renew = (token) => req("POST", "/api/tours/renew", { token, body: {} });
+  const works = async (token) => (await req("GET", "/api/grants", { token })).status;
+  // a renewal may not follow another within a minute: move the tour's clock back instead of waiting
+  const rested = (tourId) => dbQuery("UPDATE tours SET last_renewed_at = last_renewed_at - 3600 WHERE id = $1", [tourId]);
+  const reservedOf = async (grantId) => JSON.parse(JSON.stringify((await dbQuery("SELECT reserved FROM grants WHERE id = $1", [grantId])).rows[0].reserved));
+
+  test("the owner opens a tour: the stay is days long, the key is 24 hours at most, and it opens only that agent's memory", async () => {
+    const t = await newTenant("tour-open", "studio");
+    const r = await open(t);
+    expect(r.status).toBe(201);
+    const { tour, key, receipt } = r.json;
+    expect(tour.status).toBe("active");
+    expect(tour.agent).toBe("report.agent");
+    expect(tour.until).toBeGreaterThan(now() + 3 * DAY - 60);
+    expect(tour.until).toBeLessThanOrEqual(now() + 3 * DAY);
+    expect(key.exp).toBeLessThanOrEqual(now() + DAY); // the KEY is never longer than a day
+    expect(key.exp).toBeGreaterThan(now() + DAY - 60);
+    expect(key.sub).toBe("agent:report.agent");
+    expect(key.caps).toEqual(SPEC.caps);
+    expect(key.budget.calls).toBe(100);
+    expect(receipt.tour).toBe(tour.id);
+    expect(receipt.first_key).toBe(key.id);
+    // exactly ONE key is handed out: the holding grant's token is never in the answer
+    expect(r.text.match(/cog1\./g).length).toBe(1);
+    expect(await works(key.token)).toBe(200);
+    // its memory is the section kept under the agent's NAME, and no other
+    expect((await req("POST", "/api/memory", { token: key.token, body: { partition: "agent:report.agent:", key: "k", content: "mine" } })).status).toBe(201);
+    expect((await req("POST", "/api/memory", { token: key.token, body: { partition: "agent:report.agent2:", key: "k", content: "not mine" } })).status).toBe(403);
+    expect((await req("GET", "/api/memory?partition=tenant", { token: key.token })).status).toBe(403);
+  });
+
+  test("the holding grant is a record, never a credential: even a token minted for it by the admin is refused", async () => {
+    const t = await newTenant("tour-holder", "studio");
+    const r = await open(t);
+    const minted = await admin("POST", `/api/admin/grants/${r.json.receipt.holding_grant}/token`);
+    expect(minted.status).toBe(200);
+    const use = await req("GET", "/api/tenant", { token: minted.json.token });
+    expect(use.status).toBe(401);
+    expect(use.json.error).toBe("holding_grant");
+    expect((await req("POST", "/api/grants", { token: minted.json.token, body: { sub: "agent:x", caps: ["grant.read"] } })).status).toBe(401);
+    expect((await renew(minted.json.token)).status).toBe(401);
+  });
+
+  test("only the owner opens a tour, and a bad request holds nothing", async () => {
+    const t = await newTenant("tour-refuse", "studio");
+    const before = await reservedOf(t.grantId);
+    const helper = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:helper", caps: ["grant.issue", "grant.read", "memory.read"], ttlSec: 3600, budget: { usd_cents: 0, calls: 10, deploys: 0 } } });
+    const mid = await reservedOf(t.grantId);
+    const notOwner = await req("POST", "/api/tours", { token: helper.json.token, body: SPEC });
+    expect(notOwner.status).toBe(403);
+    expect(notOwner.json.error).toBe("owner_required");
+    for (const [over, error] of [
+      [{ agent: "Report Agent" }, "tour_agent_required"], [{ agent: "" }, "tour_agent_required"], [{ agent: "../x" }, "tour_agent_required"], [{ agent: "a:b" }, "tour_agent_required"], [{ agent: ["report"] }, "tour_agent_required"],
+      [{ days: 0 }, "tour_days_invalid"], [{ days: 8 }, "tour_days_invalid"], [{ days: 1.5 }, "tour_days_invalid"], [{ days: "3" }, "tour_days_invalid"], [{ days: undefined }, "tour_days_invalid"],
+      [{ caps: [] }, "tour_caps_required"], [{ caps: "memory.read" }, "tour_caps_required"], [{ caps: [1] }, "tour_caps_required"],
+      [{ budget: undefined }, "tour_budget_required"], [{ budget: { usd_cents: 0, calls: 0, deploys: 0 } }, "tour_budget_required"], [{ budget: [100] }, "tour_budget_required"],
+    ]) {
+      const r = await open(t, over);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe(error);
+    }
+    // powers the owner's own key does not have, or more money than it has, are refused by the ordinary rule
+    expect((await open(t, { caps: ["memory.read", "not.a.cap"] })).status).toBe(403);
+    expect((await open(t, { budget: { usd_cents: 99999999, calls: 1, deploys: 0 } })).status).toBeGreaterThanOrEqual(402);
+    expect(await reservedOf(t.grantId)).toEqual(mid); // none of the refusals left anything held
+    expect(mid.calls).toBe(before.calls + 10);
+    // a tier that allows keys of one day cannot be given a three-day stay
+    const pro = await newTenant("tour-tier", "pro");
+    const tooLong = await open(pro);
+    expect(tooLong.status).toBe(403);
+    expect(tooLong.json.error).toBe("tour_exceeds_tier");
+    expect(tooLong.json.detail.max_days).toBe(1);
+    // one tour per agent name
+    expect((await open(t)).status).toBe(201);
+    const again = await open(t);
+    expect(again.status).toBe(409);
+    expect(again.json.error).toBe("tour_exists");
+    expect((await open(t, { agent: "other.agent" })).status).toBe(201);
+  });
+
+  test("renewing: the old key stops, the new one works, and time never refills money", async () => {
+    const t = await newTenant("tour-renew", "studio");
+    const first = (await open(t)).json;
+    expect((await req("POST", "/api/grants/settle", { token: first.key.token, body: { calls: 30, ref: "work:day1" } })).status).toBe(200);
+    const soon = await renew(first.key.token);
+    expect(soon.status).toBe(429); // not twice within a minute
+    expect(soon.json.error).toBe("tour_renew_too_soon");
+    expect(await works(first.key.token)).toBe(200); // a refused renewal changes nothing
+    await rested(first.tour.id);
+    const second = await renew(first.key.token);
+    expect(second.status).toBe(201);
+    expect(second.json.key.id).not.toBe(first.key.id);
+    expect(second.json.key.exp).toBeLessThanOrEqual(now() + DAY);
+    expect(second.json.key.budget.calls).toBe(70); // 100 at the start, 30 spent on day one
+    expect(second.json.tour.renewals).toBe(1);
+    expect(second.json.tour.left.calls).toBe(70);
+    expect(second.json.receipt.replaced_key).toBe(first.key.id);
+    expect(await works(first.key.token)).toBe(401);
+    expect(await works(second.json.key.token)).toBe(200);
+    // the same memory, the moment the new key exists
+    expect((await req("POST", "/api/memory", { token: second.json.key.token, body: { partition: "agent:report.agent:", key: "day2", content: "carried on" } })).status).toBe(201);
+    // the old key cannot renew again, and neither can a key that is not a tour's current key
+    expect((await renew(first.key.token)).status).toBe(401);
+    expect((await renew(t.token)).status).toBe(404);
+    const plain = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:plain", caps: ["grant.read"], ttlSec: 600 } });
+    const notTour = await renew(plain.json.token);
+    expect(notTour.status).toBe(404);
+    expect(notTour.json.error).toBe("not_a_tour_key");
+  });
+
+  test("the alarm: a key that a renewal replaced, used again later, freezes the tour until the owner steps in", async () => {
+    const t = await newTenant("tour-alarm", "studio");
+    const first = (await open(t, { caps: [...SPEC.caps, "grant.issue"] })).json;
+    const helper = await req("POST", "/api/grants", { token: first.key.token, body: { sub: "agent:helper", caps: ["grant.read"], ttlSec: 600, budget: { usd_cents: 0, calls: 5, deploys: 0 } } });
+    expect(helper.status).toBe(201);
+    await rested(first.tour.id);
+    const second = (await renew(first.key.token)).json;
+    // straight after the renewal the old key is simply refused: a call that was already on its way is not an alarm
+    expect(await works(first.key.token)).toBe(401);
+    expect(await works(second.key.token)).toBe(200);
+    expect((await req("GET", "/api/tours", { token: t.token })).json.tours[0].status).toBe("active");
+    // a helper the old key had hired is gone with it, and ITS late use is not the alarm either
+    await dbQuery("UPDATE grants SET revoked_at = now() - interval '10 minutes' WHERE id = $1", [helper.json.id]);
+    expect(await works(helper.json.token)).toBe(401);
+    expect((await req("GET", "/api/tours", { token: t.token })).json.tours[0].status).toBe("active");
+    // ten minutes later the replaced key turns up again: somebody else has a copy
+    await dbQuery("UPDATE grants SET revoked_at = now() - interval '10 minutes' WHERE id = $1", [first.key.id]);
+    expect(await works(first.key.token)).toBe(401);
+    const frozen = (await req("GET", "/api/tours", { token: t.token })).json.tours[0];
+    expect(frozen.status).toBe("frozen");
+    expect(frozen.frozen_reason).toContain("used again");
+    expect(await works(second.key.token)).toBe(401); // the current key is cancelled with it
+    expect((await renew(second.key.token)).status).toBe(401);
+    // only the owner can put it right, and then the agent carries on with what the tour has left
+    const fresh = await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} });
+    expect(fresh.status).toBe(201);
+    expect(fresh.json.tour.status).toBe("active");
+    expect(fresh.json.key.budget.calls).toBe(100);
+    expect(await works(fresh.json.key.token)).toBe(200);
+    const kinds = (await req("GET", "/api/ledger", { token: t.token })).json.ledger.map((l) => l.kind);
+    for (const k of ["tour-open", "tour-renew", "tour-freeze", "tour-reissue"]) expect(kinds).toContain(k);
+    const events = (await admin("GET", "/api/admin/events")).json.events.map((e) => e.type);
+    for (const e of ["tour.opened", "tour.renewed", "tour.frozen", "tour.reissued"]) expect(events).toContain(e);
+  });
+
+  test("a key that ran out can be reissued by the owner only, and a tour left alone for two days is finished", async () => {
+    const t = await newTenant("tour-lapse", "studio");
+    const before = await reservedOf(t.grantId);
+    const first = (await open(t)).json;
+    // the key is cancelled from outside (the kill switch for one agent): the tour's record remains
+    expect((await admin("POST", `/api/admin/grants/${first.key.id}/revoke`, { body: { reason: "test: key lost" } })).status).toBe(200);
+    expect((await renew(first.key.token)).status).toBe(401);
+    expect((await req("GET", "/api/tours", { token: t.token })).json.tours[0].status).toBe("key_run_out");
+    const helper = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:helper", caps: ["grant.issue", "grant.read"], ttlSec: 600 } });
+    expect((await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: helper.json.token, body: {} })).status).toBe(403);
+    const fresh = await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} });
+    expect(fresh.status).toBe(201);
+    expect(await works(fresh.json.key.token)).toBe(200);
+    // nobody renews for more than 48 hours
+    await dbQuery("UPDATE tours SET last_renewed_at = last_renewed_at - $2 WHERE id = $1", [first.tour.id, 49 * 3600]);
+    const lapsed = await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} });
+    expect(lapsed.status).toBe(409);
+    expect(lapsed.json.error).toBe("tour_lapsed");
+    expect((await req("GET", "/api/tours", { token: t.token })).json.tours[0].status).toBe("ended");
+    expect(await works(fresh.json.key.token)).toBe(401);
+    expect((await reservedOf(t.grantId)).calls).toBe(before.calls); // everything it had not spent is back with the owner
+    expect((await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} })).json.error).toBe("tour_ended");
+    expect((await open(t)).status).toBe(201); // and a new tour for the same name can be opened
+  });
+
+  test("extending (a furlough) adds days, never money, and stops at each limit", async () => {
+    const t = await newTenant("tour-extend", "studio");
+    const first = (await open(t, { days: 2 })).json;
+    const more = await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 3 } });
+    expect(more.status).toBe(200);
+    expect(more.json.tour.until).toBe(first.tour.until + 3 * DAY);
+    expect(more.json.tour.budget).toEqual(first.tour.budget);
+    expect(more.json.tour.left.calls).toBe(100);
+    expect(more.json.receipt.limited_by).toBe("asked");
+    // the next key reaches into the added days; the current key was not made longer
+    await rested(first.tour.id);
+    expect((await renew(first.key.token)).json.key.exp).toBeLessThanOrEqual(now() + DAY);
+    // one signature never reaches more than 7 days ahead
+    const capped = await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 7 } });
+    expect(capped.status).toBe(200);
+    expect(capped.json.receipt.limited_by).toBe("one_signature");
+    expect(capped.json.tour.until).toBeLessThanOrEqual(now() + 7 * DAY);
+    const atLimit = await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 1 } });
+    expect(atLimit.status).toBe(409);
+    expect(atLimit.json.error).toBe("tour_at_limit");
+    // 30 days in all: a tour opened 29 days ago can only be taken to its 30th day
+    await dbQuery("UPDATE tours SET opened_at = opened_at - $2, until = $3 WHERE id = $1", [first.tour.id, 29 * DAY, now() + 3600]);
+    await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [first.tour.id.length ? capped.json.tour.id && (await dbQuery("SELECT grant_id FROM tours WHERE id = $1", [first.tour.id])).rows[0].grant_id : "", now() + 3600]);
+    const last = await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 5 } });
+    expect(last.status).toBe(200);
+    expect(last.json.receipt.limited_by).toBe("whole_tour");
+    expect(last.json.tour.until).toBeLessThanOrEqual(now() + DAY + 60);
+    for (const days of [0, 8, 2.5, "2", null]) expect((await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days } })).json.error).toBe("tour_days_invalid");
+    const helper = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:helper", caps: ["grant.issue", "grant.read"], ttlSec: 600 } });
+    expect((await req("POST", `/api/tours/${first.tour.id}/extend`, { token: helper.json.token, body: { days: 1 } })).status).toBe(403);
+    const other = await newTenant("tour-extend-other", "studio");
+    expect((await req("POST", `/api/tours/${first.tour.id}/extend`, { token: other.token, body: { days: 1 } })).status).toBe(404); // another tenant cannot even see it
+  });
+
+  test("ending a tour stops the agent at once and gives back what it had not spent", async () => {
+    const t = await newTenant("tour-end", "studio");
+    const before = await reservedOf(t.grantId);
+    const first = (await open(t)).json;
+    expect((await req("POST", "/api/grants/settle", { token: first.key.token, body: { calls: 25, ref: "work:1" } })).status).toBe(200);
+    const helper = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:helper", caps: ["grant.issue", "grant.read"], ttlSec: 600 } });
+    expect((await req("POST", `/api/tours/${first.tour.id}/end`, { token: helper.json.token, body: {} })).status).toBe(403);
+    expect((await req("POST", `/api/tours/${first.tour.id}/end`, { token: first.key.token, body: {} })).status).toBe(403); // not even the tour's own key
+    const end = await req("POST", `/api/tours/${first.tour.id}/end`, { token: t.token, body: {} });
+    expect(end.status).toBe(200);
+    expect(end.json.tour.status).toBe("ended");
+    expect(end.json.receipt.cancelled_keys).toBe(2); // the holding grant and its one key
+    expect(await works(first.key.token)).toBe(401);
+    expect((await renew(first.key.token)).status).toBe(401);
+    expect((await reservedOf(t.grantId)).calls).toBe(before.calls + 25); // only what was really spent stays counted
+    expect((await req("POST", `/api/tours/${first.tour.id}/end`, { token: t.token, body: {} })).json.error).toBe("tour_ended");
+    expect((await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 1 } })).json.error).toBe("tour_ended");
+    expect((await req("POST", "/api/tours/tr_nope/end", { token: t.token, body: {} })).status).toBe(404);
+  });
+
+  test("the owner sees every tour; a tour's key sees its own and no other", async () => {
+    const t = await newTenant("tour-list", "studio");
+    const a = (await open(t, { agent: "agent.a" })).json;
+    const b = (await open(t, { agent: "agent.b" })).json;
+    const all = (await req("GET", "/api/tours", { token: t.token })).json.tours;
+    expect(all.map((x) => x.agent).sort()).toEqual(["agent.a", "agent.b"]);
+    const mine = (await req("GET", "/api/tours", { token: a.key.token })).json.tours;
+    expect(mine.length).toBe(1);
+    expect(mine[0].id).toBe(a.tour.id);
+    expect(JSON.stringify(mine)).not.toContain(b.tour.id);
+    const other = await newTenant("tour-list-other", "studio");
+    expect((await req("GET", "/api/tours", { token: other.token })).json.tours).toEqual([]);
+    // a tour's key cannot open a tour of its own, whatever it holds
+    const withIssue = (await open(t, { agent: "agent.c", caps: [...SPEC.caps, "grant.issue"] })).json;
+    expect((await req("POST", "/api/tours", { token: withIssue.key.token, body: { ...SPEC, agent: "agent.d" } })).json.error).toBe("owner_required");
+    // what it hands to a helper is an ordinary agent-issued key: a day at most, and gone at the next renewal
+    const helper = await req("POST", "/api/grants", { token: withIssue.key.token, body: { sub: "agent:helper", caps: ["grant.read"], ttlSec: 7 * DAY, budget: { usd_cents: 0, calls: 5, deploys: 0 } } });
+    expect(helper.status).toBe(201);
+    expect(helper.json.exp).toBeLessThanOrEqual(now() + DAY);
+  });
+});
+
 describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("child grant attenuation: widening refused, subtree revoke", async () => {
     const t = await newTenant("grant-tenant");

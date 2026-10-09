@@ -124,6 +124,17 @@ export var AGENT_ISSUED_MAX_TTL_SEC = 86400;
 // limit if that comes first.
 export var holdExpiry = (heldUntil, now, limit) =>
   limit >= heldUntil ? Math.max(heldUntil, Math.min(limit, now + 60)) : null;
+// Tours (tours.js): more time for an agent without a longer key. The owner's numbers (2026-10-09):
+// one signature opens or extends a tour by at most 7 days; a tour lasts at most 30 days in all, then
+// it needs opening afresh; a tour nobody has renewed for 48 hours is finished.
+export var TOUR_MAX_SIGNED_SEC = 7 * 86400;
+export var TOUR_MAX_TOTAL_SEC = 30 * 86400;
+export var TOUR_IDLE_END_SEC = 48 * 3600;
+// A renewed key's old copy may still arrive for calls already in flight; later than this it means
+// a second copy of the key exists, and the tour freezes.
+export var TOUR_REUSE_GRACE_SEC = 120;
+// No faster than this between renewals of one tour (each one cancels a key and issues another).
+export var TOUR_RENEW_MIN_GAP_SEC = 60;
 export var memoryPartitions = (e) => e.memory?.partitions ?? [""];
 // A scope prefix covers a partition only at a real boundary: exact match, the
 // empty prefix (root wildcard), a prefix that already ends in a separator, or
