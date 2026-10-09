@@ -2265,17 +2265,51 @@ describe("18b. spend counts all the way up the chain", () => {
     await admin("POST", "/api/admin/grants/reap");
     await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: { reason: "again" } });
     expect(await left(root.token)).toBe(before - 5); // a second sweep and a late cancel change nothing
-    // the parent reached BEFORE the child: only the middle grant has run out as far as the sweep can tell
+    // A grant WAITS for the keys under it: while one of them is still live, what is held on it is not yet "what
+    // they used", so the sweep leaves it alone rather than guess. (Only a test can put a parent's end before its
+    // child's; a real child never outlives its parent.)
     const mid2 = await issue(root.token, "agent:mid2", 10);
     const leaf2 = await issue(mid2.json.token, "agent:leaf2", 6, ["grant.read"]);
     expect((await spend(leaf2.json.token, 2)).status).toBe(200);
     await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, mid2.json.id]);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).not.toContain(mid2.json.id);
+    expect(await left(root.token)).toBe(before - 5 - 10); // still holding all 10: nothing was let go early
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, leaf2.json.id]);
+    const swept = (await admin("POST", "/api/admin/grants/reap")).json.reaped;
+    expect(swept).toContain(leaf2.json.id);
+    expect(swept).toContain(mid2.json.id); // one pass, the lower one first
+    expect(await left(root.token)).toBe(before - 5 - 2);
     await admin("POST", "/api/admin/grants/reap");
     expect(await left(root.token)).toBe(before - 5 - 2);
-    // a child never outlives its parent: the helper's helper is over too, and letting it go later adds nothing
-    expect((await req("GET", "/api/grants/verify", { token: leaf2.json.token })).status).toBe(401);
+  });
+
+  test("whatever order things end in, the owner is left holding exactly what was used", async () => {
+    const root = await newTenant("chain-orders", "pro");
+    const before = await left(root.token);
+    // 1. the lower key is cancelled first, then the one above it runs out
+    let mid = await issue(root.token, "agent:m1", 10), leaf = await issue(mid.json.token, "agent:l1", 6, ["grant.read"]);
+    expect((await spend(leaf.json.token, 3)).status).toBe(200);
+    expect((await req("POST", `/api/grants/${leaf.json.id}/revoke`, { token: mid.json.token, body: {} })).status).toBe(200);
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, mid.json.id]);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).toContain(mid.json.id);
+    expect(await left(root.token)).toBe(before - 3);
+    // 2. the lower key has run out but the sweep has not reached it yet, and the one above is cancelled
+    mid = await issue(root.token, "agent:m2", 10); leaf = await issue(mid.json.token, "agent:l2", 6, ["grant.read"]);
+    expect((await spend(leaf.json.token, 2)).status).toBe(200);
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, leaf.json.id]);
+    expect((await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: {} })).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 3 - 2);
+    // 3. the sweep took the lower key earlier; cancelling the one above later must not let it go a second time
+    mid = await issue(root.token, "agent:m3", 10); leaf = await issue(mid.json.token, "agent:l3", 6, ["grant.read"]);
+    expect((await spend(leaf.json.token, 1)).status).toBe(200);
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, leaf.json.id]);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).toContain(leaf.json.id);
+    expect((await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: {} })).json.revoked).toEqual([mid.json.id]);
+    expect(await left(root.token)).toBe(before - 3 - 2 - 1);
+    // 4. cancelling something that has already ended gives nothing back and takes nothing
+    expect((await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: {} })).json.revoked).toEqual([]);
     await admin("POST", "/api/admin/grants/reap");
-    expect(await left(root.token)).toBe(before - 5 - 2);
+    expect(await left(root.token)).toBe(before - 6);
   });
 
   test("three levels down, and one level down still works as it always did", async () => {

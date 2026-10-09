@@ -258,13 +258,18 @@ export async function revokeGrantTree(e, t, a) {
   let n = [];
   if (
     (await sql.begin(async (r) => {
-      let s = await r`WITH RECURSIVE sub AS (SELECT * FROM grants WHERE id = ${e}
-      UNION ALL SELECT g.* FROM grants g JOIN sub ON g.parent = sub.id) SELECT * FROM sub ORDER BY depth DESC FOR UPDATE`;
-      for (let i of s) {
-        if (i.status !== "active") continue;
-        await r`UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = ${t} WHERE id = ${i.id}`;
-        // Read what is held on it NOW (the rows above were read before the grants under it let go).
-        let o = unusedOf(i, (await r`SELECT reserved FROM grants WHERE id = ${i.id}`)[0].reserved);
+      // Deepest first, so that by the time a grant is reached everything under it has let go. This is only the
+      // LIST: it locks nothing (the FOR UPDATE that used to sit here was on a WITH query, which Postgres does not
+      // lock), so each grant is taken and flipped below in ONE statement.
+      let s = await r`WITH RECURSIVE sub AS (SELECT id, depth FROM grants WHERE id = ${e}
+      UNION ALL SELECT g.id, g.depth FROM grants g JOIN sub ON g.parent = sub.id) SELECT id FROM sub ORDER BY depth DESC`;
+      for (let { id } of s) {
+        // Only the caller that really moves the row from active lets it go (a sweep may have got there first: never
+        // release twice), and what it gives back is worked out from the row AS IT IS NOW (a settle may have landed,
+        // and the grants under it have let go, since the list was read).
+        let i = (await r`UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = ${t} WHERE id = ${id} AND status = 'active' RETURNING *`)[0];
+        if (!i) continue;
+        let o = unusedOf(i, i.reserved);
         if (i.parent) {
           let l = (await r`SELECT reserved FROM grants WHERE id = ${i.parent} FOR UPDATE`)[0],
             c = subtractUsage(normalizeUsage(parseJson(l.reserved)), o);
@@ -369,23 +374,20 @@ export async function lowerGrantAutonomy(caller, targetId, level) {
   await recordEvent("grant.autonomy_lowered", { id: targetId, from: current, to: next, cascaded: changed.length }, t.tenant, caller.sub);
   return { id: targetId, from: AUTONOMY_LEVELS[current], to: AUTONOMY_LEVELS[next], grantsChanged: changed.length };
 }
-// Release a child grant's UNSPENT reservation (budget - settled, the same amount
-// revokeGrantTree computes) back to its parent when it transitions active->expired.
+// Release a grant's UNUSED reservation (unusedOf: budget - settled - what is still held on it for the keys
+// under it; the same amount revokeGrantTree computes) back to its parent when it transitions active->expired.
 // The `RETURNING id` length guard is the idempotency lever: only the call that
 // actually flips the row releases, so a second sweep, the lazy verify path, and a
 // later revoke can never double-credit the parent. Mirrors revokeGrantTree's
 // release (same math, same 'release' ledger row).
 async function releaseExpiredGrant(tx, g) {
-  // Everything under an expired grant is over too (a child never outlives its parent), though the sweep
-  // may not have reached it yet. Those let go first, deepest first, so that what they did not use is back
-  // on this grant before it works out what IT did not use. Same lock order as everywhere: child, then parent.
-  let below = await tx`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE parent = ${g.id}
-      UNION ALL SELECT c.id FROM grants c JOIN sub ON c.parent = sub.id)
-    SELECT * FROM grants WHERE id IN (SELECT id FROM sub) AND status = 'active' ORDER BY depth DESC FOR UPDATE`;
-  for (let c of below) await releaseOneExpired(tx, c);
-  return releaseOneExpired(tx, g);
-}
-async function releaseOneExpired(tx, g) {
+  // A grant lets go only AFTER everything under it has. Until then what is held on it is not yet "what the keys
+  // under it used", so it waits: the sweep goes deepest first, and a child never outlives its parent, so anything
+  // still active under an expired grant is itself due in this same pass. This only LOOKS at the children; it never
+  // locks one. The transaction still holds one grant and then its parent and nothing else, so the lock order stays
+  // child-then-parent, as the note above reapExpiredGrants requires.
+  let waiting = await tx`SELECT 1 FROM grants WHERE parent = ${g.id} AND status = 'active' LIMIT 1`;
+  if (waiting.length) return !1;
   let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING reserved`;
   if (flipped.length !== 1) return !1; // someone else already moved it (revoked/expired) — never double-release
   if (!g.parent) return !0; // a root holds no reservation upward
