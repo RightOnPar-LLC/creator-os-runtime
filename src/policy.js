@@ -135,6 +135,9 @@ export var TOUR_IDLE_END_SEC = 48 * 3600;
 export var TOUR_REUSE_GRACE_SEC = 120;
 // No faster than this between renewals of one tour (each one cancels a key and issues another).
 export var TOUR_RENEW_MIN_GAP_SEC = 60;
+// An extension must add at least this much, or it is refused as being at the limit already (so a
+// tour at its limit cannot be nudged a second at a time, one receipt per second).
+export var TOUR_MIN_EXTEND_SEC = 3600;
 export var memoryPartitions = (e) => e.memory?.partitions ?? [""];
 // A scope prefix covers a partition only at a real boundary: exact match, the
 // empty prefix (root wildcard), a prefix that already ends in a separator, or

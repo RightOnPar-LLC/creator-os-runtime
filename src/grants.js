@@ -481,7 +481,9 @@ export async function verifyGrant(e, t, a, countRate = !0) {
       // sweep, nothing is freed here: the sweep takes both, lower one first.
       await sql.begin(async (tx) => {
         let g = (await tx`SELECT * FROM grants WHERE id = ${r.id} FOR UPDATE`)[0];
-        if (g) await releaseExpiredGrant(tx, g);
+        // The ROW's end decides, not the token's: a tour's holding grant can be extended after its token text
+        // was written (tours.js), and an old token for it must not end it early.
+        if (g && Number(g.exp) <= nowSec()) await releaseExpiredGrant(tx, g);
       });
       throw new HttpError(401, "grant_expired");
     }
