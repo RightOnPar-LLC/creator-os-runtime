@@ -32,3 +32,27 @@ export var redactUrl = (e) => {
     a = t.indexOf("?");
   return a === -1 ? t : t.slice(0, a);
 };
+// A stored deploy/approval `intent` is the caller's request body, and its `env`
+// carries real values (other services' keys). The runtime already holds them;
+// no reader ever needs them back. Readers get the variable NAMES so a cockpit can
+// still show what was set. Any other top-level string field named like a secret
+// is masked too. The stored row is untouched: an approved deploy still runs with
+// the real values (routes/grants.js reads ap.intent from the database, not from
+// this). Shared by GET /api/deploys/:id and GET /api/approvals (2026-10-09).
+var SECRET_NAME = /(token|secret|password|passwd|api[_-]?key|private[_-]?key|credential)/i;
+export var REDACTED = "[redacted]";
+export function redactIntent(e) {
+  let t;
+  try {
+    t = parseJson(e);
+  } catch {
+    return null;
+  }
+  if (!t || typeof t !== "object" || Array.isArray(t)) return t ?? null;
+  let a = {};
+  for (let [n, r] of Object.entries(t))
+    if (n === "env") a.env = r && typeof r === "object" && !Array.isArray(r) ? Object.fromEntries(Object.keys(r).map((s) => [s, REDACTED])) : REDACTED;
+    else a[n] = typeof r === "string" && SECRET_NAME.test(n) ? REDACTED : r;
+  return a;
+}
+export var withRedactedIntent = (e) => (e ? { ...e, intent: redactIntent(e.intent) } : e);
