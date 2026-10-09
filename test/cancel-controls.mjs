@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Do the cancel tests (section 18c of runtime.test.js) really test anything? For each rule that the 2026-10-09
-// change put into src/grants.js (and one line each of three files under src/routes) this takes the rule OUT of the source, runs those tests, and expects them to
+// change put into src/grants.js (and into three files under src/routes) this takes the rule OUT of the source, runs those tests, and expects them to
 // FAIL. A rule whose removal nothing notices is a rule with no test. Same method as tours-controls.mjs.
-// The last twenty-five are the rules of a refresh token used twice (src/routes/oauth.js): every grant of that client is
+// The last thirty are the rules of a refresh token used twice (src/routes/oauth.js): every grant of that client is
 // tried even when one cancel fails, the request then fails, the same token used again takes what was left, and
 // nothing of another client is touched.
 //
-//   node test/cancel-controls.mjs        (from the repo root; about a minute)
+//   node test/cancel-controls.mjs        (from the repo root; about two minutes)
 //
 // It edits those files and always puts them back (also on Ctrl-C). It first runs the tests untouched and expects
 // them to PASS, so a red result below means "the break was noticed", not "the tests were already red".
@@ -216,6 +216,26 @@ const BREAKS = [
     "src/routes/oauth.js",
     "String(errors[0]?.message || errors[0]).slice(0, 200)}`);",
     "String(errors[0]?.message || errors[0])}`);"],
+  ["a refresh token used twice: one tenant's record that cannot be written ends the records, and the tenants after it get none",
+    "src/routes/oauth.js",
+    "        } catch (err) {\n          errors.push(err);\n        }\n",
+    "        } catch (err) {\n          errors.push(err);\n          break;\n        }\n"],
+  ["a refresh token used twice: another tenant's record that cannot be written is passed over, and the answer is \"grant revoked\"",
+    "src/routes/oauth.js",
+    "        } catch (err) {\n          errors.push(err);\n        }\n",
+    "        } catch (err) {\n          if (tenant === existing.tenant) errors.push(err);\n        }\n"],
+  ["a refresh token used twice: a grant found by the mark is written down under the spent token's tenant, whichever tenant it is in",
+    "src/routes/oauth.js",
+    "          SELECT grant_id, tenant FROM marked\n",
+    "          SELECT grant_id, ${existing.tenant}::text AS tenant FROM marked\n"],
+  ["a refresh token used twice: the log names only the grants left in the spent token's own tenant",
+    "src/routes/oauth.js",
+    "grants NOT cancelled: ${failed.join(\", \")};",
+    "grants NOT cancelled: ${failed.filter((id) => tenantOf.get(id) === existing.tenant).join(\", \")};"],
+  ["a refresh token used twice: the log carries every failure with its stack, not the one line",
+    "src/routes/oauth.js",
+    "      if (failed.length) console.error(`[oauth] refresh token reuse: ",
+    "      for (let err of errors) console.error(err?.stack || err);\n      if (failed.length) console.error(`[oauth] refresh token reuse: "],
 ];
 
 const once = () => spawnSync(bun, ["test", "runtime.test.js", "-t", "18c\\. a cancel"], { cwd: here, env: { ...process.env, RUNTIME_ENTRY: "" }, encoding: "utf8", timeout: 300000 });

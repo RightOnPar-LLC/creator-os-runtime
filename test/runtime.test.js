@@ -3694,6 +3694,18 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
       expect(r.json).toEqual({ error: "internal_error", detail: null });
     };
 
+    // A client the owner approved for TWO tenants: one grant in each, xA and xB. The first token, for xA, is spent
+    // (the same grant was signed again), so two unmarked rows are left, one in each tenant.
+    const twoTenants = async (name) => {
+      const x = await start(name), [xA] = x.grants;
+      const elsewhere = await newTenant(name + "-b", "studio");
+      expect((await x.refresh(x.tokens[0])).status).toBe(200);
+      const there = await approve(x.client, x.redirect, elsewhere.id, name + "-b");
+      const xB = await idOf(there.access_token);
+      expect(await unmarked(x.client)).toBe(2);
+      return { x, elsewhere, there, xA, xB };
+    };
+
     test("one cancel that fails does not save the client's other grants; the request fails and the record says which were left; used again, it takes those too", async () => {
       // 1. the FIRST grant's cancel fails with an ordinary error. The second is cancelled all the same, and the
       //    request says it failed.
@@ -3708,6 +3720,7 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
       const first = rec(a, [aOld, aNow], [aNow], [aOld]);
       expect(await noted(a.client)).toEqual([first]);
       expect(one.lines).toContain(leftLine([aOld], 2, refused(aOld))); // why it failed is in the log, not in the record
+      expect(one.lines.length).toBe(2); // that line and the failed request: nothing more is logged
       //    used again with nothing in the way: the one that was left goes, and nothing else is gone over again
       reused(await a.refresh(a.tokens[0]));
       expect(await statusOf(aOld)).toBe("revoked");
@@ -3822,13 +3835,10 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
       // 3. A client the owner approved for TWO tenants. Used again in one, it loses its grants and its refresh rows
       //    in both (so before 2026-10-09 as well). Here the pass fails on the other tenant's grant, and the same
       //    token used again takes it. Each tenant gets its own record, naming its own grants only.
-      const x = await start("reuse-two-tenants"), [xA] = x.grants;
-      const elsewhere = await newTenant("reuse-two-tenants-b", "studio");
-      expect((await x.refresh(x.tokens[0])).status).toBe(200); // the first token is spent; the same grant is signed again
-      const there = await approve(x.client, x.redirect, elsewhere.id, "reuse-two-tenants-b");
-      const xB = await idOf(there.access_token);
-      expect(await unmarked(x.client)).toBe(2);
-      failedAs((await logOf(() => losesTheWait("t18c_reuse_elsewhere", xB, "revoked", 1000, () => x.refresh(x.tokens[0]), refuse))).r.r);
+      const { x, elsewhere, there, xA, xB } = await twoTenants("reuse-two-tenants");
+      const left = await logOf(() => losesTheWait("t18c_reuse_elsewhere", xB, "revoked", 1000, () => x.refresh(x.tokens[0]), refuse));
+      failedAs(left.r.r);
+      expect(left.lines).toContain(leftLine([xB], 2, refused(xB))); // the log names a grant left in the other tenant too
       expect([await statusOf(xA), await statusOf(xB)]).toEqual(["revoked", "active"]);
       expect(await unmarked(x.client)).toBe(0); // the row in the other tenant is marked too: its token refreshes nothing
       const firstPass = [rec(x, [xA], [xA], []), rec(x, [xB], [], [xB], elsewhere.id)];
@@ -3870,11 +3880,34 @@ describe("18c. a cancel leaves nothing working under it, and losing a lock wait 
       expect(await noted(a.client)).toEqual([rec(a, [aOld], [], [])]);
     });
 
+    test("a client approved for two tenants: each tenant gets its own record under its own name, whatever becomes of the other's", async () => {
+      const noRecordFor = (name, tenantId, fn) => at(name, "events", "BEFORE INSERT", `NEW.type = 'oauth.refresh_reuse_detected' AND NEW.tenant = '${tenantId}'`, "RAISE EXCEPTION 'test: no record for this tenant'; RETURN NEW;", fn);
+      // 1. the FIRST tenant's record cannot be written: the other tenant still gets its own, and the request fails
+      const a = await twoTenants("reuse-record-first");
+      failedAs((await logOf(() => noRecordFor("t18c_reuse_record_first", a.x.root.id, () => a.x.refresh(a.x.tokens[0])))).r);
+      expect([await statusOf(a.xA), await statusOf(a.xB)]).toEqual(["revoked", "revoked"]);
+      expect(await noted(a.x.client)).toEqual([rec(a.x, [a.xB], [a.xB], [], a.elsewhere.id)]);
+      // 2. the OTHER tenant's record cannot be written: the request fails all the same; it is not "grant revoked"
+      const b = await twoTenants("reuse-record-other");
+      failedAs((await logOf(() => noRecordFor("t18c_reuse_record_other", b.elsewhere.id, () => b.x.refresh(b.x.tokens[0])))).r);
+      expect([await statusOf(b.xA), await statusOf(b.xB)]).toEqual(["revoked", "revoked"]);
+      expect(await noted(b.x.client)).toEqual([rec(b.x, [b.xA], [b.xA], [])]);
+      // 3. the other tenant's grant had ended before the pass, so only the row the pass marks leads to it: it is
+      //    still written down under its own tenant, not under the spent token's
+      const c = await twoTenants("reuse-record-ended");
+      await dbQuery("UPDATE grants SET status = 'expired' WHERE id = $1", [c.xB]);
+      reused(await c.x.refresh(c.x.tokens[0]));
+      expect(await noted(c.x.client)).toEqual([rec(c.x, [c.xA], [c.xA], []), rec(c.x, [c.xB], [], [], c.elsewhere.id)]);
+    });
+
     test("the rows are marked and the grants listed by ONE statement: nothing on this path reads the refresh rows again once they are marked", async () => {
       // Were the list a statement of its own it could fail after the rows were marked: nothing cancelled, nothing
       // written down, and the rows marked all the same. Here every later statement that reads oauth_refresh WOULD
       // fail: at the mark, a trigger puts an empty table of that name in front of the real one (the session's
       // search path) until the request is over. The pass goes through because it has no such statement.
+      // (It notices a later read of the refresh rows, nothing else: a new statement between the mark and the cancels
+      // that reads some other table would not show here. And should the runner give up on this test while its
+      // request is still out, the path stays changed until that request ends: later tests of that run fail too.)
       const a = await chain("reuse-one-statement"), [aOld, aNow] = a.grants;
       const path = (await dbQuery("SHOW search_path")).rows[0].search_path;
       const back = () => dbQuery("SELECT set_config('search_path', $1, false)", [path]);
