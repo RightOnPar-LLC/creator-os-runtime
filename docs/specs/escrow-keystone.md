@@ -100,12 +100,15 @@ everything; add one scope block and two terminal statuses.
    amount (ledger `escrow-capture`) **and** emit a MESH credit to the payee. Only the runtime,
    holding the escrow, can capture; the *condition* is the authorization, never either party's say-so.
 
-   What a capture pays (as built, `captureAmount` in `src/escrow.js`): the value the hold still
-   holds itself. That is the whole amount for every hold, because nothing can be opened under a
-   hold. The rule is written for the case where something was: while any of the value is still
-   pledged to a hold underneath, the capture waits (`pledged_to_a_hold_below`, the hold stays open);
-   what was already paid out underneath is not paid again (`nothing_left_to_capture` if that was
-   all of it). Captures can never credit more than the payer paid.
+   What a capture pays (as built, `captureEscrow` and `captureAmount` in `src/escrow.js`): the value
+   the hold still holds itself. That is the whole amount for every hold, because nothing can be
+   opened under a hold. The rule is written for the case where something was:
+   - While anything under the hold is still open, the capture waits (`pledged_to_a_hold_below`,
+     the hold stays open), the same way a grant waits before it lets go.
+   - Then it pays the hold's amount less everything that was passed on: what was captured directly
+     under it (`settled`) and what is held on it for spend further down (`reserved`; a grant keeps
+     what the keys under it used held). `nothing_left_to_capture` if that was all of it.
+   - So captures can never credit more than the payer paid, at any depth and in any order.
 
 ## Condition kinds (start with two)
 

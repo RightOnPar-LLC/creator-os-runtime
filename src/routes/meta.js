@@ -336,20 +336,24 @@ app.get("/selftest", async (e) => {
           plainKeyPays: refusal(n),
           holdPays: refusal(asHold),
           whole: captureAmount(row(100, 0, 0)), // nothing under it: all of it
-          pledgedBelow: captureAmount(row(100, 100, 0)), // all pledged to a hold below: wait
-          partPledged: captureAmount(row(100, 40, 0)), // part still pledged below: wait
-          paidBelow: captureAmount(row(100, 0, 100)), // already paid out below: nothing left
+          allHeldBelow: captureAmount(row(100, 100, 0)), // all of it held for what is under it: none of it
+          partHeldBelow: captureAmount(row(100, 40, 0)), // 40 held for what is under it: the other 60
+          paidBelow: captureAmount(row(100, 0, 100)), // all of it already paid out below: nothing left
           partPaidBelow: captureAmount(row(100, 0, 40)), // 40 paid out below: the other 60
-          asText: captureAmount({ budget: '{"usd_cents":100}', reserved: '{"usd_cents":0}', settled: '{"usd_cents":40}' }),
+          threeDeep: captureAmount(row(100, 20, 20)), // 20 captured right under it, 20 spent two levels down: 60
+          overdrawn: captureAmount(row(100, 80, 40)), // books that do not add up never go below nothing
+          asText: captureAmount({ budget: '{"usd_cents":100}', reserved: '{"usd_cents":20}', settled: '{"usd_cents":20}' }),
         };
       return (
         (got.plainKeyPays === null &&
           got.holdPays === "escrow_custodian_cannot_pay" &&
           got.whole === 100 &&
-          got.pledgedBelow === 0 &&
-          got.partPledged === 0 &&
+          got.allHeldBelow === 0 &&
+          got.partHeldBelow === 60 &&
           got.paidBelow === 0 &&
           got.partPaidBelow === 60 &&
+          got.threeDeep === 60 &&
+          got.overdrawn === 0 &&
           got.asText === 60) ||
         got
       );

@@ -3704,6 +3704,128 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     expect(await n.paid()).toBe(100);
   });
 
+  // Any shape of holds under holds, built the same way: each hold in `plan` is { amount, under }
+  // where `under` is the index of an earlier hold in the plan, or null for the payer itself.
+  const tree = async (name, plan) => {
+    const root = await newTenant(name, "pro");
+    // Read straight from the payer's row, and refund with the admin key, so a long random run
+    // never meets the payer key's own rate limit.
+    const left = async () => { const r = (await dbQuery("SELECT budget, reserved, settled FROM grants WHERE id = $1", [root.grantId])).rows[0]; const c = (v) => (typeof v === "string" ? JSON.parse(v) : v || {}).usd_cents || 0; return c(r.budget) - c(r.reserved) - c(r.settled); };
+    const before = await left();
+    const usage = async (id, col) => { const v = (await dbQuery(`SELECT ${col} FROM grants WHERE id = $1`, [id])).rows[0][col]; return typeof v === "string" ? JSON.parse(v) : v || {}; };
+    const addHeld = async (id, by) => { const r = await usage(id, "reserved"); await dbQuery("UPDATE grants SET reserved = $2::jsonb WHERE id = $1", [id, JSON.stringify({ usd_cents: (r.usd_cents || 0) + by, calls: r.calls || 0, deploys: r.deploys || 0 })]); };
+    const holds = [];
+    for (const [i, h] of plan.entries()) {
+      const payee = `t_${name}_${i}`;
+      const o = await openEscrow(root.token, { amount: h.amount, payee_tenant: payee });
+      expect(o.status).toBe(201);
+      const hold = { ...o.json.escrow, payee, amount: h.amount, under: h.under };
+      if (h.under !== null) {
+        const parent = holds[h.under];
+        await addHeld(root.grantId, -h.amount);
+        await addHeld(parent.grant_id, h.amount);
+        await dbQuery("UPDATE grants SET parent = $2, depth = (SELECT depth + 1 FROM grants WHERE id = $2) WHERE id = $1", [hold.grant_id, parent.grant_id]);
+      }
+      holds.push(hold);
+    }
+    const credited = async (payee) => (await dbQuery("SELECT coalesce(sum(usd_cents),0)::int AS cents FROM ledger WHERE tenant=$1 AND kind='mesh-credit'", [payee])).rows[0].cents;
+    return {
+      root, holds,
+      paid: async () => before - (await left()),
+      credits: async () => { const out = []; for (const h of holds) out.push(await credited(h.payee)); return out; },
+      statusOf: async (h) => (await dbQuery("SELECT status FROM grants WHERE id = $1", [h.grant_id])).rows[0].status,
+      revoke: (h) => admin("POST", "/api/admin/grants/" + h.grant_id + "/revoke", { body: { reason: "test refund" } }),
+    };
+  };
+
+  // A hold keeps what was spent further down HELD (that is how spend below a grant is counted),
+  // so "something is held on it" does not mean "something below is still open". With three
+  // levels, the top hold used to look pledged for ever and never paid its own share.
+  test("CONTROL: three levels deep, each hold pays exactly its own share, whichever delivery comes first", async () => {
+    const plan = [{ amount: 100, under: null }, { amount: 40, under: 0 }, { amount: 20, under: 1 }]; // A(100) > B(40) > C(20)
+    // bottom up: C 20, B its other 20, A its other 60
+    const up = await tree("deep-up", plan);
+    expect((await receiptFor(up.holds[2])).json.escrow).toMatchObject({ captured: true, amount: 20 });
+    expect((await receiptFor(up.holds[1])).json.escrow).toMatchObject({ captured: true, amount: 20 });
+    expect((await receiptFor(up.holds[0])).json.escrow).toMatchObject({ captured: true, amount: 60 });
+    expect(await up.credits()).toEqual([60, 20, 20]);
+    expect(await up.paid()).toBe(100);
+    // top down: each waits for what is still open under it, then pays the same shares
+    const down = await tree("deep-down", plan);
+    expect((await receiptFor(down.holds[0])).json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" });
+    expect((await receiptFor(down.holds[1])).json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" });
+    expect((await receiptFor(down.holds[2])).json.escrow).toMatchObject({ captured: true, amount: 20 });
+    expect((await receiptFor(down.holds[0])).json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" }); // B is still open
+    expect((await receiptFor(down.holds[1])).json.escrow).toMatchObject({ captured: true, amount: 20 });
+    expect((await receiptFor(down.holds[0])).json.escrow).toMatchObject({ captured: true, amount: 60 });
+    expect(await down.credits()).toEqual([60, 20, 20]);
+    expect(await down.paid()).toBe(100);
+  });
+
+  // Every shape and every order at once. Random trees of holds under holds (a fixed seed, so a
+  // failure repeats), then deliveries and refunds in random order until nothing is open.
+  // Two things must hold: payees are never credited more than the payer is out, at any moment;
+  // and when everything has ended the two are EQUAL (nothing made, nothing lost).
+  test("CONTROL: any tree of holds, any order of deliveries and refunds — credits never pass what the payer paid, and end equal to it", async () => {
+    // mulberry32: whole-number maths only (Math.imul), so every bit is used and a seed repeats exactly
+    let seed = 20261009;
+    const rnd = (n) => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let x = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x;
+      return ((x ^ (x >>> 14)) >>> 0) % n;
+    };
+    const shapes = { nested: 0, threeDeep: 0, waited: 0, deliveries: 0, refunds: 0 };
+    for (let round = 0; round < 24; round++) {
+      const plan = [], free = [];
+      const count = 2 + rnd(4); // 2 to 5 holds
+      for (let i = 0; i < count; i++) {
+        const parents = free.map((v, j) => (v >= 2 ? j : -1)).filter((j) => j >= 0);
+        const under = i > 0 && parents.length && rnd(4) > 0 ? parents[rnd(parents.length)] : null;
+        const amount = under === null ? 20 + rnd(81) : 1 + rnd(free[under] - 1);
+        if (under !== null) free[under] -= amount;
+        plan.push({ amount, under });
+        free.push(amount);
+      }
+      const depthOf = (i) => (plan[i].under === null ? 1 : 1 + depthOf(plan[i].under));
+      const deepest = Math.max(...plan.map((_, i) => depthOf(i)));
+      if (deepest >= 2) shapes.nested++;
+      if (deepest >= 3) shapes.threeDeep++;
+      const t = await tree("fuzz-" + round, plan);
+      const total = (xs) => xs.reduce((a, b) => a + b, 0);
+      for (let step = 0; step < 60; step++) {
+        const open = [];
+        for (const h of t.holds) if ((await t.statusOf(h)) === "active") open.push(h);
+        if (!open.length) break;
+        const h = open[rnd(open.length)];
+        if (rnd(3) === 0) (shapes.refunds++, await t.revoke(h));
+        else {
+          const r = await receiptFor(h);
+          shapes.deliveries++;
+          if (r.json.escrow.reason === "pledged_to_a_hold_below") shapes.waited++;
+          // A delivery waits only while something directly under the hold is still open, never
+          // because of what was spent further down.
+          let openBelow = false;
+          for (const c of t.holds) if (c.under === t.holds.indexOf(h) && (await t.statusOf(c)) === "active") openBelow = true;
+          expect([round, step, r.json.escrow.reason === "pledged_to_a_hold_below"]).toEqual([round, step, openBelow]);
+        }
+        expect([round, step, total(await t.credits()) <= (await t.paid())]).toEqual([round, step, true]);
+      }
+      for (const h of t.holds) if ((await t.statusOf(h)) === "active") await t.revoke(h); // anything still waiting is refunded
+      const credits = await t.credits();
+      expect([round, JSON.stringify(plan), total(credits)]).toEqual([round, JSON.stringify(plan), await t.paid()]);
+      // and no hold ever paid more than its own amount
+      for (const [i, h] of t.holds.entries()) expect(credits[i]).toBeLessThanOrEqual(h.amount);
+    }
+    // The run really did build holds under holds, three deep, and really did make deliveries wait.
+    // (A random test that only ever drew flat shapes would pass whatever the code did.)
+    expect(shapes.nested).toBeGreaterThan(8);
+    expect(shapes.threeDeep).toBeGreaterThan(3);
+    expect(shapes.waited).toBeGreaterThan(3);
+    expect(shapes.deliveries).toBeGreaterThan(20);
+    expect(shapes.refunds).toBeGreaterThan(5);
+  }, 30000); // about a second here; the default limit of five leaves too little room on a slow machine
+
   // The same rule on the running build, where no request can make such rows: /selftest.
   test("the runtime's own self-test carries the control: a hold cannot pay for a hold, a capture never pays out what was passed on", async () => {
     const r = await req("GET", "/selftest");
