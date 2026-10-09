@@ -202,8 +202,13 @@ async function findEscrowGrant(idOrEscrowId) {
 // FOR UPDATE) is the idempotency + mutual-exclusion lever: a replay, a second receipt, or a race
 // with the reaper/revoke credits the payee once and never double-settles the payer. Once captured,
 // the reaper and revoke (both status='active') can never touch it; a refunded/expired escrow
-// (status!='active') can never be captured. Locks child then parent — the order the reaper and
-// revokeGrantTree take — so it cannot deadlock against them.
+// (status!='active') can never be captured. Locks child then parent, the order the reaper takes, so
+// it cannot deadlock against the reaper. It CAN against revokeGrantTree (corrected 2026-10-09; this
+// note used to say it could not): a cancel of the payer's key holds the payer's grant while it asks
+// for the holds under it, and a capture holds one of those and asks for the payer's grant. Postgres
+// then aborts one of the two. The cancel tries again (grants.js). A capture that is aborted throws
+// with nothing changed; the receipt webhook then answers an error before it has recorded the
+// receipt, so the same receipt sent again is tried again.
 export async function captureEscrow(idOrEscrowId, { source = "capture", ref = null } = {}) {
   let g0 = await findEscrowGrant(idOrEscrowId);
   if (!g0) throw new HttpError(404, "escrow_not_found");

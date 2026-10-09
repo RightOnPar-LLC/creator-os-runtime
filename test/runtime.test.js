@@ -1541,11 +1541,14 @@ describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the
     expect((await req("POST", `/api/grants/${c.receipt.holding_grant}/revoke`, { token: t.token, body: {} })).status).toBe(200);
     expect((await open(t, { agent: "agent.c" })).status).toBe(201);
     expect((await tourOf(t, c.tour.id)).status).toBe("ended");
-    // A key that was written under the holding grant at the very moment that grant was cancelled is not in the
-    // cancel's list (grants.js, known gap) and would go on working. Ending the tour looks under it once more.
+    // A key written under the holding grant at the very moment that grant was cancelled used to be missed by the
+    // cancel (grants.js: the gap closed on 2026-10-09). The state it left is written here by hand: the holding grant
+    // cancelled, its key not. The key stops WORKING at once, because a grant above it has ended (grants.js,
+    // endedAbove; before that it answered 200). It is still there, though, until ending the tour looks under it.
     const d = (await open(t, { agent: "agent.d" })).json;
     await dbQuery("UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'test: cancelled, one key missed' WHERE id = $1", [d.receipt.holding_grant]);
-    expect(await works(d.key.token)).toBe(200); // the gap, as it is without tours
+    expect(await works(d.key.token)).toBe(401);
+    expect(await liveUnder(d.receipt.holding_grant)).toBe(1);
     expect((await admin("POST", "/api/admin/grants/reap")).json.tours_ended).toContain(d.tour.id);
     expect(await works(d.key.token)).toBe(401);
     expect(await liveUnder(d.receipt.holding_grant)).toBe(0);
@@ -1676,8 +1679,11 @@ describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the
     await works(first.key.token);
     return { id: first.tour.id, hold: first.receipt.holding_grant, first: first.key, second: second.key };
   };
-  // A cancel MISSES one grant, once: what happens when that grant is written at the very moment its parent is being
-  // cancelled (it is not in the cancel's list). The first attempt to cancel it does nothing; the next one works.
+  // A cancel MISSES one grant: the first `times` attempts to cancel it do nothing; the next one works.
+  // (This is how a key "written at the very moment its parent was being cancelled" used to be shown. Since
+  // 2026-10-09 the cancel finds such a key itself: revokeGrantTree goes at a key from its list and once more in its
+  // second look, after it has taken the key above. So a key that gets past the CANCEL is one that gets past both
+  // of those, and what is tested below is that the tour's own looks still find it then.)
   const missed = async (name, grantId, times, fn) => {
     await dbQuery("DELETE FROM settings WHERE key = $1", [name]);
     await dbQuery("INSERT INTO settings (key, value) VALUES ($1, $2)", [name, String(times)]);
@@ -1688,7 +1694,7 @@ describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the
       await dbQuery("DELETE FROM settings WHERE key = $1", [name]);
     }
   };
-  const missedOnce = (name, grantId, fn) => missed(name, grantId, 1, fn);
+  const missedByTheCancel = (name, grantId, fn) => missed(name, grantId, 2, fn);
 
   test("turns: something that saw the tour one turn ago never touches the key of the turn after", async () => {
     const t = await newTenant("tour-turns", "studio");
@@ -1836,13 +1842,15 @@ describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the
     const t = await newTenant("tour-deep", "studio");
     const withHelpers = { caps: [...SPEC.caps, "grant.issue"] };
     const hire = (token) => req("POST", "/api/grants", { token, body: { sub: "agent:helper", caps: ["grant.read"], ttlSec: 600, budget: { usd_cents: 0, calls: 5, deploys: 0 } } });
-    // renewal: the old key's helper is missed by the cancel, and goes on working under a cancelled key (the older gap)
+    // renewal: the old key's helper is missed by the cancel and is left, not cancelled, under a cancelled key
     const first = (await open(t, { ...withHelpers, agent: "deep.a" })).json;
     let helper = (await hire(first.key.token)).json;
     await rested(first.tour.id);
-    const second = (await missedOnce("tr_miss_renew", helper.id, () => renew(first.key.token))).json;
+    const second = (await missedByTheCancel("tr_miss_renew", helper.id, () => renew(first.key.token))).json;
     expect(await works(first.key.token)).toBe(401);
-    // the look before the next key is issued goes under every key the tour ever had, not only the ones still working
+    // the look before the next key is issued goes under every key the tour ever had, not only the ones still working.
+    // (Its STATUS is what shows that: a key under a cancelled key answers 401 whether it was found or not.)
+    expect(await statusOf(helper.id)).toBe("revoked");
     expect(await works(helper.token)).toBe(401);
     expect(await works(second.key.token)).toBe(200);
     await rested(first.tour.id);
@@ -1851,15 +1859,17 @@ describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the
     // a freeze: the helper of the CURRENT key is missed by the alarm's first cancel
     helper = (await hire(third.json.key.token)).json;
     await longAgo(second.key.id);
-    await missedOnce("tr_miss_freeze", helper.id, async () => expect(await works(second.key.token)).toBe(401));
+    await missedByTheCancel("tr_miss_freeze", helper.id, async () => expect(await works(second.key.token)).toBe(401));
     expect((await tourOf(t, first.tour.id)).status).toBe("frozen");
     expect(await works(third.json.key.token)).toBe(401);
+    expect(await statusOf(helper.id)).toBe("revoked");
     expect(await works(helper.token)).toBe(401);
     // the end: missed by the cancel AND by the first look after it, found by the look after that (it looks until a look finds nothing)
     const b = (await open(t, { ...withHelpers, agent: "deep.b" })).json;
     helper = (await hire(b.key.token)).json;
-    const end = await missed("tr_miss_end", helper.id, 2, () => req("POST", `/api/tours/${b.tour.id}/end`, { token: t.token, body: {} }));
+    const end = await missed("tr_miss_end", helper.id, 3, () => req("POST", `/api/tours/${b.tour.id}/end`, { token: t.token, body: {} }));
     expect(end.status).toBe(200);
+    expect(await statusOf(helper.id)).toBe("revoked");
     expect(await works(helper.token)).toBe(401);
     expect(end.json.tour.status).toBe("ended");
     // and if it truly cannot be cancelled, the tour does NOT claim to be ended; the sweep finishes it when it can
@@ -1867,13 +1877,16 @@ describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the
     helper = (await hire(c.key.token)).json;
     const stuck = await during("tr_never_cancel", "grants", "BEFORE UPDATE", `OLD.id = '${helper.id}' AND NEW.status = 'revoked'`, "RETURN NULL;", async () => {
       const r = await req("POST", `/api/tours/${c.tour.id}/end`, { token: t.token, body: {} });
-      expect(await works(helper.token)).toBe(200);
+      // it could not be cancelled, so it is still there; it no longer WORKS, because the key above it has ended
+      // (grants.js, endedAbove; before 2026-10-09 it answered 200 here)
+      expect(await statusOf(helper.id)).toBe("active");
+      expect(await works(helper.token)).toBe(401);
       expect((await dbQuery("SELECT status FROM tours WHERE id = $1", [c.tour.id])).rows[0].status).not.toBe("ended");
       return r;
     });
     expect(stuck.status).toBe(500);
     expect((await admin("POST", "/api/admin/grants/reap")).json.tours_ended).toContain(c.tour.id);
-    expect(await works(helper.token)).toBe(401);
+    expect(await statusOf(helper.id)).toBe("revoked");
     expect((await tourOf(t, c.tour.id)).status).toBe("ended");
   }, 60000);
 
@@ -3299,6 +3312,246 @@ describe("18b. spend counts all the way up the chain", () => {
     expect((await spend(direct.json.token, 7)).status).toBe(200);
     expect((await req("POST", `/api/grants/${direct.json.id}/revoke`, { token: root.token, body: {} })).status).toBe(200);
     expect(await left(root.token)).toBe(before - 5 - 7);
+  });
+});
+
+// Two older faults in cancelling, both closed on 2026-10-09 (src/grants.js, revokeGrantTree).
+//
+// 1. A key issued under a grant AT THE MOMENT that grant was being cancelled was missed: it stayed live under a
+//    cancelled parent, and its whole budget stayed held on the grant above for good.
+// 2. A cancel that lost a lock wait (Postgres aborts one of two transactions that each hold what the other wants)
+//    simply failed, and a sweep pass that lost one skipped every candidate after it.
+//
+// WHAT THESE TESTS CAN AND CANNOT SHOW. The suite's database is ONE connection, so two transactions never really
+// run side by side here. Instead a database trigger makes the other party's work appear at one chosen statement,
+// which is where the other transaction would have finished, or makes that statement fail with the very error
+// Postgres gives the side it aborts (SQLSTATE 40P01). So these tests pin what the code DOES once it meets that
+// state or that error. That the state and the error arise the way the notes in grants.js say, and that no other
+// interleaving exists, rests on reading the lock sequences, not on a test.
+describe("18c. a cancel leaves nothing working under it, and losing a lock wait does not fail it", () => {
+  const past = Math.floor(Date.now() / 1000) - 60;
+  const works = async (token) => (await req("GET", "/api/grants/verify", { token })).status;
+  const left = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining.calls;
+  const issue = (token, sub, calls, caps = ["grant.issue", "grant.read"]) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget: { usd_cents: 0, calls, deploys: 0 } } });
+  const spend = (token, calls) => req("POST", "/api/grants/settle", { token, body: { calls, ref: "work:test" } });
+  const cancel = (token, id) => req("POST", `/api/grants/${id}/revoke`, { token, body: { reason: "test" } });
+  const statusOf = async (id) => (await dbQuery("SELECT status FROM grants WHERE id = $1", [id])).rows[0]?.status;
+  const rowOf = async (id) => JSON.parse(JSON.stringify((await dbQuery("SELECT status, reserved, settled FROM grants WHERE id = $1", [id])).rows[0]));
+  // what each grant gave back to the one above it, one number per time it let go (never more than one)
+  const gaveBack = async (id) => (await dbQuery("SELECT calls FROM ledger WHERE kind = 'release' AND grant_id = $1 ORDER BY id", [id])).rows.map((r) => r.calls);
+  // Something happens at ONE chosen statement, for the length of `fn`: a trigger that exists only inside one test.
+  const at = async (name, table, timing, when, body, fn) => {
+    await dbQuery(`CREATE OR REPLACE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN ${body} END $f$`);
+    await dbQuery(`CREATE TRIGGER ${name} ${timing} ON ${table} FOR EACH ROW WHEN (${when}) EXECUTE FUNCTION ${name}()`);
+    try {
+      return await fn();
+    } finally {
+      await dbQuery(`DROP TRIGGER IF EXISTS ${name} ON ${table}`);
+      await dbQuery(`DROP FUNCTION IF EXISTS ${name}()`);
+    }
+  };
+  const beingCancelled = (id) => `OLD.id = '${id}' AND OLD.status = 'active' AND NEW.status = 'revoked'`;
+  // A key that was "issued while the grant above it was being cancelled". It is issued for real first, so its
+  // token is real, then taken out from under its parent again (nothing held for it there), so the cancel's list
+  // cannot see it: as if it had not been issued yet. It is put back at the very statement that takes the parent,
+  // with its budget held on the parent, which is exactly what issueChildGrant leaves when it finishes just before.
+  const issuedDuringCancel = async (name, parentId, child, held, fn) => {
+    await dbQuery("UPDATE grants SET parent = NULL WHERE id = $1", [child.json.id]);
+    await dbQuery(`UPDATE grants SET reserved = '{"usd_cents":0,"calls":0,"deploys":0}'::jsonb WHERE id = $1`, [parentId]);
+    return at(name, "grants", "BEFORE UPDATE", beingCancelled(parentId),
+      `UPDATE grants SET parent = '${parentId}' WHERE id = '${child.json.id}'; NEW.reserved := '{"usd_cents":0,"calls":${held},"deploys":0}'::jsonb; RETURN NEW;`, fn);
+  };
+  // The statement that takes `id` fails the first `times` times with the error Postgres gives the side it aborts
+  // in a lock cycle. The count is a sequence because a sequence is not undone when the transaction is.
+  const losesTheWait = async (name, id, to, times, fn, error = "RAISE EXCEPTION 'deadlock detected' USING ERRCODE = '40P01';") => {
+    await dbQuery(`DROP SEQUENCE IF EXISTS ${name}_n`);
+    await dbQuery(`CREATE SEQUENCE ${name}_n`);
+    try {
+      const r = await at(name, "grants", "BEFORE UPDATE", `OLD.id = '${id}' AND OLD.status = 'active' AND NEW.status = '${to}'`, `IF nextval('${name}_n') <= ${times} THEN ${error} END IF; RETURN NEW;`, fn);
+      const n = (await dbQuery(`SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS n FROM ${name}_n`)).rows[0].n;
+      return { r, tries: Number(n) };
+    } finally {
+      await dbQuery(`DROP SEQUENCE IF EXISTS ${name}_n`);
+    }
+  };
+
+  test("a helper issued while the key above it is being cancelled is cancelled with it, and the owner gets back all that nobody used", async () => {
+    const root = await newTenant("cancel-race", "studio");
+    const before = await left(root.token);
+    // 1. the sequence as it was found: one key is cancelled, and a helper is issued under it at that moment
+    let mid = await issue(root.token, "agent:mid", 10),
+      late = await issue(mid.json.token, "agent:late", 6, ["grant.read"]);
+    expect(late.status).toBe(201);
+    expect((await spend(late.json.token, 2)).status).toBe(200);
+    let r = await issuedDuringCancel("t18c_late_one", mid.json.id, late, 6, () => cancel(root.token, mid.json.id));
+    expect(r.status).toBe(200);
+    expect(r.json.revoked).toEqual([late.json.id, mid.json.id]); // the lower one first
+    expect(await statusOf(late.json.id)).toBe("revoked");
+    expect(await works(late.json.token)).toBe(401);
+    expect(await gaveBack(late.json.id)).toEqual([4]); // 6 less the 2 it used
+    expect(await gaveBack(mid.json.id)).toEqual([8]); // 10 less the 2 used under it: read AFTER the helper let go
+    expect(await left(root.token)).toBe(before - 2);
+    // 2. the same from higher up, and the helper has a helper of its own: the whole of what was issued late goes
+    const top = await issue(root.token, "agent:top", 20);
+    mid = await issue(top.json.token, "agent:mid", 10);
+    late = await issue(mid.json.token, "agent:late", 6);
+    const under = await issue(late.json.token, "agent:under", 3, ["grant.read"]);
+    expect(under.status).toBe(201);
+    expect((await spend(late.json.token, 2)).status).toBe(200);
+    expect((await spend(under.json.token, 1)).status).toBe(200);
+    r = await issuedDuringCancel("t18c_late_tree", mid.json.id, late, 6, () => cancel(root.token, top.json.id));
+    expect(r.status).toBe(200);
+    expect(r.json.revoked).toEqual([under.json.id, late.json.id, mid.json.id, top.json.id]);
+    for (const g of [under, late, mid, top]) expect(await statusOf(g.json.id)).toBe("revoked");
+    expect(await works(late.json.token)).toBe(401);
+    expect(await works(under.json.token)).toBe(401);
+    expect(await gaveBack(under.json.id)).toEqual([2]); // 3 less the 1 it used
+    expect(await gaveBack(late.json.id)).toEqual([3]); // 6 less its own 2, less the 1 used under it
+    expect(await gaveBack(mid.json.id)).toEqual([7]); // 10 less the 3 used under it
+    expect(await gaveBack(top.json.id)).toEqual([17]); // 20 less those 3
+    // The owner is left holding exactly what was used (2, then 2 + 1), and can hand out the rest and no more.
+    expect(await left(root.token)).toBe(before - 5);
+    expect((await issue(root.token, "agent:again", before - 5)).status).toBe(201);
+    expect((await issue(root.token, "agent:over", 1)).status).toBeGreaterThanOrEqual(400);
+  });
+
+  test("a key under a grant that has ended does not work: it is refused at the door, and cannot settle or issue even past the door", async () => {
+    const root = await newTenant("cancel-orphan", "studio");
+    const top = await issue(root.token, "agent:top", 30);
+    const mid = await issue(top.json.token, "agent:mid", 20);
+    const leaf = await issue(mid.json.token, "agent:leaf", 10);
+    const deep = await issue(leaf.json.token, "agent:deep", 2, ["grant.read"]);
+    expect(deep.status).toBe(201);
+    const end = (id, status) => dbQuery("UPDATE grants SET status = $2 WHERE id = $1", [id, status]);
+    // The state the old fault left behind, written by hand: a grant ended, the keys under it not. Whatever way it
+    // ended, and whether it is the grant just above or one further up, every key under it is refused.
+    for (const [which, status] of [[mid, "revoked"], [mid, "expired"], [mid, "captured"], [top, "revoked"]]) {
+      expect(await works(leaf.json.token)).toBe(200); // control: with everything above it active, it works
+      expect(await works(deep.json.token)).toBe(200);
+      await end(which.json.id, status);
+      const refused = await req("GET", "/api/grants/verify", { token: leaf.json.token });
+      expect(refused.status).toBe(401);
+      expect(refused.json.error).toBe("grant_revoked");
+      expect(await works(deep.json.token)).toBe(401); // two below the one that ended
+      expect((await spend(leaf.json.token, 1)).status).toBe(401);
+      expect((await issue(leaf.json.token, "agent:no", 1)).status).toBe(401);
+      expect(await works(which === mid ? top.json.token : root.token)).toBe(200); // the grant above the ended one is untouched
+      await end(which.json.id, "active");
+    }
+    // PAST THE DOOR. The door (verifyGrant) reads once, when the request comes in. If the grant above ends after
+    // that read, the write itself must still refuse. Made to happen here at the door's last statement (its
+    // rate-limit count), which is after its read of the grant and before the write.
+    const afterTheDoor = (name, fn) => at(name, "rate_limits", "BEFORE INSERT", `NEW.grant_id = '${leaf.json.id}'`, `UPDATE grants SET status = 'revoked' WHERE id = '${mid.json.id}'; RETURN NEW;`, fn);
+    const was = await rowOf(leaf.json.id);
+    const settle = await afterTheDoor("t18c_ends_before_settle", () => spend(leaf.json.token, 1));
+    expect(settle.status).toBe(401);
+    expect(settle.json.error).toBe("grant_not_active"); // the settle's own refusal, not the door's
+    await end(mid.json.id, "active");
+    const hire = await afterTheDoor("t18c_ends_before_issue", () => issue(leaf.json.token, "agent:no", 1));
+    expect(hire.status).toBe(403);
+    expect(hire.json.error).toBe("parent_not_active"); // the issue's own refusal
+    await end(mid.json.id, "active");
+    expect(await rowOf(leaf.json.id)).toEqual(was); // nothing was settled on it and nothing is held on it for a new key
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [leaf.json.id])).rows[0].n).toBe(1);
+    // with the grant above active again, both go through: it was only ever the ended grant that stopped them
+    expect((await spend(leaf.json.token, 1)).status).toBe(200);
+    expect((await issue(leaf.json.token, "agent:yes", 1, ["grant.read"])).status).toBe(201);
+    // and a key under an ended grant can still be CANCELLED, through the ordinary route
+    await end(mid.json.id, "revoked");
+    expect((await cancel(root.token, leaf.json.id)).json.revoked).toContain(leaf.json.id);
+    expect(await statusOf(deep.json.id)).toBe("revoked");
+  });
+
+  test("a cancel that loses a lock wait starts again and lets go exactly once; it gives up after three tries with nothing changed; any other failure is not tried again", async () => {
+    const root = await newTenant("cancel-retry", "studio");
+    const before = await left(root.token);
+    const tree = async (n) => {
+      const mid = await issue(root.token, `agent:mid${n}`, 10);
+      const leaf = await issue(mid.json.token, `agent:leaf${n}`, 6, ["grant.read"]);
+      expect((await spend(leaf.json.token, 2)).status).toBe(200);
+      return { mid: mid.json.id, leaf: leaf.json.id };
+    };
+    // The failure comes when `mid` is taken, which is AFTER the leaf under it was cancelled and had let go in the
+    // same transaction. So a try that fails must leave nothing of that behind, or the next try would let go twice.
+    // 1. lost once, then twice: it finishes. A lost wait is known by its code (40P01) whatever its words are, and by
+    //    its words if a driver does not pass the code on.
+    const shapes = { 1: "RAISE EXCEPTION 'Verklemmung entdeckt' USING ERRCODE = '40P01';", 2: "RAISE EXCEPTION 'deadlock detected';" };
+    for (const lost of [1, 2]) {
+      const g = await tree(lost);
+      const { r, tries } = await losesTheWait(`t18c_lost_${lost}`, g.mid, "revoked", lost, () => cancel(root.token, g.mid), shapes[lost]);
+      expect(r.status).toBe(200);
+      expect(tries).toBe(lost + 1);
+      expect(r.json.revoked).toEqual([g.leaf, g.mid]); // the answer is the try that worked, not a list from each try
+      expect(await gaveBack(g.leaf)).toEqual([4]);
+      expect(await gaveBack(g.mid)).toEqual([8]);
+      expect(await left(root.token)).toBe(before - 2 * lost);
+    }
+    // 2. lost every time: three tries, then the failure is the caller's to see, and NOTHING has changed
+    const g = await tree(3);
+    const stuck = await losesTheWait("t18c_lost_always", g.mid, "revoked", 1000, () => cancel(root.token, g.mid));
+    expect(stuck.r.status).toBe(500);
+    expect(stuck.tries).toBe(3);
+    expect(await statusOf(g.leaf)).toBe("active");
+    expect(await statusOf(g.mid)).toBe("active");
+    expect(await gaveBack(g.leaf)).toEqual([]);
+    expect(await left(root.token)).toBe(before - 4 - 10);
+    // 3. a failure that is not a lost wait is not tried again
+    const other = await losesTheWait("t18c_other_error", g.mid, "revoked", 1000, () => cancel(root.token, g.mid), "RAISE EXCEPTION 'test: this key cannot be cancelled right now';");
+    expect(other.r.status).toBe(500);
+    expect(other.tries).toBe(1);
+    expect(await statusOf(g.leaf)).toBe("active");
+    // and with nothing in the way it is cancelled as usual
+    expect((await cancel(root.token, g.mid)).json.revoked).toEqual([g.leaf, g.mid]);
+    expect(await left(root.token)).toBe(before - 6);
+  });
+
+  test("the sweep: one grant that cannot be released does not stop the pass, and is taken by the next", async () => {
+    const a = await newTenant("sweep-a", "studio");
+    const b = await newTenant("sweep-b", "studio");
+    const before = await left(a.token);
+    const mid = await issue(a.token, "agent:mid", 10);
+    const leaf = await issue(mid.json.token, "agent:leaf", 6, ["grant.read"]);
+    const other = await issue(b.token, "agent:other", 5, ["grant.read"]);
+    expect((await spend(leaf.json.token, 2)).status).toBe(200);
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = ANY($2)", [past, [mid.json.id, leaf.json.id, other.json.id]]);
+    // The leaf is the deepest, so the pass comes to it first. It loses its lock wait, every time, for this pass.
+    const { r, tries } = await losesTheWait("t18c_sweep_lost", leaf.json.id, "expired", 1000, () => admin("POST", "/api/admin/grants/reap"));
+    expect(r.status).toBe(200); // the pass did not fail
+    expect(tries).toBe(1); // the sweep does not try a candidate twice in one pass
+    expect(r.json.reaped).toContain(other.json.id); // a candidate AFTER the one that failed was still released
+    expect(r.json.reaped).not.toContain(leaf.json.id);
+    expect(r.json.reaped).not.toContain(mid.json.id); // the grant above it waited for it
+    expect(await statusOf(leaf.json.id)).toBe("active");
+    expect(await statusOf(mid.json.id)).toBe("active");
+    expect((await rowOf(b.grantId)).reserved.calls).toBe(0); // b got its 5 back in that same pass
+    // the next pass takes both, the lower one first, and the owner is left holding exactly what was used
+    const next = (await admin("POST", "/api/admin/grants/reap")).json.reaped;
+    expect(next).toContain(leaf.json.id);
+    expect(next).toContain(mid.json.id);
+    expect(await gaveBack(leaf.json.id)).toEqual([4]);
+    expect(await gaveBack(mid.json.id)).toEqual([8]);
+    expect(await left(a.token)).toBe(before - 2);
+  });
+
+  test("the keys under one grant are always cancelled in the same order: by id, not by whatever order the database lists them in", async () => {
+    const root = await newTenant("cancel-order", "studio");
+    const mid = await issue(root.token, "agent:mid", 20);
+    const byId = async () => (await dbQuery("SELECT id FROM grants WHERE parent = $1 ORDER BY id", [mid.json.id])).rows.map((x) => x.id);
+    // Ids are random. Keys are issued until the order they were made in is NOT their order by id (four is nearly
+    // always enough), so that an order left to the database could not pass by luck.
+    const made = [];
+    while (made.length < 16 && (made.length < 4 || String(made) === String(await byId()))) {
+      const k = await issue(mid.json.token, `agent:k${made.length}`, 1, ["grant.read"]);
+      expect(k.status).toBe(201);
+      made.push(k.json.id);
+    }
+    expect(made).not.toEqual(await byId());
+    const r = await cancel(root.token, mid.json.id);
+    expect(r.status).toBe(200);
+    expect(r.json.revoked).toEqual([...(await byId()), mid.json.id]);
+    // and that is the order they really let go in, one after another
+    const order = (await dbQuery("SELECT grant_id FROM ledger WHERE kind = 'release' AND parent = $1 ORDER BY id", [mid.json.id])).rows.map((x) => x.grant_id);
+    expect(order).toEqual(await byId());
   });
 });
 
