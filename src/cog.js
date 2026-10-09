@@ -3,7 +3,7 @@ import { randomBytes } from "crypto";
 import { env } from "./config.js";
 import { HttpError, parseJson } from "./util.js";
 import { getGrant, recordEvent, sql } from "./db.js";
-import { gatehouseEvaluate, normalizeOverlay, normalizeUsage, remainingBudget, tenantWorkerPrefix, TIERS } from "./policy.js";
+import { gatehouseEvaluate, memoryPartitions, normalizeOverlay, normalizeUsage, remainingBudget, tenantWorkerPrefix, TIERS } from "./policy.js";
 import { issueChildGrant, revokeGrantTree } from "./grants.js";
 import { searchMemories, writeMemory } from "./memory.js";
 import { deployWorker, TEMPLATES } from "./railway.js";
@@ -18,9 +18,19 @@ function guessTemplateFromIntent(e) {
   if (/\brelay|webhook|bridge\b/.test(t)) return "webhook-relay";
   return null;
 }
-async function gatherPlanEvidence(e, t, a) {
-  let n = await searchMemories(e, a ? `${a} ${t}` : t, "", 5),
-    r = a
+// Evidence comes ONLY from memory the caller's own key may read: the key needs memory.read,
+// and the search stays under the key's own memory sections. It used to search the whole
+// tenant for anyone allowed to plan, so a guest (all guests share one tenant), or a key
+// with an empty memory scope, could read other memory through the planner.
+async function gatherPlanEvidence(e, t, a, row) {
+  let caps = parseJson(row?.caps),
+    parts = Array.isArray(caps) && caps.includes("memory.read") ? memoryPartitions(parseJson(row.scope) || {}).slice(0, 5) : [],
+    n = [];
+  for (let p of parts) {
+    if (n.length >= 5) break;
+    n.push(...(await searchMemories(e, a ? `${a} ${t}` : t, p, 5 - n.length)));
+  }
+  let r = a
       ? await sql`SELECT 1 FROM events WHERE tenant = ${e} AND type = 'worker.failed' AND data->>'template' = ${a} LIMIT 3`
       : [];
   return {
@@ -181,6 +191,7 @@ export async function cogPlan(e, t, a) {
       e.tenant.id,
       t,
       a.template && TEMPLATES[a.template] ? a.template : guessTemplateFromIntent(t),
+      e.row,
     ),
     r = (await planWithLlm(e.tenant, e.row, t, a, n)) || buildDeterministicPlan(e.tenant, e.row, t, a, n);
   return (

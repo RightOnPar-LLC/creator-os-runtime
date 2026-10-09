@@ -111,7 +111,7 @@ export var remainingBudget = (e) =>
     subtractUsage(normalizeUsage(parseJson(e.budget)), normalizeUsage(parseJson(e.reserved))),
     normalizeUsage(parseJson(e.settled)),
   );
-// The owner's rule (2026-10-09): a key that an AGENT hands to a sub-agent lives 24 hours at
+// The owner's rule (2026-10-09 UTC): a key that an AGENT hands to a sub-agent lives 24 hours at
 // most. "An agent" is any issuing key that is not the tenant's own root key (depth >= 1).
 // The tier's maxTtlSec still bounds what the owner's root key may issue; a child can never
 // outlive its parent either way, so when a grant is up everything under it is up too.
