@@ -4,7 +4,7 @@ import { HttpError, newId } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
-import { mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
+import { endedAbove, mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
 import { readGuestPool, guestPoolStatus } from "../guest.js";
 import { sweepTours } from "../tours.js";
 import { TEMPLATES } from "../railway.js";
@@ -193,7 +193,11 @@ app.post("/api/admin/breakglass", requireAdmin, async (e) => {
 // Static 4-segment path — distinct from the 5-segment /:id/{revoke,token}, so it
 // runs the sweep on demand for ops and for deterministic tests (the background
 // timer is disabled under test).
-app.post("/api/admin/grants/reap", requireAdmin, async (e) => e.json({ reaped: await reapExpiredGrants(), tours_ended: await sweepTours() }));
+// `failed`: candidates this pass could not release (id and why); they are left for the next pass.
+app.post("/api/admin/grants/reap", requireAdmin, async (e) => {
+  let failed = [];
+  return e.json({ reaped: await reapExpiredGrants({ failed }), failed, tours_ended: await sweepTours() });
+});
 app.post("/api/admin/grants/:id/revoke", requireAdmin, async (e) =>
   e.json({
     revoked: await revokeGrantTree(
@@ -205,7 +209,8 @@ app.post("/api/admin/grants/:id/revoke", requireAdmin, async (e) =>
 );
 app.post("/api/admin/grants/:id/token", requireAdmin, async (e) => {
   let t = await getGrant(e.req.param("id"));
-  if (!t || t.status !== "active") throw new HttpError(404, "grant_not_active");
+  // (endedAbove: nor is a token signed again for a grant whose grant above has ended; it would answer 401.)
+  if (!t || t.status !== "active" || (await endedAbove(sql, t.id))) throw new HttpError(404, "grant_not_active");
   return e.json({
     id: t.id,
     token: reissueGrantToken(t),

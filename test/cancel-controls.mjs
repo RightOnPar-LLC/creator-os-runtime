@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Do the cancel tests (section 18c of runtime.test.js) really test anything? For each rule that the 2026-10-09
-// change put into src/grants.js (and one line of src/routes/grants.js) this takes the rule OUT of the source, runs those tests, and expects them to
+// change put into src/grants.js (and one line each of three files under src/routes) this takes the rule OUT of the source, runs those tests, and expects them to
 // FAIL. A rule whose removal nothing notices is a rule with no test. Same method as tours-controls.mjs.
 //
 //   node test/cancel-controls.mjs        (from the repo root; about a minute)
@@ -82,12 +82,32 @@ const BREAKS = [
     "  for (let attempt = 1; ; attempt++) {\n"],
   ["one candidate that fails ends the sweep's whole pass",
     "src/grants.js",
-    "      console.error(\"[reaper] left for the next pass:\", id, err?.message || err);\n",
+    "      failed.push({ id, error: String(err?.message || err).slice(0, 200) });\n",
     "      throw err;\n"],
+  ["the sweep does not say which candidates it left",
+    "src/routes/admin.js",
+    "reaped: await reapExpiredGrants({ failed }), failed, tours_ended",
+    "reaped: await reapExpiredGrants({ failed }), failed: [], tours_ended"],
   ["the keys under one grant are cancelled in whatever order the database lists them",
     "src/grants.js",
     "SELECT id FROM sub ORDER BY depth DESC, id`;\n        for (let { id } of s) await cancel(id);",
     "SELECT id FROM sub ORDER BY depth DESC`;\n        for (let { id } of s) await cancel(id);"],
+  ["a cancel takes the grants by id alone, not the lower ones first",
+    "src/grants.js",
+    "SELECT id FROM sub ORDER BY depth DESC, id`;\n        for (let { id } of s) await cancel(id);",
+    "SELECT id FROM sub ORDER BY id`;\n        for (let { id } of s) await cancel(id);"],
+  ["the keys found by a cancel's second look are taken in whatever order the database lists them",
+    "src/grants.js",
+    "WHERE parent = ${id} AND status = 'active' ORDER BY id`;\n          for (let child of late)",
+    "WHERE parent = ${id} AND status = 'active'`;\n          for (let child of late)"],
+  ["the admin signs a fresh token for a key whose grant above has ended",
+    "src/routes/admin.js",
+    " || (await endedAbove(sql, t.id))) throw new HttpError(404, \"grant_not_active\");",
+    ") throw new HttpError(404, \"grant_not_active\");"],
+  ["an OAuth refresh signs the same grant again although the grant above it has ended",
+    "src/routes/oauth.js",
+    " && Number(n.exp) - nowSec() > 3600 && !(await endedAbove(sql, n.id))",
+    " && Number(n.exp) - nowSec() > 3600"],
 ];
 
 const once = () => spawnSync(bun, ["test", "runtime.test.js", "-t", "18c\\. a cancel"], { cwd: here, env: { ...process.env, RUNTIME_ENTRY: "" }, encoding: "utf8", timeout: 300000 });

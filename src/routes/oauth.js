@@ -3,7 +3,7 @@ import { randomBytes } from "crypto";
 import { escapeHtml, HttpError, newId, nowSec, sha256Base64Url, sha256Hex } from "../util.js";
 import { getGrant, getTenant, recordEvent, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
-import { revokeGrantTree } from "../grants.js";
+import { endedAbove, revokeGrantTree } from "../grants.js";
 import { app, readJsonBody, requireAdmin } from "../http.js";
 import {
   effectiveCaps,
@@ -181,8 +181,11 @@ app.post("/oauth/token", async (e) => {
     // Same profile the grant was approved under, or no refresh at all.
     let r = profileForGrant(n);
     if (!r) return oauthError(e, "invalid_grant", "grant profile unknown; approve again");
+    // The same grant is signed again only while it would still be let in: a grant whose grant above has ended
+    // answers 401 at the door (grants.js, endedAbove), so it goes the other way, where a root that is no longer
+    // active ends in "approve again".
     let s =
-      n.status === "active" && Number(n.exp) - nowSec() > 3600
+      n.status === "active" && Number(n.exp) - nowSec() > 3600 && !(await endedAbove(sql, n.id))
         ? {
             row: n,
             token: reissueGrantToken(n),

@@ -262,36 +262,36 @@ function unusedOf(g, heldNow) {
   return { usd_cents: Math.max(0, u.usd_cents), calls: Math.max(0, u.calls), deploys: Math.max(0, u.deploys) };
 }
 // DEFENCE IN DEPTH: a grant is only as alive as everything above it. Cancelling a grant cancels everything under
-// it (revokeGrantTree), so an ACTIVE grant under one that has ended should not exist. If one ever does (a row left
-// by the gap revokeGrantTree had until 2026-10-09, or by a mistake still to be made), it must not work:
-// verifyGrant, settleGrantUsage and issueChildGrant all refuse it, and the owner's approval does not run a request
-// it filed (routes/grants.js). "Ended" is any status but active: cancelled, run out, captured. The walk goes up
-// the parent chain: one primary-key look-up per step and at most as many steps as the tier's maxDepth (6 today).
-// `parent` is written once, when a row is made, and points at a row that already exists, so the chain cannot loop.
+// it (revokeGrantTree), and a grant that runs out waits for the keys under it, so an ACTIVE grant under one that
+// has ended is not a state this code means to leave. Where one exists it must not work. Three ways one can exist:
+// a row left by the gap revokeGrantTree had until 2026-10-09; a hold opened with another hold's own token, once
+// the hold above it is captured (possible until buildEscrow refuses a hold as payer); a mistake still to be made.
+// "Ended" is any status but active: cancelled, run out, captured.
 //
-// The nearest ended grant above `id`, or null. `q` is what to read with: the two write paths pass their own
+// WHO LOOKS: verifyGrant (every request that carries a key), settleGrantUsage, issueChildGrant, the owner's
+// approval of a request the grant filed (routes/grants.js), the OAuth refresh and the admin's token reissue
+// (neither hands out a fresh token for it). WHO DOES NOT: captureEscrow. A hold under an ended grant can still be
+// captured on a signed delivery receipt; see the note there.
+//
+// ONE walk, used by all of them: grantAndChain reads a grant's row and, in the SAME statement, whether any grant
+// above it has ended. The walk goes up the parent chain, one primary-key look-up per step and at most as many
+// steps as the tier's maxDepth (6 today). `parent` is written once, when a row is made, and points at a row that
+// already exists, so the chain cannot loop. On the verify path this is the read verifyGrant made anyway, so the
+// walk costs no extra round trip to the database. `q` is what to read with: the write paths pass their own
 // transaction, so that they look AFTER they hold their own row's lock.
-export async function endedAbove(q, id) {
-  return (
-    (
-      await q`WITH RECURSIVE up AS (SELECT p.id, p.parent, p.status, 1 AS hop FROM grants c JOIN grants p ON p.id = c.parent WHERE c.id = ${id}
-          UNION ALL SELECT p.id, p.parent, p.status, up.hop + 1 FROM grants p JOIN up ON p.id = up.parent)
-        SELECT id FROM up WHERE status <> 'active' ORDER BY hop LIMIT 1`
-    )[0]?.id ?? null
-  );
-}
-// verifyGrant's read of a grant: its row and, worked out in the SAME statement, whether anything above it has
-// ended. One statement because this runs on every request that carries a key: the walk rides along with the read
-// verifyGrant made anyway, so it costs no extra round trip to the database.
-async function grantAndChain(id) {
+async function grantAndChain(q, id) {
   let row = (
-    await sql`WITH RECURSIVE up AS (SELECT p.id, p.parent, p.status FROM grants c JOIN grants p ON p.id = c.parent WHERE c.id = ${id}
+    await q`WITH RECURSIVE up AS (SELECT p.id, p.parent, p.status FROM grants c JOIN grants p ON p.id = c.parent WHERE c.id = ${id}
         UNION ALL SELECT p.id, p.parent, p.status FROM grants p JOIN up ON p.id = up.parent)
       SELECT g.*, (SELECT up.id FROM up WHERE up.status <> 'active' LIMIT 1) AS ended_above FROM grants g WHERE g.id = ${id}`
   )[0];
   if (!row) return { row: null, endedAbove: null };
   let { ended_above, ...grant } = row;
   return { row: grant, endedAbove: ended_above ?? null };
+}
+// The id of an ended grant above `id`, or null.
+export async function endedAbove(q, id) {
+  return (await grantAndChain(q, id)).endedAbove;
 }
 // When two transactions each hold a row the other wants, Postgres ends the wait after about a second by
 // aborting ONE of them (SQLSTATE 40P01, "deadlock detected"); everything that one had done is rolled back.
@@ -309,6 +309,9 @@ const CANCEL_TRIES = 3;
 // parent and refuses one that is not active, so it either finished before the grant was taken or is refused after.
 // So right after taking a grant its active children are listed AGAIN, each is cancelled the same way (and its
 // children, and so on down), and only then is what is held on the grant read for its own release.
+// (This leans on READ COMMITTED, the level Postgres runs at unless told otherwise and the one this service uses:
+// each statement sees everything committed before it began, so the second look sees a key whose issue finished
+// while the statement before it was waiting for the parent's lock.)
 //
 // LOCKS. Inside its one transaction this holds a grant, and the parent it released into, while it asks for the
 // next one: the next sibling, or a child found by the second look. Every other transaction that takes two grants
@@ -465,9 +468,9 @@ async function releaseExpiredGrant(tx, g) {
   // under it used", so it waits: the sweep goes deepest first, and a child never outlives its parent, so anything
   // still active under an expired grant is itself due for the sweep (this pass, or the next if another writer held
   // it). This only LOOKS at the children; it never locks one. The transaction holds one grant and then its parent
-  // and nothing else: child, then parent. (revokeGrantTree is the one writer that holds a parent while it asks for
-  // one of that parent's children, so this and a cancel can each hold what the other wants. Postgres then aborts
-  // one of the two without changing any balance: see the notes above revokeGrantTree and reapExpiredGrants.)
+  // and nothing else: child, then parent. (revokeGrantTree holds a parent while it asks for one of that parent's
+  // children, so this and a cancel can each hold what the other wants. Postgres then aborts one of the two
+  // without changing any balance: see the notes above revokeGrantTree and reapExpiredGrants.)
   let waiting = await tx`SELECT 1 FROM grants WHERE parent = ${g.id} AND status = 'active' LIMIT 1`;
   if (waiting.length) return !1;
   let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING reserved`;
@@ -519,7 +522,13 @@ async function releaseExpiredGrant(tx, g) {
 // candidate is left for the next pass: each candidate is caught on its own below, so
 // one failure no longer ends the pass and leaves every later candidate waiting a
 // further minute.
-export async function reapExpiredGrants({ limit = 500 } = {}) {
+//
+// ANY failure of one candidate is caught, not only a lost lock wait: a candidate that
+// can never be released must not hold up every one after it, pass after pass (there
+// is no "stop after so many" for the same reason). It is not hidden: the pass says
+// what it left, in ONE log line, and in `failed` for a caller that passes a list (the
+// admin route puts it in its answer).
+export async function reapExpiredGrants({ limit = 500, failed = [] } = {}) {
   let candidates = await sql`SELECT id FROM grants WHERE status='active' AND exp <= ${nowSec()} ORDER BY depth DESC LIMIT ${limit}`,
     ids = [];
   for (let { id } of candidates) {
@@ -538,9 +547,10 @@ export async function reapExpiredGrants({ limit = 500 } = {}) {
     } catch (err) {
       // Nothing of this candidate's txn is left, so it is exactly as it was: still due, taken by the next pass. A
       // grant above it in this pass sees it still active and waits for it (releaseExpiredGrant).
-      console.error("[reaper] left for the next pass:", id, err?.message || err);
+      failed.push({ id, error: String(err?.message || err).slice(0, 200) });
     }
   }
+  if (failed.length) console.error(`[reaper] ${failed.length} of ${candidates.length} left for the next pass; the first: ${failed[0].id} (${failed[0].error})`);
   if (ids.length) await recordEvent("grant.reaped", { ids }, null, "reaper");
   return ids;
 }
@@ -581,7 +591,7 @@ export async function verifyGrant(e, t, a, countRate = !0) {
       });
       throw new HttpError(401, "grant_expired");
     }
-    let { row: s, endedAbove: above } = await grantAndChain(r.id);
+    let { row: s, endedAbove: above } = await grantAndChain(sql, r.id);
     // A key that a tour renewal already replaced, presented again: the alarm (tours.js). It answers 401 either way.
     if (s && s.status === "revoked" && s.revoke_reason === TOUR_RENEWED) await tourKeyReused(s);
     if (!s || s.status !== "active") throw new HttpError(401, "grant_revoked");
