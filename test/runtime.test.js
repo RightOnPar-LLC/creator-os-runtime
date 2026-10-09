@@ -1960,6 +1960,77 @@ describe("reservation reaper (runtime-wide)", () => {
   });
 });
 
+// What a key's helper spends counts against every grant above it, all the way up to the owner. Before
+// 2026-10-09 it counted one level up only: when the grant in between ended, the grant above got its
+// whole budget back and the spend was forgotten.
+describe("18b. spend counts all the way up the chain", () => {
+  const past = Math.floor(Date.now() / 1000) - 60;
+  const left = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining.calls;
+  const issue = (token, sub, calls, caps = ["grant.issue", "grant.read"]) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget: { usd_cents: 0, calls, deploys: 0 } } });
+  const spend = (token, calls) => req("POST", "/api/grants/settle", { token, body: { calls, ref: "work:test" } });
+
+  test("a helper's helper spends 4: when the grant between them is cancelled, the owner still has 4 less", async () => {
+    const root = await newTenant("chain-revoke", "pro");
+    const before = await left(root.token);
+    const mid = await issue(root.token, "agent:mid", 10);
+    const leaf = await issue(mid.json.token, "agent:leaf", 6, ["grant.read"]);
+    expect(leaf.status).toBe(201);
+    expect((await spend(leaf.json.token, 4)).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 10); // while they live, the whole 10 is held
+    expect((await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: { reason: "test" } })).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 4); // the 6 nobody used came back; the 4 that were used did not
+    // and it can be handed out again only up to what is really left
+    expect((await issue(root.token, "agent:again", before - 4)).status).toBe(201);
+    expect((await issue(root.token, "agent:over", 1)).status).toBeGreaterThanOrEqual(400);
+  });
+
+  test("the same when they simply run out (the sweep), in either order, and never twice", async () => {
+    const root = await newTenant("chain-expire", "pro");
+    const before = await left(root.token);
+    const mid = await issue(root.token, "agent:mid", 10);
+    const leaf = await issue(mid.json.token, "agent:leaf", 6, ["grant.read"]);
+    expect((await spend(leaf.json.token, 4)).status).toBe(200);
+    expect((await spend(mid.json.token, 1)).status).toBe(200); // the middle one uses 1 itself
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = ANY($2)", [past, [mid.json.id, leaf.json.id]]);
+    expect((await admin("POST", "/api/admin/grants/reap")).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 5); // 4 by the helper's helper, 1 by the helper
+    await admin("POST", "/api/admin/grants/reap");
+    await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: { reason: "again" } });
+    expect(await left(root.token)).toBe(before - 5); // a second sweep and a late cancel change nothing
+    // the parent reached BEFORE the child: only the middle grant has run out as far as the sweep can tell
+    const mid2 = await issue(root.token, "agent:mid2", 10);
+    const leaf2 = await issue(mid2.json.token, "agent:leaf2", 6, ["grant.read"]);
+    expect((await spend(leaf2.json.token, 2)).status).toBe(200);
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, mid2.json.id]);
+    await admin("POST", "/api/admin/grants/reap");
+    expect(await left(root.token)).toBe(before - 5 - 2);
+    // a child never outlives its parent: the helper's helper is over too, and letting it go later adds nothing
+    expect((await req("GET", "/api/grants/verify", { token: leaf2.json.token })).status).toBe(401);
+    await admin("POST", "/api/admin/grants/reap");
+    expect(await left(root.token)).toBe(before - 5 - 2);
+  });
+
+  test("three levels down, and one level down still works as it always did", async () => {
+    const root = await newTenant("chain-deep", "studio");
+    const before = await left(root.token);
+    const a = await issue(root.token, "agent:a", 20);
+    const b = await issue(a.json.token, "agent:b", 12);
+    const c = await issue(b.json.token, "agent:c", 8, ["grant.read"]);
+    expect(c.status).toBe(201);
+    expect((await spend(c.json.token, 3)).status).toBe(200);
+    expect((await spend(b.json.token, 2)).status).toBe(200);
+    // cancel the lowest first, then the top: the answer must not depend on the order things end in
+    expect((await req("POST", `/api/grants/${c.json.id}/revoke`, { token: b.json.token, body: {} })).status).toBe(200);
+    expect(await left(b.json.token)).toBe(12 - 2 - 3);
+    expect((await req("POST", `/api/grants/${a.json.id}/revoke`, { token: root.token, body: {} })).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 5);
+    const direct = await issue(root.token, "agent:direct", 10, ["grant.read"]);
+    expect((await spend(direct.json.token, 7)).status).toBe(200);
+    expect((await req("POST", `/api/grants/${direct.json.id}/revoke`, { token: root.token, body: {} })).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 5 - 7);
+  });
+});
+
 describe("19. escrow keystone (stage 1: open + read)", () => {
   const remainingOf = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
   const openBody = (over = {}) => ({ amount: 500, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });

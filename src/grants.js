@@ -228,6 +228,15 @@ export async function issueChildGrant(e, t, a, w = {}) {
     }
   );
 }
+// What a grant has NOT used, which is what goes back to its parent when it ends: what it was given, less
+// what it settled itself, less what is still held on it for the keys under it. Once those keys have
+// ended, what is still held IS what they used. So a key's spend counts against every grant above it, all
+// the way up. (Before 2026-10-09 the last term was missing: spend two levels down was forgotten the
+// moment the grant in between ended, and the grant above got its whole budget back.)
+function unusedOf(g, heldNow) {
+  let u = subtractUsage(subtractUsage(normalizeUsage(parseJson(g.budget)), normalizeUsage(parseJson(g.settled))), normalizeUsage(parseJson(heldNow)));
+  return { usd_cents: Math.max(0, u.usd_cents), calls: Math.max(0, u.calls), deploys: Math.max(0, u.deploys) };
+}
 export async function revokeGrantTree(e, t, a) {
   let n = [];
   if (
@@ -237,7 +246,8 @@ export async function revokeGrantTree(e, t, a) {
       for (let i of s) {
         if (i.status !== "active") continue;
         await r`UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = ${t} WHERE id = ${i.id}`;
-        let o = subtractUsage(normalizeUsage(parseJson(i.budget)), normalizeUsage(parseJson(i.settled)));
+        // Read what is held on it NOW (the rows above were read before the grants under it let go).
+        let o = unusedOf(i, (await r`SELECT reserved FROM grants WHERE id = ${i.id}`)[0].reserved);
         if (i.parent) {
           let l = (await r`SELECT reserved FROM grants WHERE id = ${i.parent} FOR UPDATE`)[0],
             c = subtractUsage(normalizeUsage(parseJson(l.reserved)), o);
@@ -349,10 +359,20 @@ export async function lowerGrantAutonomy(caller, targetId, level) {
 // later revoke can never double-credit the parent. Mirrors revokeGrantTree's
 // release (same math, same 'release' ledger row).
 async function releaseExpiredGrant(tx, g) {
-  let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING id`;
+  // Everything under an expired grant is over too (a child never outlives its parent), though the sweep
+  // may not have reached it yet. Those let go first, deepest first, so that what they did not use is back
+  // on this grant before it works out what IT did not use. Same lock order as everywhere: child, then parent.
+  let below = await tx`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE parent = ${g.id}
+      UNION ALL SELECT c.id FROM grants c JOIN sub ON c.parent = sub.id)
+    SELECT * FROM grants WHERE id IN (SELECT id FROM sub) AND status = 'active' ORDER BY depth DESC FOR UPDATE`;
+  for (let c of below) await releaseOneExpired(tx, c);
+  return releaseOneExpired(tx, g);
+}
+async function releaseOneExpired(tx, g) {
+  let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING reserved`;
   if (flipped.length !== 1) return !1; // someone else already moved it (revoked/expired) — never double-release
   if (!g.parent) return !0; // a root holds no reservation upward
-  let unspent = subtractUsage(normalizeUsage(parseJson(g.budget)), normalizeUsage(parseJson(g.settled))),
+  let unspent = unusedOf(g, flipped[0].reserved),
     p = (await tx`SELECT reserved FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0];
   if (p) {
     let c = subtractUsage(normalizeUsage(parseJson(p.reserved)), unspent);
