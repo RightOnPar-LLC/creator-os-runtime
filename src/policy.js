@@ -135,6 +135,9 @@ export var TOUR_IDLE_END_SEC = 48 * 3600;
 export var TOUR_REUSE_GRACE_SEC = 120;
 // No faster than this between renewals of one tour (each one cancels a key and issues another).
 export var TOUR_RENEW_MIN_GAP_SEC = 60;
+// A key that a renewal replaced, presented again, is looked into (the alarm, tours.js) at most this many times
+// a minute. Honest calls that were in flight at a renewal are a handful; more is somebody hammering a dead key.
+export var TOUR_ALARM_MAX_PER_MIN = 10;
 // An extension must add at least this much, or it is refused as being at the limit already (so a
 // tour at its limit cannot be nudged a second at a time, one receipt per second).
 export var TOUR_MIN_EXTEND_SEC = 3600;
