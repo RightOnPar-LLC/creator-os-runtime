@@ -1526,17 +1526,39 @@ describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the
     expect(await works(again.key.token)).toBe(401);
   });
 
-  test("a cancel reason somebody wrote by hand is not the alarm", async () => {
+  test("a cancel reason beginning \"tour:\" is the runtime's to write: the revoke routes refuse it, and one written by hand is not the alarm", async () => {
     const t = await newTenant("tour-spoof", "studio");
     const first = (await open(t)).json;
-    // the tour's CURRENT key, cancelled through the ordinary route with the very words a renewal writes
-    expect((await req("POST", `/api/grants/${first.key.id}/revoke`, { token: t.token, body: { reason: "tour: renewed" } })).status).toBe(200);
-    await longAgo(first.key.id);
+    // neither route writes such a reason, whoever asks; refused means nothing happened
+    for (const reason of ["tour: renewed", "TOUR: renewed", " tour: anything at all"]) {
+      const mine = await req("POST", `/api/grants/${first.key.id}/revoke`, { token: t.token, body: { reason } });
+      expect(mine.status).toBe(400);
+      expect(mine.json.error).toBe("reason_reserved");
+      const theirs = await admin("POST", `/api/admin/grants/${first.key.id}/revoke`, { body: { reason } });
+      expect(theirs.status).toBe(400);
+      expect(theirs.json.error).toBe("reason_reserved");
+    }
+    expect(await works(first.key.token)).toBe(200);
+    expect((await tourOf(t, first.tour.id)).status).toBe("active");
+    // the tour's CURRENT key, cancelled with the very words a renewal writes (in the table: no route writes them now),
+    // long ago, and given back as a real cancel gives back
+    await dbQuery("UPDATE grants SET status = 'revoked', revoked_at = now() - interval '10 minutes', revoke_reason = 'tour: renewed' WHERE id = $1", [first.key.id]);
+    await dbQuery(`UPDATE grants SET reserved = '{"usd_cents":0,"calls":0,"deploys":0}'::jsonb WHERE id = $1`, [first.receipt.holding_grant]);
     expect(await works(first.key.token)).toBe(401);
     const tour = await tourOf(t, first.tour.id);
     expect(tour.status).toBe("key_run_out"); // not frozen: no renewal ever replaced that key
     expect((await req("GET", "/api/ledger", { token: t.token })).json.ledger.map((l) => l.kind)).not.toContain("tour-freeze");
     expect((await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} })).status).toBe(201);
+    // the MCP tool is the third door: the owner's key can cancel a key with it too
+    const plain = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:plain", caps: ["grant.read"], ttlSec: 600 } });
+    const viaMcp = await mcp(t.token, "tools/call", { name: "grant_revoke", arguments: { id: plain.json.id, reason: "tour: renewed" } });
+    expect(viaMcp.json.result.isError).toBe(true); // an MCP tool answers a refusal as a result, not as a status
+    expect(JSON.parse(viaMcp.json.result.content[0].text).error).toBe("reason_reserved");
+    expect((await req("GET", "/api/grants/verify", { token: plain.json.token })).status).toBe(200); // refused means nothing happened
+    // an ordinary reason still goes through on both routes; only the prefix is the runtime's
+    expect((await req("POST", `/api/grants/${plain.json.id}/revoke`, { token: t.token, body: { reason: "about a tour: not the prefix" } })).status).toBe(200);
+    const other = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:other", caps: ["grant.read"], ttlSec: 600 } });
+    expect((await admin("POST", `/api/admin/grants/${other.json.id}/revoke`, { body: { reason: "test: key lost" } })).status).toBe(200);
   });
 
   test("a key that ran out can be reissued by the owner only, and a tour left alone for two days is finished", async () => {
@@ -2104,6 +2126,231 @@ describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the
     }
     expect(bad).toEqual([]);
   }, 120000);
+
+  // ---- review round 3 (the follow-ups listed on pull request 37), each FORCED -------------------------------------------
+  // The chosen statement fails ONCE with `message`, then works. A sequence counts the attempts: it is the one thing in
+  // Postgres that a rolled-back statement does not roll back, so the failure's own rollback cannot reset the count.
+  const raisesOnce = async (name, table, timing, when, message, fn) => {
+    await dbQuery(`CREATE SEQUENCE IF NOT EXISTS ${name}_seq`);
+    try {
+      return await during(name, table, timing, when, `IF nextval('${name}_seq') = 1 THEN RAISE EXCEPTION '${message}'; END IF; RETURN NEW;`, fn);
+    } finally {
+      await dbQuery(`DROP SEQUENCE IF EXISTS ${name}_seq`);
+    }
+  };
+  const reasonOf = async (grantId) => (await dbQuery("SELECT revoke_reason FROM grants WHERE id = $1", [grantId])).rows[0]?.revoke_reason;
+  const freezeLines = async (tenantId) => (await dbQuery("SELECT count(*)::int AS n FROM ledger WHERE tenant = $1 AND kind = 'tour-freeze'", [tenantId])).rows[0].n;
+  const freezeLinesOf = async (holdId) => (await dbQuery("SELECT count(*)::int AS n FROM ledger WHERE grant_id = $1 AND kind = 'tour-freeze'", [holdId])).rows[0].n;
+  // what a reissue's relabel of the replaced keys looks like from a trigger on `grants`
+  const relabelOf = (hold) => `OLD.parent = '${hold}' AND NEW.revoke_reason LIKE 'tour: renewed (before%' AND OLD.revoke_reason = 'tour: renewed'`;
+
+  test("a reissue that loses its turn, or fails in the middle, leaves the alarm exactly as it found it: the clearing is rolled back with it", async () => {
+    // The turn is lost as a rival's statement would make it lose it: the reissue's own turn matches no row (a trigger
+    // skips it). The rival itself is not needed; what matters is what the loser leaves behind. The clearing of the
+    // replaced keys and the turn are ONE transaction, so nothing of the loser stays: putting the reason back
+    // afterwards cannot tell a renewal that won from a renewal that bumped and a second reissue about to win.
+    const turnOf = (tourId) => `OLD.id = '${tourId}' AND NEW.gen = OLD.gen + 1 AND NEW.status = 'active'`;
+    // 1. an active tour whose first key a renewal replaced
+    const t = await newTenant("tour-lost-turn", "studio");
+    const first = (await open(t)).json;
+    await rested(first.tour.id);
+    const second = (await renew(first.key.token)).json;
+    expect(await reasonOf(first.key.id)).toBe("tour: renewed");
+    let r = await during("tr_turn_skipped_active", "tours", "BEFORE UPDATE", turnOf(first.tour.id), "RETURN NULL;", () => reissue(t, first.tour.id));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_changed");
+    expect(r.text).not.toContain("cog1.");
+    expect(await reasonOf(first.key.id)).toBe("tour: renewed"); // armed, as before
+    expect(await works(second.key.token)).toBe(200); // nothing else was touched either
+    await longAgo(first.key.id);
+    expect(await works(first.key.token)).toBe(401);
+    expect((await tourOf(t, first.tour.id)).status).toBe("frozen"); // the alarm still goes off, as if no reissue had been tried
+    expect(await works(second.key.token)).toBe(401);
+    // 2. a frozen tour: the same, and a reissue that is NOT lost then clears them for good
+    const w = await newTenant("tour-lost-turn-frozen", "studio");
+    const f = await frozenTour(w);
+    expect(await reasonOf(f.first.id)).toBe("tour: renewed");
+    r = await during("tr_turn_skipped_frozen", "tours", "BEFORE UPDATE", turnOf(f.id), "RETURN NULL;", () => reissue(w, f.id));
+    expect(r.status).toBe(409);
+    expect(await reasonOf(f.first.id)).toBe("tour: renewed");
+    expect((await dbQuery("SELECT status FROM tours WHERE id = $1", [f.id])).rows[0].status).toBe("frozen"); // as it was
+    expect((await reissue(w, f.id)).status).toBe(201);
+    expect(await reasonOf(f.first.id)).toBe("tour: renewed (before an owner reissue)");
+    await longAgo(f.first.id);
+    expect(await works(f.first.token)).toBe(401);
+    expect((await tourOf(w, f.id)).status).toBe("active"); // the owner has looked: this key is not the alarm any more
+    // 3. an error in the middle (the turn's statement fails) rolls the clearing back as well
+    const u = await newTenant("tour-turn-errors", "studio");
+    const a = (await open(u)).json;
+    await rested(a.tour.id);
+    await renew(a.key.token);
+    r = await during("tr_turn_errors", "tours", "BEFORE UPDATE", turnOf(a.tour.id), "RAISE EXCEPTION 'test: the turn cannot be taken';", () => reissue(u, a.tour.id));
+    expect(r.status).toBe(500);
+    expect(r.text).not.toContain("cog1.");
+    expect(await reasonOf(a.key.id)).toBe("tour: renewed");
+  });
+
+  test("inside its transaction a reissue clears the replaced keys of the alarm first, then takes its turn (pins the order within the transaction)", async () => {
+    const t = await newTenant("tour-reissue-order", "studio");
+    const f = await frozenTour(t); // its first key still carries "tour: renewed"
+    // At the moment the reissue takes its turn: how many keys under the tour still carry the alarm's reason? With the
+    // right order none, so an old key tried at that moment (the alarm reads the tour, then the key) finds nothing to do.
+    await dbQuery("DELETE FROM settings WHERE key = 'tr_armed_at_turn'");
+    const fresh = await during("tr_armed_at_turn", "tours", "AFTER UPDATE", `NEW.id = '${f.id}' AND NEW.gen = OLD.gen + 1 AND OLD.status = 'frozen' AND NEW.status = 'active'`,
+      `INSERT INTO settings (key, value) VALUES ('tr_armed_at_turn', (SELECT count(*) FROM grants WHERE parent = '${f.hold}' AND revoke_reason = 'tour: renewed')::text)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value; RETURN NULL;`, () => reissue(t, f.id));
+    expect(fresh.status).toBe(201);
+    expect((await dbQuery("SELECT value FROM settings WHERE key = 'tr_armed_at_turn'")).rows[0].value).toBe("0");
+    await dbQuery("DELETE FROM settings WHERE key = 'tr_armed_at_turn'");
+  });
+
+  test("the alarm reads the tour before the key: a reissue that lands between the two is not undone by it", async () => {
+    const t = await newTenant("tour-alarm-order", "studio");
+    const f = await frozenTour(t);
+    const g = await genOf(f.id);
+    // Between the alarm's two reads (its count of the use sits there) the owner's reissue lands whole: the replaced keys
+    // cleared, the turn taken, the new key written at that turn and noted. (A reissue's own statements, made by hand.)
+    await during("tr_reissue_between_reads", "rate_limits", "AFTER INSERT OR UPDATE", `NEW.grant_id = 'tour-alarm:${f.first.id}'`,
+      `UPDATE grants SET revoke_reason = 'tour: renewed (before an owner reissue)' WHERE parent = '${f.hold}' AND revoke_reason = 'tour: renewed';
+       UPDATE tours SET gen = gen + 1, status = 'active', frozen_reason = NULL, current_key = NULL, last_renewed_at = extract(epoch from now())::bigint WHERE id = '${f.id}';
+       INSERT INTO grants (id, tenant, parent, depth, sub, status, caps, scope, budget, constraints, payload, iat, exp)
+       SELECT 'gr_reissued_between', tenant, parent, depth, sub, 'active', caps, jsonb_set(scope, '{tour,gen}', to_jsonb(${g + 1})), '{"usd_cents":0,"calls":0,"deploys":0}'::jsonb, constraints, payload, iat, exp FROM grants WHERE id = '${f.second.id}';
+       UPDATE tours SET current_key = 'gr_reissued_between' WHERE id = '${f.id}'; RETURN NULL;`,
+      async () => expect(await works(f.first.token)).toBe(401));
+    // the alarm read the tour as it was (frozen, one turn ago) and the key's reason as it is now (cleared): nothing to do
+    expect(await statusOf("gr_reissued_between")).toBe("active");
+    expect((await dbQuery("SELECT status FROM tours WHERE id = $1", [f.id])).rows[0].status).toBe("active");
+    expect(await genOf(f.id)).toBe(g + 1);
+    expect(await freezeLines(t.id)).toBe(1); // the one that froze it in the first place
+  });
+
+  test("a renewal whose line on the record cannot be written still answers with the key it has handed over", async () => {
+    const t = await newTenant("tour-renew-record", "studio");
+    const a = (await open(t, { agent: "record.a" })).json;
+    await rested(a.tour.id);
+    let r = await during("tr_no_renew_line", "ledger", "BEFORE INSERT", `NEW.kind = 'tour-renew' AND NEW.grant_id = '${a.receipt.holding_grant}'`, "RAISE EXCEPTION 'test: the line cannot be written';", () => renew(a.key.token));
+    expect(r.status).toBe(201);
+    expect(await works(r.json.key.token)).toBe(200);
+    expect(await works(a.key.token)).toBe(401);
+    expect(r.json.tour.key.id).toBe(r.json.key.id);
+    expect((await req("GET", "/api/ledger", { token: t.token })).json.ledger.some((l) => l.kind === "tour-renew" && l.ref === r.json.key.id)).toBe(false); // the line is really missing
+    const b = (await open(t, { agent: "record.b" })).json;
+    await rested(b.tour.id);
+    r = await during("tr_no_renew_event", "events", "BEFORE INSERT", `NEW.type = 'tour.renewed' AND NEW.tenant = '${t.id}'`, "RAISE EXCEPTION 'test: the event cannot be written';", () => renew(b.key.token));
+    expect(r.status).toBe(201);
+    expect(await works(r.json.key.token)).toBe(200);
+    expect(await works(b.key.token)).toBe(401);
+    expect(r.json.tour.renewals).toBe(1);
+  });
+
+  test("a renewal whose issue fails after the key was written cancels that key before it marks the tour", async () => {
+    const t = await newTenant("tour-renew-late-fail", "studio");
+    const a = (await open(t)).json;
+    const hold = a.receipt.holding_grant;
+    await rested(a.tour.id);
+    // the key's row is committed; the step after it (the issue's own event) throws
+    const r = await during("tr_issued_then_throws", "events", "BEFORE INSERT", `NEW.type = 'grant.issued' AND NEW.tenant = '${t.id}'`, "RAISE EXCEPTION 'test: thrown after the key was written';", () => renew(a.key.token));
+    expect(r.status).toBe(500);
+    expect(r.text).not.toContain("cog1.");
+    expect(await liveUnder(hold)).toBe(0); // the key that was written is cancelled, by parent
+    expect((await reservedOf(hold)).calls).toBe(0); // and what it held is back on the tour
+    const tour = await tourOf(t, a.tour.id);
+    expect(tour.status).toBe("frozen");
+    expect(tour.left.calls).toBe(100);
+    const fresh = await reissue(t, a.tour.id);
+    expect(fresh.status).toBe(201);
+    expect(fresh.json.key.budget.calls).toBe(100);
+  });
+
+  test("the next key is asked for again when the amount it was given is refused (the refusal is forced; the key that would cause it is not)", async () => {
+    const t = await newTenant("tour-budget-retry", "studio");
+    const a = (await open(t)).json;
+    const hold = a.receipt.holding_grant;
+    await rested(a.tour.id);
+    // the issue's own hold on the budget (the holding grant's reserved going UP) is refused once, as it is when a key
+    // written after the look still holds part of it; the next attempt looks again and goes through
+    const r = await raisesOnce("tr_budget_once", "grants", "BEFORE UPDATE", `NEW.id = '${hold}' AND (NEW.reserved->>'calls')::int > (OLD.reserved->>'calls')::int`, "budget_exceeds_parent_remaining", () => renew(a.key.token));
+    expect(r.status).toBe(201);
+    expect(r.json.key.budget.calls).toBe(100);
+    expect(await works(r.json.key.token)).toBe(200);
+    expect(await liveUnder(hold)).toBe(1);
+    expect((await reservedOf(hold)).calls).toBe(100);
+  });
+
+  test("the owner ends the tour in the middle of a renewal or a reissue: 409 tour_ended, and nothing frozen on the record", async () => {
+    // 1. the holding grant is cancelled (as the owner's end does first) just as the renewal takes its turn
+    const t = await newTenant("tour-end-mid", "studio");
+    const a = (await open(t)).json;
+    await rested(a.tour.id);
+    let r = await during("tr_end_at_turn", "tours", "AFTER UPDATE", `NEW.id = '${a.tour.id}' AND NEW.gen = OLD.gen + 1 AND NEW.current_key = '${a.key.id}'`,
+      `UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'tour: ended by the owner' WHERE id = '${a.receipt.holding_grant}' AND status = 'active'; RETURN NULL;`, () => renew(a.key.token));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_ended");
+    expect(r.text).not.toContain("cog1.");
+    expect(await freezeLines(t.id)).toBe(0);
+    expect(await liveUnder(a.receipt.holding_grant)).toBe(0);
+    expect((await dbQuery("SELECT status FROM tours WHERE id = $1", [a.tour.id])).rows[0].status).toBe("active"); // the end's own mark is still to come
+    expect((await req("POST", `/api/tours/${a.tour.id}/end`, { token: t.token, body: {} })).status).toBe(200);
+    expect((await tourOf(t, a.tour.id)).status).toBe("ended");
+    expect(await freezeLines(t.id)).toBe(0);
+    // 2. the owner's own key ends at that moment (a grant above the tour): the issue is refused as parent_not_active,
+    //    which is the same thing said another way
+    const u = await newTenant("tour-end-mid-root", "studio");
+    const b = (await open(u)).json;
+    await rested(b.tour.id);
+    r = await during("tr_root_ends_at_turn", "tours", "AFTER UPDATE", `NEW.id = '${b.tour.id}' AND NEW.gen = OLD.gen + 1 AND NEW.current_key = '${b.key.id}'`,
+      `UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'test: the owner key ended' WHERE id = '${u.grantId}' AND status = 'active'; RETURN NULL;`, () => renew(b.key.token));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_ended");
+    expect(r.text).not.toContain("cog1.");
+    expect(await freezeLines(u.id)).toBe(0);
+    expect(await liveUnder(b.receipt.holding_grant)).toBe(0);
+    // 3. a reissue: the holding grant is cancelled as the reissue clears the replaced keys (the owner's end landing on
+    //    the owner's own reissue). 409 tour_ended, not the issue's own error
+    const w = await newTenant("tour-end-mid-reissue", "studio");
+    const f = await frozenTour(w);
+    r = await during("tr_end_at_relabel", "grants", "AFTER UPDATE", relabelOf(f.hold),
+      `UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'tour: ended by the owner' WHERE id = '${f.hold}' AND status = 'active'; RETURN NULL;`, () => reissue(w, f.id));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_ended");
+    expect(r.text).not.toContain("cog1.");
+    expect(await liveUnder(f.hold)).toBe(0);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.tours_ended).toContain(f.id);
+  });
+
+  test("the alarm is rate limited per key: a dead key hammered makes no more than TOUR_ALARM_MAX_PER_MIN looks a minute", async () => {
+    const t = await newTenant("tour-alarm-rate", "studio");
+    const MAX = 10; // TOUR_ALARM_MAX_PER_MIN (policy.js)
+    await inOneWindow(async (attempt) => {
+      const f = await frozenTour(t, { agent: `hammer${attempt}` }); // one use of the dead key, counted
+      for (let i = 1; i < MAX; i++) expect(await works(f.first.token)).toBe(401); // MAX uses in all: the meter is full
+      expect((await dbQuery("SELECT sum(count)::int AS n FROM rate_limits WHERE grant_id = $1", [`tour-alarm:${f.first.id}`])).rows[0].n).toBe(MAX);
+      // the owner reissues, and the dead key is then armed again BY HAND (as in \"turns\" above), so that its next use
+      // WOULD be the alarm if it were looked into
+      const fresh = await reissue(t, f.id);
+      expect(fresh.status).toBe(201);
+      await dbQuery("UPDATE grants SET revoke_reason = 'tour: renewed', revoked_at = now() - interval '10 minutes' WHERE id = $1", [f.first.id]);
+      expect(await works(f.first.token)).toBe(401); // use MAX + 1 this minute: counted, and nothing more
+      expect((await tourOf(t, f.id)).status).toBe("active");
+      expect(await works(fresh.json.key.token)).toBe(200);
+      expect(await freezeLinesOf(f.hold)).toBe(1); // this tour's own: the freeze that made it, none since (per tour: the tenant is shared by a rerun)
+    });
+  });
+
+  test("the list shows live tours first, so an older open tour is never pushed out by newer finished ones", async () => {
+    const t = await newTenant("tour-list-order", "studio");
+    const live = (await open(t, { agent: "old.live" })).json;
+    const frozen = await frozenTour(t, { agent: "old.frozen" });
+    // a hundred tours ended since, every one newer than the two live ones
+    await dbQuery(`INSERT INTO tours (id, tenant, grant_id, agent, status, opened_at, until, last_renewed_at, ended_reason)
+      SELECT 'tr_done_' || i, tenant, grant_id, 'done.' || i, 'ended', opened_at + 10 + i, until, last_renewed_at, 'test: ended' FROM tours, generate_series(1, 100) AS i WHERE id = $1`, [live.tour.id]);
+    const list = (await req("GET", "/api/tours", { token: t.token })).json.tours;
+    expect(list.length).toBe(100);
+    expect(list.slice(0, 2).map((x) => x.id).sort()).toEqual([live.tour.id, frozen.id].sort());
+    expect(list[0].opened_at).toBeGreaterThanOrEqual(list[1].opened_at); // live first; among themselves newest first
+    expect(list.slice(2).every((x) => x.status === "ended")).toBe(true);
+    expect(list[2].opened_at).toBeGreaterThan(list[99].opened_at);
+  });
 });
 
 describe("8. extras: grants, deploys, cog, docs, status", () => {

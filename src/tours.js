@@ -44,12 +44,13 @@
 // issueChildGrant / settleGrantUsage / revokeGrantTree, exactly as for any other key.
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
 import { getGrant, recordEvent, sql } from "./db.js";
-import { issueChildGrant, revokeGrantTree } from "./grants.js";
+import { checkNamedRateLimit, endedAbove, issueChildGrant, revokeGrantTree } from "./grants.js";
 import {
   AGENT_ISSUED_MAX_TTL_SEC,
   normalizeUsage,
   remainingBudget,
   TIERS,
+  TOUR_ALARM_MAX_PER_MIN,
   TOUR_IDLE_END_SEC,
   TOUR_MAX_SIGNED_SEC,
   TOUR_MAX_TOTAL_SEC,
@@ -67,6 +68,12 @@ const TOUR_SUPERSEDED = "tour: renewed (before an owner reissue)";
 const TOUR_UNFINISHED = "tour: its renewal did not finish";
 const FROZEN_WHY = "a key this tour had already replaced was used again";
 const FROZEN_CANCEL = "tour: frozen (no key works until the owner reissues)";
+// Every reason this file writes begins "tour:", and the alarm reads one of them back. So nobody else may write one:
+// the three doors that cancel a key with a reason the caller gives (routes/grants.js, routes/admin.js, routes/mcp.js)
+// refuse a reason that begins so.
+export function notATourReason(reason) {
+  if (/^\s*tour:/i.test(String(reason ?? ""))) throw new HttpError(400, "reason_reserved", { hint: 'a reason beginning "tour:" is written by the runtime only' });
+}
 // The agent's name: lowercase letters, digits and dots. Its memory is the section
 // agent:<name>: (the closing colon keeps "report" out of "report2"), the same rule the
 // front door's key mint uses, so a tour and a one-off key for one name share one memory.
@@ -96,6 +103,19 @@ const changed = async (id) => {
   let t = await rowOf(id);
   return new HttpError(409, `tour_${!t ? "gone" : t.status === "active" ? "changed" : t.status}`, { hint: "the tour changed at the same moment: look at it and ask again" });
 };
+// The tour is ENDING under a step that was about to issue a key, whatever its row still says: its holding grant was
+// cancelled (the owner's end, or the ordinary grants route; or a grant above it, which makes it as dead), or its end
+// date has passed. The step answers 409 with this and writes nothing: the end, or the sweep, says what happened.
+// (Without this a renewal said "frozen" on the record of a tour the owner had just ended, and a reissue answered the
+// owner 403 parent_not_active.)
+const ending = async (tour) => {
+  let hold = await getGrant(tour.grant_id);
+  if (!hold || hold.status !== "active" || (await endedAbove(sql, hold.id))) return "tour_ended";
+  return Number(hold.exp) <= nowSec() ? "tour_over" : null;
+};
+// A line on the record (ledger, event) after a hand-over that is already done: logged if it cannot be written, never
+// answered. The answer is the only thing that carries the key.
+const recordOrLog = (what, fn) => fn().catch((err) => console.error(`ERR tour: ${what} could not be written (the key was handed over)`, err?.message || err));
 
 // RULE 1 and RULE 2 in one query: every grant still ACTIVE anywhere under the holding grant, whose day key
 // (the grant directly under the holding grant that it hangs from) belongs to a turn up to `gen`. Shallowest
@@ -354,6 +374,19 @@ export async function renewTour(auth) {
     key = await issueDayKey(tour, auth.row.sub, gen);
   } catch (err) {
     await notAnAlarm(old);
+    // The tour is ending underneath (ending): nothing is frozen and nothing is written. 409.
+    let over = await ending(tour);
+    if (over) throw new HttpError(409, over, { hint: "the tour ended at the same moment: nobody is handed a key" });
+    // The key may exist although the issue is said to have failed (written and committed, then the step after it threw).
+    // By parent, before the tour is marked: a tour never reads frozen while a key under it works. If it cannot be
+    // cancelled the tour is not marked either (it stays active with a dead key noted and reads key_run_out, for the
+    // owner); the first error is still the one to report.
+    try {
+      await cancelUnder(tour, gen, TOUR_UNFINISHED, auth.row.sub);
+    } catch (e) {
+      console.error("ERR tour renew: a key its failed issue left behind could not be cancelled", tour.id, e?.message || e);
+      throw err;
+    }
     let marked = await sql`UPDATE tours SET status = 'frozen', frozen_reason = 'a renewal could not issue the next key', current_key = NULL, gen = gen + 1
       WHERE id = ${tour.id} AND status = 'active' AND gen = ${gen}::bigint RETURNING id`;
     if (marked.length !== 1) throw await changed(tour.id); // a later turn has the tour now; what happens to it is that turn's to say
@@ -378,8 +411,10 @@ export async function renewTour(auth) {
     await notAnAlarm(old);
     throw await changed(tour.id);
   }
-  await tourLedger(tour, "tour-renew", key.row.id, `renewed: ${old} replaced by ${key.row.id}`);
-  await recordEvent("tour.renewed", { tour: tour.id, agent: tour.agent, replaced: old, key: key.row.id }, tour.tenant, auth.row.sub);
+  // 5. The lines on the record. The hand-over is done and only this answer carries the key, so a line that cannot be
+  //    written is logged, never a 500 (which would leave the agent with no key and a tour only the owner can put right).
+  await recordOrLog("the tour-renew line", () => tourLedger(tour, "tour-renew", key.row.id, `renewed: ${old} replaced by ${key.row.id}`));
+  await recordOrLog("the tour.renewed event", () => recordEvent("tour.renewed", { tour: tour.id, agent: tour.agent, replaced: old, key: key.row.id }, tour.tenant, auth.row.sub));
   return { tour: await serializeTour(await rowOf(tour.id)), key: keyView(key), receipt: { tour: tour.id, replaced_key: old, new_key: key.row.id } };
 }
 
@@ -390,22 +425,46 @@ export async function reissueTour(auth, id) {
   await sweepTours({ tenant: auth.tenant.id }); // a tour that is finished says so before anything is asked of it
   let tour = await ownTour(auth, id);
   if (tour.status === "ended") throw new HttpError(409, "tour_ended");
-  // 1. FIRST, no key replaced before this point can raise the alarm any more: the owner has looked, and is starting
-  //    the tour afresh. It comes first so that an old key being tried again at this very moment finds nothing to
-  //    do by the time the tour is active again (the alarm looks at the tour, and only then at the key's reason).
-  await sql`UPDATE grants SET revoke_reason = ${TOUR_SUPERSEDED} WHERE parent = ${tour.grant_id} AND revoke_reason = ${TOUR_RENEWED}`;
+  // 1. No key replaced before this point can raise the alarm any more: the owner has looked, and is starting the
+  //    tour afresh. Done in the same transaction as step 2, so that an old key being tried again at this very moment
+  //    sees either the tour as it was and its reason as it was, or the tour afresh and its reason gone: never the
+  //    tour afresh with the alarm still set (the alarm looks at the tour, and only then at the key's reason).
   // 2. Take the turn, and in the same statement the tour is active again with no key noted. From here the sweep
   //    and a late alarm, which saw an earlier turn, cannot touch the key this turn issues.
+  // ONE TRANSACTION for the two. A reissue that loses its turn has cleared the alarm for a reissue that did not
+  // happen, and putting the reason back afterwards cannot tell "a renewal won" from "a renewal bumped and another
+  // reissue is one statement from winning" (the row reads the same). So nothing is put back: a lost turn throws inside
+  // the transaction and the clearing is rolled back with it, on exactly the keys it touched. To everyone else the
+  // clearing and the turn appear together, which is what the alarm's own ordering needs (it reads the tour, then the
+  // key's reason).
   let now = nowSec(),
-    turn = await sql`UPDATE tours SET gen = gen + 1, status = 'active', frozen_reason = NULL, current_key = NULL, last_renewed_at = ${now}
-      WHERE id = ${tour.id} AND status IN ('active', 'frozen') AND gen = ${Number(tour.gen)}::bigint RETURNING gen`;
+    lost = false,
+    turn = await sql
+      .begin(async (tx) => {
+        lost = false; // (per attempt: a flag left over from an earlier run of this callback must never swallow a real error)
+        await tx`UPDATE grants SET revoke_reason = ${TOUR_SUPERSEDED} WHERE parent = ${tour.grant_id} AND revoke_reason = ${TOUR_RENEWED}`;
+        let t = await tx`UPDATE tours SET gen = gen + 1, status = 'active', frozen_reason = NULL, current_key = NULL, last_renewed_at = ${now}
+          WHERE id = ${tour.id} AND status IN ('active', 'frozen') AND gen = ${Number(tour.gen)}::bigint RETURNING gen`;
+        if (t.length !== 1) {
+          lost = true;
+          throw new Error("tour: this reissue lost its turn"); // rolls the clearing back
+        }
+        return t;
+      })
+      .catch((err) => {
+        if (lost) return [];
+        throw err;
+      });
   if (turn.length !== 1) throw await changed(tour.id);
   let gen = Number(turn[0].gen),
     key;
-  // 3. The key. If it cannot be issued the tour is left active with no key (it reads key_run_out): ask again.
+  // 3. The key. If it cannot be issued the tour is left active with no key (it reads key_run_out): ask again. Unless
+  //    the tour is ending underneath (its holding grant cancelled): 409, as for a renewal.
   try {
     key = await issueDayKey(tour, auth.row.sub, gen);
   } catch (err) {
+    let over = await ending(tour);
+    if (over) throw new HttpError(409, over, { hint: "the tour ended at the same moment" });
     if (Number((await rowOf(tour.id))?.gen) !== gen) throw await changed(tour.id);
     throw err;
   }
@@ -482,12 +541,14 @@ export async function endTour(auth, id) {
   return { tour: await serializeTour(await rowOf(tour.id)), receipt: { tour: tour.id, ended_by: auth.row.id, cancelled_keys: cancelled.length } };
 }
 
-// LIST. The owner sees every tour of the tenant; a tour's own key sees its own tour and nothing else.
+// LIST. The owner sees every tour of the tenant; a tour's own key sees its own tour and nothing else. Live tours (active
+// or frozen) come first, so that an older open tour is always among the 100 shown (the front door's confirm page picks
+// from this list); among themselves, newest first.
 export async function listTours(auth) {
   let owner = Number(auth.row.depth) === 0;
   if (owner) await sweepTours({ tenant: auth.tenant.id });
   let rows = owner
-    ? await sql`SELECT * FROM tours WHERE tenant = ${auth.tenant.id} ORDER BY opened_at DESC LIMIT 100`
+    ? await sql`SELECT * FROM tours WHERE tenant = ${auth.tenant.id} ORDER BY (status IN ('active', 'frozen')) DESC, opened_at DESC LIMIT 100`
     : await sql`SELECT * FROM tours WHERE tenant = ${auth.tenant.id} AND current_key = ${auth.row.id}`;
   return Promise.all(rows.map(serializeTour));
 }
@@ -497,8 +558,8 @@ export async function listTours(auth) {
 // exists somewhere. Never throws: the caller is about to answer 401 either way.
 //
 // ORDER MATTERS, three times over.
-//   - The TOUR is read first and the key's reason only after it. An owner reissue takes the reason off BEFORE it
-//     makes the tour active again, so an old key tried during a reissue either sees the tour as it was before
+//   - The TOUR is read first and the key's reason only after it. An owner reissue takes the reason off in the SAME
+//     TRANSACTION in which it makes the tour active again, so an old key tried during a reissue either sees the tour as it was before
 //     (and can only cancel keys of turns up to that one), or sees the tour after and finds its reason gone.
 //   - The keys are stopped FIRST and the tour is marked frozen only after that worked, so a tour never reads
 //     "frozen" while a key under it still works. If stopping them fails, nothing is marked and the very next use
@@ -514,6 +575,10 @@ export async function tourKeyReused(oldKey) {
       // Not directly under a live tour's holding grant (a helper's key, or the tour is over): no alarm.
       // The tour's CURRENT key is never "replaced", whatever reason somebody wrote on it when cancelling it.
       if (!tour || tour.current_key === oldKey.id) return false;
+      // Counted once per use, here between the two reads: a dead key under a live tour may make the runtime look under
+      // that tour at most TOUR_ALARM_MAX_PER_MIN times a minute (the sweep looks every minute regardless). Over that,
+      // nothing more is read or written for it; a key that is due raises the alarm at the next minute at the latest.
+      if (look === 0 && !(await checkNamedRateLimit(`tour-alarm:${oldKey.id}`, TOUR_ALARM_MAX_PER_MIN))) return false;
       // asked of the database's own clock, the one that wrote revoked_at
       let due = await sql`SELECT 1 FROM grants WHERE id = ${oldKey.id} AND revoke_reason = ${TOUR_RENEWED}
         AND revoked_at < now() - make_interval(secs => ${TOUR_REUSE_GRACE_SEC}::int)`;

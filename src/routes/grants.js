@@ -4,6 +4,7 @@ import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "../db.js"
 import { normalizeUsage, remainingBudget, TIERS } from "../policy.js";
 import { endedAbove, issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
 import { HOST_DEFAULT_BUDGET, HOST_DEFAULT_CAPS, HOST_DEFAULTS, HOST_TIERS, hostLimits, hostName } from "../hostpolicy.js";
+import { notATourReason } from "../tours.js";
 import { AUTONOMY_LEVELS, autonomyOf } from "../autonomy.js";
 import { openEscrow, serializeEscrow } from "../escrow.js";
 import { deleteDeploy, deployWorker, refreshDeployStatus, restartDeploy, TEMPLATES } from "../railway.js";
@@ -104,13 +105,9 @@ app.post("/api/grants/:id/revoke", requireGrant("grant.issue"), async (e) => {
     ).length
   )
     throw new HttpError(403, "not_in_subtree");
-  return e.json({
-    revoked: await revokeGrantTree(
-      a,
-      String((await readJsonBody(e)).reason || "revoked by " + t.row.sub),
-      t.row.sub,
-    ),
-  });
+  let reason = String((await readJsonBody(e)).reason || "revoked by " + t.row.sub);
+  notATourReason(reason); // "tour: ..." is the runtime's own (tours.js): the alarm reads one of them back
+  return e.json({ revoked: await revokeGrantTree(a, reason, t.row.sub) });
 });
 app.post("/api/cog/plan", requireGrant("cog.plan"), async (e) => {
   let t = e.get("auth"),

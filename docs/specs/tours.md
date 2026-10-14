@@ -84,17 +84,20 @@ out only by the step whose turn it still is.
 | What happens | What the runtime does |
 |---|---|
 | A renewal cannot cancel the key in hand | Nothing has changed. The key still works; the agent asks again |
-| A renewal cancels the old key and then cannot issue the next | The tour is marked frozen with that reason. Only the owner can reissue |
+| A renewal cancels the old key and then cannot issue the next | The tour is marked frozen with that reason. Only the owner can reissue. If the next key's row was in fact written before the issue threw, that key is cancelled by parent first; if it cannot be, the tour is not marked frozen (it reads `key_run_out`) |
+| A renewal has handed its key over and then its line on the record cannot be written | 201 with the key all the same; the missing line is logged. Only the answer carries the key, so a 500 here would leave the agent with no key and a tour only the owner can put right |
+| The owner ends the tour (or its holding grant is cancelled through the grants route) while a renewal or a reissue is about to issue | 409 `tour_ended` (`tour_over` if its end date passed), nothing frozen on the record: the end says what happened |
 | The alarm, a reissue or an end lands in the middle of a renewal | The renewal hands its key over only if it is still its turn and the tour is still active. Otherwise the new key is cancelled and it answers 409 with no key. Its old key is then just a dead key, not an alarm: nobody was handed a next one |
 | Two renewals with the same key at once | A key is cancelled by exactly one caller: that renewal goes on and takes the turn. The other answers 409 and has changed nothing |
 | The owner cancels the agent's key in the instant after a renewal was let in | The kill stands: the renewal answers 409 and issues nothing |
 | Two reissues at once, or a reissue while the agent renews | The later turn's key is the tour's key. The other answers 409 with no key, and never cancels the winner's key |
+| A reissue loses its turn, or fails in the middle | Nothing of it stays. The clearing of the replaced keys (below) and the turn are ONE transaction: a lost turn throws inside it and the clearing is rolled back with it, on exactly the keys it touched, so the alarm stays set. (An earlier version put the reason back afterwards; the row cannot tell "a renewal won" from "a renewal bumped and another reissue is about to win", and re-armed keys under a tour the owner had just reissued.) |
 | A reissue of a frozen tour while the sweep runs, or while the old key is tried again | The reissue first clears every replaced key of the alarm, then takes its turn (the tour is active again in the same statement), then issues. The sweep and a late alarm saw an earlier turn and cannot touch the new key. A reissue answers 201 only with a key it has checked still works |
 | The alarm cannot cancel a key | The tour is NOT marked frozen (it never reads frozen while a key works). The next use of the old key tries again. If the mark was written and a later cancel then failed, the sweep cancels it within a minute |
 | A key is left working that the tour has lost sight of | Nobody was handed it. It shows in `live_keys`, and the next turn, freeze or end cancels it. The next key still gets everything the tour has left: the holding grant and "is any earlier key still working" are read in one statement, so they cannot disagree |
 | A helper's key is written at the very moment the key above it is cancelled | The cancel finds it itself: `revokeGrantTree` looks again under each grant right after taking it, and what the key held comes back (before 2026-10-09 the cancel's list missed it). Every tour cancel still looks again as well, at every depth, until a look finds nothing; if something still works, the tour is not marked ended or frozen and the sweep tries again |
-| The same dead key is used again and again | While frozen: nothing more happens. After the owner reissues: nothing at all |
-| Somebody cancels the tour's current key by hand with the words a renewal writes | Not the alarm. The current key is never "replaced" |
+| The same dead key is used again and again | While frozen: nothing more happens. After the owner reissues: nothing at all. And it is looked into at most `TOUR_ALARM_MAX_PER_MIN` (10) times a minute; over that, nothing more is looked into for it (the count itself is one row a use; a key that is due raises the alarm at the next minute at the latest) |
+| Somebody cancels the tour's current key by hand with the words a renewal writes | Not the alarm. The current key is never "replaced". And the three doors that cancel a key with a reason the caller gives (`/api/grants/:id/revoke`, `/api/admin/grants/:id/revoke`, the MCP tool `grant_revoke`) refuse any reason that begins `tour:` (400 `reason_reserved`; on MCP, an error result with that code): those words are the runtime's to write |
 | The tour cannot be recorded, or its first key cannot be issued, when it is opened | The holding grant is cancelled and nothing stays held |
 | The holding grant is cancelled through the ordinary grants route | Its keys go with it; the sweep (or the owner's next look) marks the tour ended |
 | The sweep comes to end a tour that was renewed, reissued or extended a moment ago | The statement that takes the tour for ending looks at it again and only succeeds if it is still finished |
@@ -110,7 +113,7 @@ no answer should stop and have the owner reissue, not retry with the old key.
 | Call | Who | What |
 |---|---|---|
 | `POST /api/tours` | owner | `{ agent, days, caps, budget, scope?, constraints? }` -> `{ tour, key, receipt }` (201). `receipt.until` is the real end and `receipt.limited_by` is `asked` or `owner_key` |
-| `GET /api/tours` | owner: every tour of the tenant. A tour's key: its own tour only | `{ tours }` |
+| `GET /api/tours` | owner: every tour of the tenant (the newest 100, live ones first so an older open tour is always shown). A tour's key: its own tour only | `{ tours }` |
 | `POST /api/tours/renew` | the tour's current key | -> `{ tour, key, receipt }` (201). The key used is cancelled. 409 `tour_key_cancelled` (another renewal, or the owner, cancelled this key a moment ago), `tour_frozen`, `tour_ended` or `tour_changed` (it lost its turn): no key is handed out |
 | `POST /api/tours/:id/reissue` | owner | a fresh key for a tour whose key ran out or that froze. Every key still working under the tour is cancelled first. 409 `tour_changed` when it lost its turn |
 | `POST /api/tours/:id/extend` | owner | `{ days }`. More days, never more money. The receipt says which limit stopped it; 409 `tour_at_limit` lists every limit |
@@ -137,14 +140,14 @@ A tour reads:
 
 ## Tests
 
-`test/runtime.test.js`, section 7c (28 tests). The failure cases above are FORCED, not hoped for:
+`test/runtime.test.js`, section 7c (37 tests). The failure cases above are FORCED, not hoped for:
 a database trigger that lives for one test makes one chosen statement fail, miss, or makes
 something else happen at that exact moment. One test runs random mixes of renewals, reissues,
 old-key reuse, lists and sweeps at the same moment and checks the tables afterwards.
 
 ```
 node test/run.mjs                              the whole suite
-node test/tours-controls.mjs                   takes each of 38 rules OUT of the source in turn and expects the tests to fail
+node test/tours-controls.mjs                   takes each of 57 rules OUT of the source in turn and expects the tests to fail
 TOURS_STRESS_RUNS=500 node test/run.mjs        the random mixes, 500 of them instead of 40
 ```
 

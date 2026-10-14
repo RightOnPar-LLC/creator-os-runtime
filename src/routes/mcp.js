@@ -1,6 +1,7 @@
 // Routes: MCP streamable-http endpoint. Registration order is significant.
 import { armedIntegrations, SERVICE_NAME, VERSION } from "../config.js";
 import { HttpError, parseJson } from "../util.js";
+import { notATourReason } from "../tours.js";
 import { isKillSwitchOn, sql } from "../db.js";
 import { memoryPartitions, remainingBudget } from "../policy.js";
 import { issueChildGrant, revokeGrantTree, verifyGrant } from "../grants.js";
@@ -195,15 +196,9 @@ app.post("/mcp", async (e) => {
           ).length
         )
           throw new HttpError(403, "not_in_subtree");
-        return e.json(
-          o({
-            revoked: await revokeGrantTree(
-              E,
-              String(i.reason || "revoked by " + c.row.sub).slice(0, 200),
-              c.row.sub,
-            ),
-          }),
-        );
+        let reason = String(i.reason || "revoked by " + c.row.sub).slice(0, 200);
+        notATourReason(reason); // "tour: ..." is the runtime's own (tours.js): the alarm reads one of them back
+        return e.json(o({ revoked: await revokeGrantTree(E, reason, c.row.sub) }));
       }
       case "cog_plan":
         return e.json(

@@ -6,6 +6,7 @@
 //
 // It edits files under src/ and always puts them back (also on Ctrl-C). It first runs the tests untouched and
 // expects them to PASS, so a red result below means "the break was noticed", not "the tests were already red".
+// A rule that lives in two statements is taken out of both at once: `from` and `to` may be lists, one entry per site.
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -101,7 +102,7 @@ const BREAKS = [
     "      if (!tour) return false;"],
   ["keys replaced before an owner reissue can still raise the alarm",
     "src/tours.js",
-    "  await sql`UPDATE grants SET revoke_reason = ${TOUR_SUPERSEDED} WHERE parent = ${tour.grant_id} AND revoke_reason = ${TOUR_RENEWED}`;\n",
+    "        await tx`UPDATE grants SET revoke_reason = ${TOUR_SUPERSEDED} WHERE parent = ${tour.grant_id} AND revoke_reason = ${TOUR_RENEWED}`;\n",
     ""],
   ["the old key of a renewal that lost its turn can still raise the alarm",
     "src/tours.js",
@@ -171,15 +172,114 @@ const BREAKS = [
     "src/tours.js",
     "export async function openTour(auth, body) {\n  ownerOnly(auth);\n",
     "export async function openTour(auth, body) {\n"],
+  // ---- the follow-ups of pull request 37's third review ------------------------------------------------------------
+  ["a reissue takes its turn before it clears the replaced keys of the alarm",
+    "src/tours.js",
+    "        await tx`UPDATE grants SET revoke_reason = ${TOUR_SUPERSEDED} WHERE parent = ${tour.grant_id} AND revoke_reason = ${TOUR_RENEWED}`;\n        let t = await tx`UPDATE tours SET gen = gen + 1, status = 'active', frozen_reason = NULL, current_key = NULL, last_renewed_at = ${now}\n          WHERE id = ${tour.id} AND status IN ('active', 'frozen') AND gen = ${Number(tour.gen)}::bigint RETURNING gen`;\n",
+    "        let t = await tx`UPDATE tours SET gen = gen + 1, status = 'active', frozen_reason = NULL, current_key = NULL, last_renewed_at = ${now}\n          WHERE id = ${tour.id} AND status IN ('active', 'frozen') AND gen = ${Number(tour.gen)}::bigint RETURNING gen`;\n        await tx`UPDATE grants SET revoke_reason = ${TOUR_SUPERSEDED} WHERE parent = ${tour.grant_id} AND revoke_reason = ${TOUR_RENEWED}`;\n"],
+  ["a reissue that loses its turn keeps the keys it had cleared (the clearing is not rolled back)",
+    "src/tours.js",
+    "          throw new Error(\"tour: this reissue lost its turn\"); // rolls the clearing back\n",
+    "          return [];\n"],
+  ["a reissue that loses its turn answers as a failure (500), not as a changed tour (409)",
+    "src/tours.js",
+    "        if (lost) return [];\n        throw err;\n",
+    "        throw err;\n"],
+  ["a real failure inside a reissue's transaction is answered as a lost turn (409)",
+    "src/tours.js",
+    "        if (lost) return [];\n        throw err;\n",
+    "        return [];\n"],
+  ["a reissue clears the alarm and takes its turn in two separate statements (no transaction)",
+    "src/tours.js",
+    ["turn = await sql\n      .begin(async (tx) => {\n", "        return t;\n      })\n      .catch((err) => {\n        if (lost) return [];\n"],
+    ["turn = await (async (tx) => {\n", "        return t;\n      })(sql)\n      .catch((err) => {\n        if (lost) return [];\n"]],
+  ["the alarm reads the key's reason before the tour",
+    "src/tours.js",
+    ["      let tour = (await sql`SELECT * FROM tours WHERE grant_id = ${oldKey.parent} AND status IN ('active', 'frozen')`)[0];\n      // Not directly under a live tour's holding grant (a helper's key, or the tour is over): no alarm.\n      // The tour's CURRENT key is never \"replaced\", whatever reason somebody wrote on it when cancelling it.\n      if (!tour || tour.current_key === oldKey.id) return false;\n",
+     "      // asked of the database's own clock, the one that wrote revoked_at\n      let due = await sql`SELECT 1 FROM grants WHERE id = ${oldKey.id} AND revoke_reason = ${TOUR_RENEWED}\n        AND revoked_at < now() - make_interval(secs => ${TOUR_REUSE_GRACE_SEC}::int)`;\n      if (!due.length) return false;\n"],
+    ["      let due = await sql`SELECT 1 FROM grants WHERE id = ${oldKey.id} AND revoke_reason = ${TOUR_RENEWED}\n        AND revoked_at < now() - make_interval(secs => ${TOUR_REUSE_GRACE_SEC}::int)`;\n      if (!due.length) return false;\n",
+     "      let tour = (await sql`SELECT * FROM tours WHERE grant_id = ${oldKey.parent} AND status IN ('active', 'frozen')`)[0];\n      if (!tour || tour.current_key === oldKey.id) return false;\n"]],
+  ["the next key is not asked for again when the amount it was given is refused",
+    "src/tours.js",
+    "      if (attempt < 8 && err?.message === \"budget_exceeds_parent_remaining\") continue;\n",
+    ""],
+  ["the old key of a renewal that lost its turn before issuing can still raise the alarm",
+    "src/tours.js",
+    "  if (turn.length !== 1) {\n    await notAnAlarm(old);\n    throw await changed(tour.id);\n  }\n",
+    "  if (turn.length !== 1) throw await changed(tour.id);\n"],
+  ["a frozen tour is ended for being idle (the rule sits in two statements; both are taken out)",
+    "src/tours.js",
+    [" OR (t.status = 'active' AND ${now}::bigint - t.last_renewed_at > ${TOUR_IDLE_END_SEC}::bigint))",
+     "          OR (status = 'active' AND ${now}::bigint - last_renewed_at > ${TOUR_IDLE_END_SEC}::bigint))"],
+    [" OR (${now}::bigint - t.last_renewed_at > ${TOUR_IDLE_END_SEC}::bigint))",
+     "          OR (${now}::bigint - last_renewed_at > ${TOUR_IDLE_END_SEC}::bigint))"]],
+  ["a renewal whose line on the record cannot be written answers 500 though the tour points at the new key",
+    "src/tours.js",
+    "const recordOrLog = (what, fn) => fn().catch((err) => console.error(`ERR tour: ${what} could not be written (the key was handed over)`, err?.message || err));",
+    "const recordOrLog = (what, fn) => fn();"],
+  ["a renewal whose issue fails after the key was written leaves that key working until the sweep",
+    "src/tours.js",
+    "      await cancelUnder(tour, gen, TOUR_UNFINISHED, auth.row.sub);\n",
+    ""],
+  ["a renewal under a tour that is being ended says frozen on the record",
+    "src/tours.js",
+    "    let over = await ending(tour);\n    if (over) throw new HttpError(409, over, { hint: \"the tour ended at the same moment: nobody is handed a key\" });\n",
+    ""],
+  ["a reissue under a tour that is being ended answers the owner with the issue's own error",
+    "src/tours.js",
+    "    let over = await ending(tour);\n    if (over) throw new HttpError(409, over, { hint: \"the tour ended at the same moment\" });\n",
+    ""],
+  ["a reason beginning tour: is not reserved",
+    "src/tours.js",
+    "  if (/^\\s*tour:/i.test(String(reason ?? \"\"))) throw",
+    "  if (false) throw"],
+  ["the owner's revoke route writes any reason",
+    "src/routes/grants.js",
+    "  notATourReason(reason); // \"tour: ...\" is the runtime's own (tours.js): the alarm reads one of them back\n",
+    ""],
+  ["the admin's revoke route writes any reason",
+    "src/routes/admin.js",
+    "  notATourReason(reason); // \"tour: ...\" is the runtime's own (tours.js): the alarm reads one of them back\n",
+    ""],
+  ["the MCP revoke tool writes any reason",
+    "src/routes/mcp.js",
+    "        notATourReason(reason); // \"tour: ...\" is the runtime's own (tours.js): the alarm reads one of them back\n",
+    ""],
+  ["the alarm path is not rate limited",
+    "src/tours.js",
+    "      if (look === 0 && !(await checkNamedRateLimit(`tour-alarm:${oldKey.id}`, TOUR_ALARM_MAX_PER_MIN))) return false;\n",
+    ""],
+  ["the list shows the newest tours, live or not",
+    "src/tours.js",
+    "ORDER BY (status IN ('active', 'frozen')) DESC, opened_at DESC LIMIT 100",
+    "ORDER BY opened_at DESC LIMIT 100"],
   // (The 24-hour cap on a tour's key is not in this list: tours.js asks for 24 hours AND issueChildGrant caps every
   // key a non-root key issues, so taking either one out changes nothing. The cap itself is tested in section 7b.)
+  // (Nor are two of the four notAnAlarm calls in renewTour: the one after a failed issue and the one after a failed
+  // record. No test can show them, because no path leaves the tour where that old key could then raise the alarm:
+  // after a failed issue the tour is frozen, and the alarm does nothing to a frozen tour; after a failed record the
+  // tour still points at the old key, and the alarm never fires for the tour's current key; and the one step that makes
+  // a tour active again is the owner's reissue, which clears the reason itself. They stay as a second guard.)
 ];
 
-const runTours = () => spawnSync(bun, ["test", "runtime.test.js", "-t", "7c. tours"], { cwd: here, env: { ...process.env, RUNTIME_ENTRY: "" }, encoding: "utf8" });
+// (--timeout as run.mjs passes it: this bun ignores the one in bunfig.toml)
+const once = () => spawnSync(bun, ["test", "--timeout", "30000", "runtime.test.js", "-t", "7c. tours"], { cwd: here, env: { ...process.env, RUNTIME_ENTRY: "" }, encoding: "utf8", timeout: 600000 });
+// On some machines a run now and then dies of the harness's own trouble: its throwaway database refuses the first
+// connection, or everything stalls and tests time out. Such a run says nothing either way (it is red, but not because
+// a break was noticed), so it is run again (as cancel-controls.mjs does). None of the breaks below makes a test hang.
+const TROUBLE = /ERR_POSTGRES_CONNECTION_REFUSED|ConnectionRefused|ECONNRESET|timed out after/;
+const out = (r) => (r.stderr || "") + (r.stdout || "");
+const runTours = () => {
+  let r = once();
+  for (let again = 0; again < 4 && r.status !== 0 && TROUBLE.test(out(r)); again++) r = once();
+  return r;
+};
 const originals = new Map();
 const restore = () => { for (const [f, text] of originals) writeFileSync(f, text); };
 process.on("SIGINT", () => (restore(), process.exit(130)));
 
+// TOURS_CONTROLS_ONLY=<words> runs only the breaks whose description contains them (the control run still comes first).
+const only = process.env.TOURS_CONTROLS_ONLY || "";
 let bad = 0;
 try {
   const control = runTours();
@@ -189,20 +289,24 @@ try {
   }
   console.log("control run: the tours tests pass with nothing taken out\n");
   for (const [what, rel, from, to] of BREAKS) {
+    if (only && !what.includes(only)) continue;
     const f = join(root, rel);
     const text = readFileSync(f, "utf8");
     if (!originals.has(f)) originals.set(f, text);
     const nl = text.includes("\r\n") ? "\r\n" : "\n";
     const src = text.replace(/\r\n/g, "\n");
-    if (src.split(from).length !== 2) {
+    const froms = Array.isArray(from) ? from : [from], tos = Array.isArray(to) ? to : [to];
+    let broken = src, site = 0;
+    for (; site < froms.length && broken.split(froms[site]).length === 2; site++) broken = broken.split(froms[site]).join(tos[site]);
+    if (site < froms.length) {
       console.log(`CANNOT APPLY   ${what}\n               (the text was not found exactly once in ${rel}: this list is out of date)`);
       bad++;
       continue;
     }
-    writeFileSync(f, src.split(from).join(to).replace(/\n/g, nl));
+    writeFileSync(f, broken.replace(/\n/g, nl));
     const r = runTours();
     writeFileSync(f, text);
-    const failed = ((r.stderr || "") + (r.stdout || "")).match(/\(fail\) [^\n]*/g) || [];
+    const failed = out(r).match(/\(fail\) [^\n]*/g) || [];
     if (r.status === 0) {
       console.log(`NOT NOTICED    ${what}`);
       bad++;

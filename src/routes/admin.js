@@ -6,7 +6,7 @@ import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
 import { endedAbove, grantsLeftUnderEnded, mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
 import { readGuestPool, guestPoolStatus } from "../guest.js";
-import { sweepTours } from "../tours.js";
+import { notATourReason, sweepTours } from "../tours.js";
 import { TEMPLATES } from "../railway.js";
 import { app, readJsonBody, requireAdmin } from "../http.js";
 
@@ -206,15 +206,11 @@ app.get("/api/admin/grants/orphans", requireAdmin, async (e) => {
   let asked = Math.floor(Number(e.req.query("limit") || NaN));
   return e.json(await grantsLeftUnderEnded({ limit: Number.isFinite(asked) ? Math.min(5000, Math.max(1, asked)) : 500 }));
 });
-app.post("/api/admin/grants/:id/revoke", requireAdmin, async (e) =>
-  e.json({
-    revoked: await revokeGrantTree(
-      e.req.param("id"),
-      String((await readJsonBody(e)).reason || "admin"),
-      "admin",
-    ),
-  }),
-);
+app.post("/api/admin/grants/:id/revoke", requireAdmin, async (e) => {
+  let reason = String((await readJsonBody(e)).reason || "admin");
+  notATourReason(reason); // "tour: ..." is the runtime's own (tours.js): the alarm reads one of them back
+  return e.json({ revoked: await revokeGrantTree(e.req.param("id"), reason, "admin") });
+});
 app.post("/api/admin/grants/:id/token", requireAdmin, async (e) => {
   let t = await getGrant(e.req.param("id"));
   // (endedAbove: nor is a token signed again for a grant whose grant above has ended; it would answer 401.)
