@@ -3,7 +3,7 @@ import { env, POLICY_VERSION } from "./config.js";
 import { HttpError, newId, parseJson } from "./util.js";
 import { recordEvent, sql } from "./db.js";
 import { vaultDecrypt, vaultKey } from "./tokens.js";
-import { remainingBudget, TIERS, usageWithin } from "./policy.js";
+import { remainingBudget, TIERS, usageWithin, workerNameCovers } from "./policy.js";
 import { settleGrantUsage } from "./grants.js";
 
 export var TEMPLATES = {
@@ -109,7 +109,7 @@ export async function deployWorker(e, t, a, n) {
     l = t.target?.environment || i.railway?.environments?.[0] || "production",
     c = String(t.name || "").toLowerCase();
   if (!/^[a-z0-9-]{3,48}$/.test(c)) throw new HttpError(400, "bad_worker_name");
-  if (!c.startsWith(i.workers?.namePrefix || "\x00"))
+  if (!workerNameCovers(i.workers?.namePrefix || "", c))
     throw new HttpError(403, "out_of_scope", {
       workerName: c,
     });

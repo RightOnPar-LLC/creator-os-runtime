@@ -98,6 +98,13 @@ export function partitionCovers(prefix, candidate) {
   if (/[:/-]$/.test(prefix)) return !0;
   return /^[:/-]/.test(candidate.slice(prefix.length));
 }
+// Worker names use the same boundary rule, except that an empty namePrefix
+// grants NO workers (fail closed) instead of acting as the root wildcard. The
+// bare `.startsWith()` let namePrefix "acme" reach worker "acmecorp-app", and
+// let a child grant re-scope to a sibling prefix (2026-09-25 fix).
+export function workerNameCovers(prefix, name) {
+  return !!prefix && partitionCovers(prefix, name);
+}
 var numberOr = (e, t) => (e === void 0 || e === null || e === "" || Number.isNaN(+e) ? t : +e);
 export var clampConstraints = (e, t) => ({
   maxWorkers: Math.min(t.maxWorkers, Math.max(0, Math.floor(numberOr(e?.maxWorkers, t.maxWorkers)))),
@@ -124,8 +131,9 @@ export function attenuationViolations(e, t, a) {
     if (!isSubset(t.scope.railway?.projects, i.railway?.projects)) n.push("scope_projects_widened");
     if (!isSubset(t.scope.railway?.environments, i.railway?.environments))
       n.push("scope_environments_widened");
-    let l = i.workers?.namePrefix || "";
-    if (!(t.scope.workers?.namePrefix || "").startsWith(l)) n.push("scope_prefix_widened");
+    let l = i.workers?.namePrefix || "",
+      p = t.scope.workers?.namePrefix || "";
+    if (p !== l && !workerNameCovers(l, p)) n.push("scope_prefix_widened");
     if (!memoryPartitions(t.scope).every((c) => memoryPartitions(i).some((E) => partitionCovers(E, c))))
       n.push("scope_memory_widened");
     if (!usageWithin(t.budget, remainingBudget(e))) n.push("budget_exceeds_parent_remaining");
