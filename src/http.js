@@ -1,7 +1,7 @@
 // The Hono app, auth middleware (admin, grant, sync token), route inventory, source-hash state.
 import { Hono } from "hono";
 import { env } from "./config.js";
-import { HttpError, safeEqual, sha256Hex } from "./util.js";
+import { HttpError, hmacSha256, safeEqual, sha256Hex } from "./util.js";
 import { verifyGrant } from "./grants.js";
 
 // The entry point (index.js) hashes the file it was loaded from and hands the text here.
@@ -34,12 +34,69 @@ var tagAuth = (e, t) =>
   Object.assign(e, {
     auth: t,
   });
+// ---- The operator session (0.3.5) --------------------------------------------
+// Before this, every /api/admin/* call and every cockpit data fetch carried the
+// raw RUNTIME_ADMIN_KEY in an Authorization header. There was no session, so the
+// owner re-pasted the master key into every new tab, on every machine, after
+// every redeploy — the one secret that cannot be attenuated or revoked, typed
+// over and over, which is exactly how a key ends up in a password manager's
+// autofill, a screenshot or a shell history.
+//
+// A session is a stateless signed cookie: `<expMs>.<hmac>`, where the HMAC is
+// taken over "admin-session|<expMs>" with RUNTIME_ADMIN_KEY ITSELF as the
+// signing key. Nothing is stored: no table, no row to sweep, no state to
+// replicate. Two properties fall out of that choice:
+//
+//   * The TTL is inside the signature. An expiry cannot be edited without
+//     invalidating the HMAC, so a cookie cannot be stretched by its holder.
+//   * ROTATING RUNTIME_ADMIN_KEY INVALIDATES EVERY OUTSTANDING SESSION, because
+//     the key is the signing key. Key rotation is therefore the revoke-all
+//     button; there is no session list to clear and none can be missed.
+//
+// A session cookie is exactly as strong as the key that signed it, so it is
+// handed out only to a caller who already proved it holds that key, and it is
+// set HttpOnly (script cannot read it) + Secure (never sent in clear) +
+// SameSite=Lax (not sent on a cross-site POST).
+export var SESSION_COOKIE = "cos_session";
+var SESSION_CONTEXT = "admin-session|";
+export var signSession = (expMs) =>
+  `${expMs}.${hmacSha256(env.RUNTIME_ADMIN_KEY, `${SESSION_CONTEXT}${expMs}`)}`;
+// Reads the cookie off the raw Cookie header (no new dependency: nothing in this
+// repo imports hono/cookie). Returns a boolean and never throws — it sits in
+// front of requireAdmin, so a malformed cookie must read as "no session", not
+// as a 500 that locks the operator out of their own cockpit.
+export function verifySessionCookie(e) {
+  try {
+    if (!env.RUNTIME_ADMIN_KEY) return !1;
+    let t = e.req.header("cookie") || "";
+    if (!t) return !1;
+    let a;
+    for (let r of t.split(";")) {
+      let s = r.indexOf("=");
+      if (s === -1) continue;
+      if (r.slice(0, s).trim() === SESSION_COOKIE) a = r.slice(s + 1).trim();
+    }
+    if (!a) return !1;
+    let n = a.indexOf(".");
+    if (n <= 0 || n === a.length - 1) return !1;
+    let i = a.slice(0, n),
+      o = a.slice(n + 1);
+    if (!/^[0-9]{1,15}$/.test(i)) return !1;
+    let l = Number(i);
+    if (!Number.isSafeInteger(l) || l <= Date.now()) return !1;
+    return safeEqual(o, hmacSha256(env.RUNTIME_ADMIN_KEY, `${SESSION_CONTEXT}${i}`));
+  } catch {
+    return !1;
+  }
+}
 export var requireAdmin = tagAuth(async (e, t) => {
   if (!env.RUNTIME_ADMIN_KEY)
     throw new HttpError(503, "unarmed", {
       needs: "RUNTIME_ADMIN_KEY",
     });
-  if (!isAdminRequest(e)) throw new HttpError(401, "admin_required");
+  // Either channel: the master key in Authorization (unchanged, and still the
+  // only way to MINT a session), or a session cookie this runtime signed.
+  if (!isAdminRequest(e) && !verifySessionCookie(e)) throw new HttpError(401, "admin_required");
   await t();
 }, "admin");
 export var requireGrant = (e) =>

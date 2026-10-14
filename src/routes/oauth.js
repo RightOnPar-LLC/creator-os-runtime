@@ -88,15 +88,21 @@ app.get("/oauth/authorize", async (e) => {
       `<h1>Approve connector</h1><div class="card"><p><b>${escapeHtml(a.name)}</b> wants to act on this runtime as <code>${n.sub}</code>.</p>
 <p>It gets a <b>grant</b> (never the admin key): <code>${displayCaps.join(", ")}</code>${n.parts ? `<br>Memory only in <code>${n.parts.join(", ")}</code>` : ""}<br>Budget up to \xA2${n.usd} \xB7 ${n.calls} calls \xB7 0 deploys \xB7 no delete<br>${n === OPERATOR_PROFILE ? "Lifetime \u2264 7 days (capped by tier), then you approve again." : "Stays connected (auto-renews) until you revoke it."} Revoke anytime in Grants.</p>
 <p>Redirects to <code>${escapeHtml(new URL(t.redirect_uri).host)}</code></p></div>
-<div class="card" id="unlock" hidden><p>Unlock with the admin key (stays in this tab).</p><input id="k" type="password" style="width:100%"><button id="u">Unlock</button></div>
+<div class="card" id="unlock" hidden><p>Unlock with the admin key — once. This browser is then signed in for 30 days; the key is not kept on the page.</p><input id="k" type="password" style="width:100%"><button id="u">Unlock</button></div>
 <div class="card" id="go" hidden><label>Tenant <select id="t"></select></label><p><button id="ok">Approve</button> <button id="no">Deny</button></p><p id="msg"></p></div>
-<script>const C=${r};const $=i=>document.getElementById(i);let K=sessionStorage.getItem("cos_admin");
-async function api(p,o={}){const r=await fetch(p,{...o,headers:{"content-type":"application/json",authorization:"Bearer "+K}});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j}
+<script>const C=${r};const $=i=>document.getElementById(i);let K=sessionStorage.getItem("cos_admin")||null;
+// Unlock trades the admin key for a signed HttpOnly session cookie (POST
+// /api/admin/session), then drops the key from page state, so nothing here holds
+// the master secret. Every fetch sends credentials so that cookie rides along.
+// The Authorization header path is kept as a fallback: if minting a session
+// fails (an older runtime, a browser refusing the cookie), the key stays in this
+// tab exactly as before and the page still works.
+async function api(p,o={}){const h={"content-type":"application/json"};if(K)h.authorization="Bearer "+K;const r=await fetch(p,{...o,credentials:"same-origin",headers:h});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j}
 async function load(){try{const j=await api("/api/tenants");$("t").innerHTML=j.tenants.filter(t=>t.status==="active").map(t=>'<option value="'+t.id+'">'+t.name.replace(/</g,"")+" \xB7 "+t.tier+" \xB7 "+t.id+"</option>").join("");$("unlock").hidden=true;$("go").hidden=false}catch(e){$("unlock").hidden=false;$("go").hidden=true}}
-$("u").onclick=()=>{K=$("k").value.trim();$("k").value="";sessionStorage.setItem("cos_admin",K);load()};
+$("u").onclick=async()=>{K=$("k").value.trim();$("k").value="";try{await api("/api/admin/session",{method:"POST"});K=null;sessionStorage.removeItem("cos_admin")}catch(e){sessionStorage.setItem("cos_admin",K)}load()};
 $("no").onclick=()=>{const u=new URL(C.redirect_uri);u.searchParams.set("error","access_denied");if(C.state)u.searchParams.set("state",C.state);location=u};
 $("ok").onclick=async()=>{$("ok").disabled=true;try{const j=await api("/oauth/approve",{method:"POST",body:JSON.stringify({...C,tenant:$("t").value})});location=j.redirect}catch(e){$("msg").textContent="Failed: "+e.message;$("ok").disabled=false}};
-K?load():$("unlock").hidden=false;</script>`,
+load();</script>`,
     ),
   );
 });
