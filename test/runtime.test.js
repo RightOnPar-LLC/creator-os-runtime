@@ -5380,3 +5380,148 @@ describe("24. stored deploy secrets never leave the runtime (bridge prerequisite
     expect(list.json.approvals[0].intent.env).toEqual({ DB_PASSWORD: "[redacted]" });
   });
 });
+
+// ------------------------------------------------------------------------------------
+// GET /api/admin/grants (src/routes/admin.js). It used to answer every question with the newest 200 grants: it read
+// no filter and no offset, so a live key older than those 200 could not be seen at all.
+describe("25. the admin's list of grants: filters and pages (GET /api/admin/grants)", () => {
+  // the filler grants below are this section's own: they go when it is done, so a section after it starts clean.
+  // (starts_with, not LIKE: in LIKE an underscore matches any one character, and 'gr_25_%' would also match a real
+  // grant whose random id begins with "25".)
+  afterAll(() => dbQuery("DELETE FROM grants WHERE starts_with(id, 'gr_25_fill_') OR starts_with(id, 'gr_25_page_')"));
+  const list = (q = "") => admin("GET", `/api/admin/grants${q}`);
+  const ids = (r) => r.json.grants.map((g) => g.id);
+  const countWhere = async (where, params = []) => (await dbQuery(`SELECT count(*)::int AS n FROM grants WHERE ${where}`, params)).rows[0].n;
+  // `n` grants of `likeId`'s tenant, copies of it in `status`, written in ONE statement so that they share a created_at.
+  // Their ids rise in the order they are written, so a list that has no second sort key shows them oldest id first.
+  const fill = (likeId, prefix, n, status) =>
+    dbQuery(
+      `INSERT INTO grants (id, tenant, parent, depth, sub, status, caps, scope, budget, constraints, payload, iat, exp)
+       SELECT '${prefix}' || lpad(n::text, 4, '0'), tenant, NULL, 0, 'filler', '${status}', caps, scope, budget, constraints, payload, iat, exp
+       FROM grants, generate_series(1, ${n}) n WHERE id = $1`,
+      [likeId],
+    );
+
+  test("an old live key behind 205 newer grants: missing from the default list, found by status and by tenant", async () => {
+    const t = await newTenant("admin-list-old", "studio");
+    const kid = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:old", caps: ["grant.read"], ttlSec: 3600 } });
+    expect(kid.status).toBe(201);
+    const u = await newTenant("admin-list-filler", "studio");
+    await fill(u.grantId, "gr_25_fill_", 205, "revoked");
+    // asked with nothing: what it always was, the newest 200 of every tenant, in the same shape
+    const plain = await list();
+    expect(plain.status).toBe(200);
+    expect(plain.json.grants.length).toBe(200);
+    expect(Object.keys(plain.json.grants[0]).sort()).toEqual(["budget", "caps", "created_at", "depth", "exp", "id", "parent", "remaining", "reserved", "settled", "status", "sub", "tenant"]);
+    expect(ids(plain)).not.toContain(t.grantId); // control: this is the blind spot
+    expect(ids(plain)).not.toContain(kid.json.id);
+    expect(ids(await list("?limit=200&offset=0"))).toEqual(ids(plain));
+    expect(plain.json.total).toBe(await countWhere("TRUE"));
+    expect([plain.json.limit, plain.json.offset, plain.json.status, plain.json.tenant]).toEqual([200, 0, null, null]); // no filter applied, and it says so
+    // by status: only active grants, and the two old live keys are among them
+    const active = await list("?status=active");
+    expect(active.status).toBe(200);
+    expect(active.json.grants.every((g) => g.status === "active")).toBe(true);
+    expect(ids(active)).toEqual(expect.arrayContaining([t.grantId, kid.json.id]));
+    expect(active.json.total).toBe(await countWhere("status = 'active'"));
+    // by tenant: only that tenant's, all of them
+    const theirs = await list(`?tenant=${t.id}`);
+    expect(theirs.json.grants.every((g) => g.tenant === t.id)).toBe(true);
+    expect(ids(theirs).sort()).toEqual([t.grantId, kid.json.id].sort());
+    expect(theirs.json.total).toBe(2);
+    expect([theirs.json.tenant, theirs.json.status]).toEqual([t.id, null]);
+    expect([active.json.status, active.json.tenant]).toEqual(["active", null]);
+    // both at once
+    expect((await list(`?tenant=${u.id}&status=revoked`)).json.total).toBe(205);
+    expect(ids(await list(`?tenant=${u.id}&status=active`))).toEqual([u.grantId]);
+    expect((await list(`?tenant=${t.id}&status=revoked`)).json.grants).toEqual([]);
+    expect((await list("?tenant=t_nobodyatall")).json).toEqual({ grants: [], total: 0, limit: 200, offset: 0, status: null, tenant: "t_nobodyatall" });
+    // the other two states a grant can be in can be asked for as well
+    await dbQuery("UPDATE grants SET status = 'expired' WHERE id = 'gr_25_fill_0001'");
+    await dbQuery("UPDATE grants SET status = 'captured' WHERE id = 'gr_25_fill_0002'");
+    for (const [status, id] of [["expired", "gr_25_fill_0001"], ["captured", "gr_25_fill_0002"]]) {
+      const r = await list(`?status=${status}&tenant=${u.id}`);
+      expect(r.status).toBe(200);
+      expect(ids(r)).toEqual([id]);
+    }
+  });
+
+  test("pages: offset moves through the list, pages never overlap, and grants that share a moment are split the same way every time", async () => {
+    const u = await newTenant("admin-list-pages", "studio");
+    await fill(u.grantId, "gr_25_page_", 250, "revoked");
+    // the whole list, page by page, is the same as one long page
+    const p0 = await list("?limit=200&offset=0"),
+      p1 = await list("?limit=200&offset=200"),
+      both = await list("?limit=400");
+    expect(ids(p1)).not.toEqual(ids(p0));
+    expect(ids(p0).filter((id) => ids(p1).includes(id))).toEqual([]);
+    expect([...ids(p0), ...ids(p1)]).toEqual(ids(both));
+    expect([p1.json.limit, p1.json.offset]).toEqual([200, 200]);
+    expect((await list("?limit=1")).json.grants.length).toBe(1);
+    expect((await list("?limit=1000")).json.grants.length).toBe(Math.min(1000, await countWhere("TRUE")));
+    // 250 grants written in one statement share a created_at: within them the order is by id, newest id first, so
+    // pages cut through them never show one twice or leave one out
+    const q = `?tenant=${u.id}&status=revoked&limit=100`;
+    const pages = [await list(`${q}&offset=0`), await list(`${q}&offset=100`), await list(`${q}&offset=200`)];
+    expect(pages.map((p) => p.json.grants.length)).toEqual([100, 100, 50]);
+    const seen = pages.flatMap(ids);
+    expect(new Set(seen).size).toBe(250);
+    expect(seen).toEqual(Array.from({ length: 250 }, (_, i) => `gr_25_page_${String(250 - i).padStart(4, "0")}`));
+    expect(pages.every((p) => p.json.total === 250)).toBe(true);
+    // past the end: an empty page that still says how many there are
+    expect((await list(`${q}&offset=250`)).json).toEqual({ grants: [], total: 250, limit: 100, offset: 250, status: "revoked", tenant: u.id });
+  });
+
+  test("a value that cannot be read is refused (400), never ignored", async () => {
+    for (const status of ["bogus", "ACTIVE", "", "active,revoked"]) {
+      const r = await list(`?status=${encodeURIComponent(status)}`);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("status_invalid");
+      expect(r.json.detail.allowed).toEqual(["active", "revoked", "expired", "captured"]);
+    }
+    for (const tenant of ["", "t_x' OR '1'='1", "t/../x", "a".repeat(65)]) {
+      const r = await list(`?tenant=${encodeURIComponent(tenant)}`);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("tenant_invalid");
+    }
+    for (const limit of ["0", "1001", "abc", "1.5", "-1", "", "1e3", "99999999999"]) {
+      const r = await list(`?limit=${encodeURIComponent(limit)}`);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("limit_invalid");
+    }
+    for (const offset of ["-1", "x", "1.5", "", "99999999999"]) {
+      const r = await list(`?offset=${encodeURIComponent(offset)}`);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("offset_invalid");
+    }
+    // a key this route does not know, or a key given twice, is refused too: before, both answered the newest 200 of every
+    // tenant (or the first tenant only) as if the filter had been applied
+    const t0 = await newTenant("admin-list-keys", "studio");
+    for (const q of [`?tenant_id=${t0.id}`, `?Tenant=${t0.id}`, "?page=2", "?status=active&state=revoked", "?limit=10&per_page=5"]) {
+      const r = await list(q);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("query_unknown");
+      expect(r.json.detail.allowed).toEqual(["status", "tenant", "limit", "offset"]);
+    }
+    for (const q of [`?tenant=${t0.id}&tenant=t_someoneelse`, "?status=active&status=revoked", "?limit=1&limit=2", "?offset=0&offset=0"]) {
+      const r = await list(q);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("query_repeated");
+    }
+    // a key spelled with an escape is the key itself: it filters, and it counts as given twice when also given plainly
+    const escaped = await list(`?%74enant=${t0.id}`);
+    expect(escaped.status).toBe(200);
+    expect(escaped.json.tenant).toBe(t0.id);
+    expect(ids(escaped)).toEqual([t0.grantId]);
+    const twice = await list(`?%74enant=${t0.id}&tenant=t_someoneelse`);
+    expect(twice.status).toBe(400);
+    expect(twice.json.error).toBe("query_repeated");
+    // the edges that are allowed
+    expect((await list("?limit=1000&offset=0")).status).toBe(200);
+    expect((await list("?offset=1000000000")).json.grants).toEqual([]);
+    // and it stays the admin's: no key, or an owner's key, is refused as before
+    expect((await req("GET", "/api/admin/grants?status=active")).status).toBe(401);
+    const t = await newTenant("admin-list-owner", "studio");
+    expect((await req("GET", "/api/admin/grants?status=active", { token: t.token })).status).toBe(401);
+  });
+});
