@@ -8,7 +8,38 @@ import { endedAbove, grantsLeftUnderEnded, mintRootGrant, reapExpiredGrants, rev
 import { readGuestPool, guestPoolStatus } from "../guest.js";
 import { notATourReason, sweepTours } from "../tours.js";
 import { TEMPLATES } from "../railway.js";
-import { app, readJsonBody, requireAdmin } from "../http.js";
+import { app, readJsonBody, requireAdmin, SESSION_COOKIE, signSession } from "../http.js";
+
+// The operator session (0.3.5). Mint: present the admin key once (requireAdmin,
+// and minting deliberately accepts the cookie channel too, so a live session can
+// renew itself before it lapses) and get a 30-day signed cookie back; every later
+// /api/admin/* call rides on the cookie, so the key is pasted once per 30 days
+// per browser instead of once per tab, machine and redeploy.
+//
+// SECURITY: the cookie is signed WITH RUNTIME_ADMIN_KEY, so rotating that key
+// invalidates every outstanding session at once — there is no session store to
+// clear and no cookie that can outlive its key. The TTL is inside the signature
+// (see signSession in ../http.js), so the holder cannot extend it. Nothing is
+// persisted; this route adds no table and does not touch the grant engine.
+var SESSION_TTL_SEC = 30 * 24 * 60 * 60;
+var sessionCookie = (t, maxAge) =>
+  `${SESSION_COOKIE}=${t}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
+app.post("/api/admin/session", requireAdmin, (e) => {
+  let expMs = Date.now() + SESSION_TTL_SEC * 1000;
+  return (
+    e.header("set-cookie", sessionCookie(signSession(expMs), SESSION_TTL_SEC)),
+    e.json({
+      ok: !0,
+      expires: new Date(expMs).toISOString(),
+    })
+  );
+});
+app.delete("/api/admin/session", requireAdmin, (e) => (
+  e.header("set-cookie", sessionCookie("", 0)),
+  e.json({
+    ok: !0,
+  })
+));
 
 app.post("/api/tenants", requireAdmin, async (e) => {
   let t = await readJsonBody(e),

@@ -1,10 +1,10 @@
 // Routes: /routes inventory and /selftest. Registration order is significant.
-import { SERVICE_NAME } from "../config.js";
+import { env, SERVICE_NAME } from "../config.js";
 import { hmacSha256, nowSec } from "../util.js";
 import { parseGrantToken, signGrantToken, vaultDecrypt, vaultEncrypt, vaultKey } from "../tokens.js";
 import { attenuationViolations, gatehouseEvaluate, holdExpiry, zeroUsage } from "../policy.js";
 import { verifyTimestampedSignature } from "../webhooks.js";
-import { app, routeInventory } from "../http.js";
+import { app, routeInventory, SESSION_COOKIE, signSession, verifySessionCookie } from "../http.js";
 import { MCP_TOOLS } from "../mcp.js";
 import { buildAgentCard, validateAgentCard } from "../a2a.js";
 import { buildEscrow, captureAmount } from "../escrow.js";
@@ -15,6 +15,12 @@ app.get("/routes", (e) => {
     routes: t,
     count: t.length,
   });
+});
+// The one thing verifySessionCookie reads off a request: the Cookie header.
+var asCtx = (cookie) => ({
+  req: {
+    header: (name) => (String(name).toLowerCase() === "cookie" ? cookie : void 0),
+  },
 });
 app.get("/selftest", async (e) => {
   let t = [],
@@ -380,6 +386,48 @@ app.get("/selftest", async (e) => {
           got.soon === t0 + 62 &&
           got.soonAtLimit === t0 + 30) ||
         got
+      );
+    }),
+    // The operator session cookie (0.3.5). It stands in for the admin key on
+    // every /api/admin/* call, so the four ways it must refuse are proven here
+    // rather than only in the suite. `asCtx` is the smallest thing
+    // verifySessionCookie reads: a request with a Cookie header.
+    a("session cookie roundtrip", () => {
+      if (!env.RUNTIME_ADMIN_KEY) return "skipped:unarmed";
+      return verifySessionCookie(asCtx(`${SESSION_COOKIE}=${signSession(Date.now() + 60000)}`)) === !0;
+    }),
+    a("expired session cookie rejected", () => {
+      if (!env.RUNTIME_ADMIN_KEY) return "skipped:unarmed";
+      return (
+        verifySessionCookie(asCtx(`${SESSION_COOKIE}=${signSession(Date.now() - 1000)}`)) === !1 &&
+        verifySessionCookie(asCtx(`${SESSION_COOKIE}=${signSession(Date.now() - 86400000)}`)) === !1
+      );
+    }),
+    a("tampered session cookie rejected", () => {
+      if (!env.RUNTIME_ADMIN_KEY) return "skipped:unarmed";
+      let tok = signSession(Date.now() + 60000),
+        dot = tok.indexOf("."),
+        mac = tok.slice(dot + 1),
+        // flip one character of the HMAC, and separately re-stamp a longer life
+        // onto the signature that was made for the shorter one
+        flipped = `${tok.slice(0, dot + 1)}${mac[0] === "a" ? "b" : "a"}${mac.slice(1)}`,
+        restamped = `${Number(tok.slice(0, dot)) + 86400000}.${mac}`;
+      return (
+        verifySessionCookie(asCtx(`${SESSION_COOKIE}=${flipped}`)) === !1 &&
+        verifySessionCookie(asCtx(`${SESSION_COOKIE}=${restamped}`)) === !1 &&
+        verifySessionCookie(asCtx(`${SESSION_COOKIE}=${mac}`)) === !1 &&
+        verifySessionCookie(asCtx(`${SESSION_COOKIE}=`)) === !1 &&
+        verifySessionCookie(asCtx("")) === !1
+      );
+    }),
+    a("session cookie signed with a different key rejected", () => {
+      if (!env.RUNTIME_ADMIN_KEY) return "skipped:unarmed";
+      let expMs = Date.now() + 60000,
+        other = `${env.RUNTIME_ADMIN_KEY}-not-the-key`,
+        forged = `${expMs}.${hmacSha256(other, `admin-session|${expMs}`)}`;
+      return (
+        forged !== signSession(expMs) &&
+        verifySessionCookie(asCtx(`${SESSION_COOKIE}=${forged}`)) === !1
       );
     }));
   let s = t.every((i) => i.pass || String(i.info || "").startsWith("skipped"));
