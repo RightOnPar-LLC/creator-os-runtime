@@ -36,6 +36,10 @@ export var CAPS = [
   // no-op marker (the custodian holds value and does nothing), present only so the
   // custodian passes the no_caps floor; a payer must hold it to open an escrow.
   "escrow.hold",
+  // repo broker: scoped GitHub access via server-held credential
+  "repo.read",
+  "repo.diff",
+  "repo.pr",
 ];
 var CAP_SET = new Set(CAPS);
 export var TIERS = {
