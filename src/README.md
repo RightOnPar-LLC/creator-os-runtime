@@ -16,7 +16,8 @@ file → these modules, byte for byte.
 | `config.js` | 57 | Service name/version/policy, `env` (secret values trimmed at load), armed-integration flags, secret fingerprints. |
 | `util.js` | 25 | Pure helpers: JSON, time, ids, sha256, HMAC, constant-time compare, HTML escape, `HttpError`. |
 | `db.js` | 105 | Postgres via `Bun.SQL`, schema + migration, settings, events, tenant/grant lookups, kill-switch read. |
-| `outbox.js` | 72 | Durable outbox to the Brain and the cognitive bridge, retry with backoff. |
+| `outbox.js` | 79 | Durable outbox to the Brain and the cognitive bridge and the events bus, retry with backoff. |
+| `busout.js` | 74 | Outbox kind `bus.publish`: each `events` row to the one events bus (meshtool rail `POST /events`, NATS stream `MESH_EVENTS`), HMAC `t=,v1=` signed. Off unless `BUS_EVENTS_URL` (https) and `BUS_EVENTS_KEY` are both set; 4xx terminal, 5xx retried. |
 | `tokens.js` | 58 | Grant tokens (`cog1.<payload>.<hmac>`) and the AES-256-GCM vault. |
 | `policy.js` | 240 | Caps, tiers, usage arithmetic, attenuation rules, the gatehouse, memory-partition boundary check, source-overlay canon + the diagnostics check (0.3.2). |
 | `grants.js` | 295 | Mint root, issue child, revoke tree, settle usage, Postgres-backed rate limit, `verifyGrant`. |

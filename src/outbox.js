@@ -3,10 +3,11 @@ import { env, SERVICE_NAME } from "./config.js";
 import { hmacSha256, parseJson } from "./util.js";
 import { sql } from "./db.js";
 import { toBridgeChange } from "./bridgewire.js";
+import { busArmed, deliverBus } from "./busout.js";
 
 export var cogBridgeUrl = () => (env.COG_BRIDGE_URL || "").replace(/\/$/, "");
 export async function enqueueOutbox(e, t) {
-  if (!(e === "brain.event" ? !!env.BRAIN_URL : !!(cogBridgeUrl() && env.COG_BRIDGE_TOKEN))) return;
+  if (!(e === "brain.event" ? !!env.BRAIN_URL : e === "bus.publish" ? busArmed() : !!(cogBridgeUrl() && env.COG_BRIDGE_TOKEN))) return;
   if ((await sql`INSERT INTO outbox (kind, payload) VALUES (${e}, ${t}::jsonb)`, !outboxDrainScheduled))
     ((outboxDrainScheduled = !0),
       setTimeout(
@@ -53,6 +54,7 @@ async function deliverOutboxItem(e, t) {
     if (!a.ok) throw Error("bridge " + a.status);
     return;
   }
+  if (e === "bus.publish") return deliverBus(t);
   throw Error("unknown_kind");
 }
 export async function drainOutbox(e) {
@@ -66,7 +68,7 @@ export async function drainOutbox(e) {
         a++);
     } catch (s) {
       let i = r.attempts + 1;
-      (await sql`UPDATE outbox SET attempts = ${i}, next_at = ${new Date(Date.now() + Math.min(300, 2 ** i) * 1000)}, last_error = ${String(s?.message || s).slice(0, 300)}, done = ${i >= 10} WHERE id = ${r.id}`,
+      (await sql`UPDATE outbox SET attempts = ${i}, next_at = ${new Date(Date.now() + Math.min(300, 2 ** i) * 1000)}, last_error = ${String(s?.message || s).slice(0, 300)}, done = ${i >= 10 || s?.terminal === !0} WHERE id = ${r.id}`,
         n++);
     }
   return {

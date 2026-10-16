@@ -36,5 +36,5 @@ if (arg === "dist") env.RUNTIME_ENTRY = join(root, "dist", "runtime.js");
 else if (arg) env.RUNTIME_ENTRY = resolve(root, arg);
 // The per-test time limit has to be given HERE. This bun reads [test] in bunfig.toml but ignores a
 // `timeout` key there: from 2026-09-25 bunfig said 30 s and every test ran with bun's own 5 s.
-const r = spawnSync(bun, ["test", "--timeout", "30000", "runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "hostpolicy.test.js"], { cwd: here, env, stdio: "inherit" });
+const r = spawnSync(bun, ["test", "--timeout", "30000", "runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "hostpolicy.test.js", "bus.test.js"], { cwd: here, env, stdio: "inherit" });
 process.exit(r.status ?? 1);
