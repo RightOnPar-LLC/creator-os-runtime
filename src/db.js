@@ -2,6 +2,7 @@
 import { env, SERVICE_NAME } from "./config.js";
 import { newId } from "./util.js";
 import { enqueueOutbox } from "./outbox.js";
+import { busArmed, busEnvelope } from "./busout.js";
 
 var { SQL: BunSQL } = globalThis.Bun;
 var DB_CONNECTION_URL = env.DATABASE_URL || env.POSTGRES_URL || "";
@@ -116,10 +117,8 @@ export async function setSetting(e, t) {
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`;
 }
 export async function recordEvent(e, t, a = null, n = null) {
-  if (
-    (await sql`INSERT INTO events (tenant, type, actor, data) VALUES (${a}, ${e}, ${n}, ${t}::jsonb)`,
-    !e.startsWith("brain."))
-  )
+  let [row] = await sql`INSERT INTO events (tenant, type, actor, data) VALUES (${a}, ${e}, ${n}, ${t}::jsonb) RETURNING id, ts`;
+  if (!e.startsWith("brain."))
     await enqueueOutbox("brain.event", {
       id: newId("ev"),
       type: e,
@@ -129,6 +128,11 @@ export async function recordEvent(e, t, a = null, n = null) {
       ts: new Date().toISOString(),
       source: SERVICE_NAME,
     });
+  // The one events bus. Off (no row, no call) unless BUS_EVENTS_URL and BUS_EVENTS_KEY are both set.
+  if (busArmed()) {
+    let ev = busEnvelope({ id: row?.id, type: e, ts: row?.ts, data: t, tenant: a, actor: n }, SERVICE_NAME);
+    if (ev) await enqueueOutbox("bus.publish", ev);
+  }
 }
 export async function isKillSwitchOn() {
   return (await getSetting("kill_switch")) === "on";

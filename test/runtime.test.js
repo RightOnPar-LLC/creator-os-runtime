@@ -5525,3 +5525,117 @@ describe("25. the admin's list of grants: filters and pages (GET /api/admin/gran
     expect((await req("GET", "/api/admin/grants?status=active", { token: t.token })).status).toBe(401);
   });
 });
+
+describe("26. the one events bus: outbox kind bus.publish (src/busout.js)", () => {
+  // Test-only key from test/bus-vectors.json (the same file the gateway's suite reads).
+  const KEY = JSON.parse(readFileSync(resolve(here, "bus-vectors.json"), "utf8")).key;
+  const URL_ = "https://rail.example.test/events";
+  const busRows = async () => (await dbQuery("SELECT id, payload, attempts, done, last_error FROM outbox WHERE kind = 'bus.publish' ORDER BY id")).rows;
+  const payloadOf = (row) => (typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload);
+  // newTenant records more than one event (tenant.created, the root grant's): pick out the tenant's own.
+  const createdRow = async (before, tenant) =>
+    (await busRows()).slice(before).filter((r) => payloadOf(r).type === "tenant.created" && payloadOf(r).tenant === tenant);
+  const callsFor = (seen, id) => seen.filter((c) => JSON.parse(c.body).id === id);
+  const lastEventId = async (type, tenant) =>
+    (await dbQuery("SELECT id FROM events WHERE type = $1 AND tenant = $2 ORDER BY id DESC LIMIT 1", [type, tenant])).rows[0].id;
+  // Arm (or not), and answer the bus URL with `status()`; everything else goes to the harness as before.
+  async function withBus({ url, key, status = () => 200 }, fn) {
+    const saved = { url: process.env.BUS_EVENTS_URL, key: process.env.BUS_EVENTS_KEY, fetch: globalThis.fetch };
+    const seen = [];
+    if (url === undefined) delete process.env.BUS_EVENTS_URL; else process.env.BUS_EVENTS_URL = url;
+    if (key === undefined) delete process.env.BUS_EVENTS_KEY; else process.env.BUS_EVENTS_KEY = key;
+    globalThis.fetch = async (input, init) => {
+      const href = typeof input === "string" ? input : input.url ?? String(input);
+      if (href !== URL_) return saved.fetch(input, init);
+      seen.push({ body: init.body, sig: init.headers["x-bus-signature"] });
+      return new Response("{}", { status: status(seen.length) });
+    };
+    try {
+      return await fn(seen);
+    } finally {
+      globalThis.fetch = saved.fetch;
+      if (saved.url === undefined) delete process.env.BUS_EVENTS_URL; else process.env.BUS_EVENTS_URL = saved.url;
+      if (saved.key === undefined) delete process.env.BUS_EVENTS_KEY; else process.env.BUS_EVENTS_KEY = saved.key;
+    }
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 150)); // enqueueOutbox drains 30 ms after a write
+  const verifies = (body, sig) => {
+    const m = /^t=(\d+),v1=([0-9a-f]{64})$/.exec(sig || "");
+    return !!m && Math.abs(Date.now() / 1000 - Number(m[1])) <= 300 && hmacHex(KEY, `${m[1]}.${body}`) === m[2];
+  };
+  afterAll(() => dbQuery("DELETE FROM outbox WHERE kind = 'bus.publish'"));
+
+  test("OFF by default: events are recorded, no bus.publish row, no call", async () => {
+    await withBus({}, async (seen) => {
+      const before = (await busRows()).length;
+      const t = await newTenant("bus-off", "pro");
+      expect(await lastEventId("tenant.created", t.id)).toBeDefined(); // the event itself still lands
+      await settle();
+      expect((await busRows()).length).toBe(before);
+      expect(seen.length).toBe(0);
+    });
+  });
+
+  test("NEGATIVE CONTROL: only one of the pair set, or an http URL, still enqueues nothing", async () => {
+    for (const cfg of [{ url: URL_ }, { key: KEY }, { url: "http://rail.example.test/events", key: KEY }]) {
+      await withBus(cfg, async (seen) => {
+        const before = (await busRows()).length;
+        await newTenant("bus-half", "pro");
+        await settle();
+        expect([cfg, (await busRows()).length, seen.length]).toEqual([cfg, before, 0]);
+      });
+    }
+  });
+
+  test("armed: one row per event, id = the events row id, signed so the gateway accepts it", async () => {
+    await withBus({ url: URL_, key: KEY }, async (seen) => {
+      const before = (await busRows()).length;
+      const t = await newTenant("bus-on", "pro");
+      await settle();
+      // the paired positive of the two tests above: the same action now queues rows, one per event
+      const allNew = (await busRows()).slice(before);
+      const evCount = (await dbQuery("SELECT count(*)::int AS n FROM events WHERE tenant = $1", [t.id])).rows[0].n;
+      expect(allNew.length).toBe(evCount);
+      const rows = await createdRow(before, t.id);
+      expect(rows.length).toBe(1);
+      const evId = await lastEventId("tenant.created", t.id);
+      const p = payloadOf(rows[0]);
+      expect(p).toMatchObject({ id: `rt_ev_${evId}`, type: "tenant.created", source: "creator-os-runtime", tenant: t.id, actor: "admin", data: { tier: "pro" } });
+      expect(rows[0].done).toBe(true);
+      const calls = callsFor(seen, p.id);
+      expect(calls.length).toBe(1);
+      expect(JSON.parse(calls[0].body)).toEqual(p);
+      expect(verifies(calls[0].body, calls[0].sig)).toBe(true);
+    });
+  });
+
+  test("5xx is retried with the SAME id (the gateway dedups on it); success then marks it done", async () => {
+    let up = false; // the bus answers 503 until `up`
+    await withBus({ url: URL_, key: KEY, status: () => (up ? 200 : 503) }, async (seen) => {
+      const before = (await busRows()).length;
+      const t = await newTenant("bus-retry", "pro");
+      await settle();
+      let [row] = await createdRow(before, t.id);
+      expect([row.attempts, row.done, row.last_error]).toEqual([1, false, "bus 503"]);
+      up = true;
+      await dbQuery("UPDATE outbox SET next_at = now() WHERE kind = 'bus.publish' AND done = false"); // skip the backoff wait
+      expect((await admin("POST", "/api/admin/outbox/drain")).status).toBe(200);
+      [row] = await createdRow(before, t.id);
+      expect([row.attempts, row.done]).toEqual([1, true]);
+      const calls = callsFor(seen, payloadOf(row).id);
+      expect(calls.length).toBe(2);
+      expect(calls[1].body).toBe(calls[0].body); // same id, same bytes: the gateway's Nats-Msg-Id dedup holds
+      expect(verifies(calls[1].body, calls[1].sig)).toBe(true); // re-signed with a fresh timestamp
+    });
+  });
+
+  test("a 4xx (other than 408/429) is terminal: one attempt, done, error kept", async () => {
+    await withBus({ url: URL_, key: KEY, status: () => 400 }, async (seen) => {
+      const before = (await busRows()).length;
+      const t = await newTenant("bus-bad", "pro");
+      await settle();
+      const [row] = await createdRow(before, t.id);
+      expect([row.attempts, row.done, row.last_error, callsFor(seen, payloadOf(row).id).length]).toEqual([1, true, "bus 400", 1]);
+    });
+  });
+});

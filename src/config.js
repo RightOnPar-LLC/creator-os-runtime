@@ -20,6 +20,7 @@ var TRIMMED_SECRET_ENV_KEYS = [
   "COG_BRIDGE_TOKEN",
   "COG_SYNC_TOKEN",
   "GRANT_SIGNING_KEY",
+  "BUS_EVENTS_KEY",
 ];
 for (let e of TRIMMED_SECRET_ENV_KEYS) {
   let t = env[e];
