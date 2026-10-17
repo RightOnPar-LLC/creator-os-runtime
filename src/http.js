@@ -3,6 +3,12 @@ import { Hono } from "hono";
 import { env } from "./config.js";
 import { HttpError, hmacSha256, safeEqual, sha256Hex } from "./util.js";
 import { verifyGrant } from "./grants.js";
+import { getSetting } from "./db.js";
+
+// The latest time the owner signed out everywhere (routes/sso.js keeps it), in seconds; 0 = never.
+export async function ownerNotBefore() {
+  try { return Number((await getSetting("owner_not_before")) || 0) || 0; } catch { return 0; }
+}
 
 // The entry point (index.js) hashes the file it was loaded from and hands the text here.
 // Bundled for production, that file is the whole single-file runtime, as before the split.
@@ -126,6 +132,9 @@ export var requireAdmin = tagAuth(async (e, t) => {
   if (!isAdminRequest(e)) {
     viaCookie = sessionCookieExpiry(e);
     if (!viaCookie) throw new HttpError(401, "admin_required");
+    // Signed out everywhere (routes/sso.js) since this session was made: it is no session. A
+    // session is made (or last renewed) SESSION_TTL_SEC before its expiry, or later.
+    if (viaCookie - SESSION_TTL_SEC * 1000 <= (await ownerNotBefore()) * 1000) throw new HttpError(401, "admin_required");
   }
   await t();
   if (viaCookie) slideSession(e, viaCookie);
