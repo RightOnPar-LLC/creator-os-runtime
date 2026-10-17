@@ -481,6 +481,153 @@ describe("5b. operator session slides on use", () => {
 });
 
 // ------------------------------------------------------------------------------------
+// The owner's ONE sign-in (2026-10-16): id.meshtool.ai posts a one-time pass to
+// /sso/callback. A real Ed25519 key stands in for id's; passes are signed exactly as id
+// signs them (meshtool-frontdoor owner.mjs). Off until ID_PUBLIC_KEY is set.
+describe("5c. one sign-in: a pass from id.meshtool.ai", () => {
+  const ID = "https://id.meshtool.ai", SELF = "https://runtime.meshtool.ai";
+  const b64u = (b) => Buffer.from(b).toString("base64url");
+  let idKey, otherKey, n = 0;
+  const now = () => Math.floor(Date.now() / 1000);
+  const makePass = async (over = {}, key = idKey.privateKey) => {
+    const t = now();
+    const c = { v: 1, iss: ID, sub: "owner", aud: SELF, iat: t, exp: t + 60, jti: "rt_jti_" + String(++n).padStart(18, "0"), fa: t - 3600, ...over };
+    const p = b64u(new TextEncoder().encode(JSON.stringify(c)));
+    return p + "." + b64u(new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, key, new TextEncoder().encode(p))));
+  };
+  const callback = (pass, { origin = ID, ret = SELF + "/status" } = {}) =>
+    req("POST", "/sso/callback", { raw: new URLSearchParams({ pass, return: ret }).toString(), headers: { "content-type": "application/x-www-form-urlencoded", origin } });
+  const sessionOf = (r) => (r.headers.getSetCookie?.() || []).find((c) => c.startsWith("cos_session=")) || "";
+  const refused = (r, why = "refused") => r.status === 303 && r.headers.get("location") === `/?sso=${why}` && sessionOf(r) === "";
+
+  beforeAll(async () => {
+    idKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    otherKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  });
+  afterAll(() => { delete process.env.ID_PUBLIC_KEY; });
+
+  test("off until ID_PUBLIC_KEY is set: start is 404, a pass is refused", async () => {
+    delete process.env.ID_PUBLIC_KEY;
+    expect((await req("GET", "/sso/start")).status).toBe(404);
+    expect(refused(await callback(await makePass()), "off")).toBe(true);
+    process.env.ID_PUBLIC_KEY = (await crypto.subtle.exportKey("jwk", idKey.publicKey)).x;
+  });
+
+  test("start sends the owner to id for this runtime, coming back to the page asked for", async () => {
+    const r = await req("GET", "/sso/start?return=" + encodeURIComponent("/status?x=1"));
+    expect(r.status).toBe(302);
+    const u = new URL(r.headers.get("location"));
+    expect(u.origin + u.pathname).toBe(ID + "/sso/pass");
+    expect(u.searchParams.get("client")).toBe(SELF);
+    expect(u.searchParams.get("return")).toBe(SELF + "/status?x=1");
+    const off = new URL((await req("GET", "/sso/start?return=" + encodeURIComponent("//evil.example/x"))).headers.get("location"));
+    expect(off.searchParams.get("return")).toBe(SELF + "/");
+  });
+
+  test("a good pass becomes the operator session, and it works", async () => {
+    const r = await callback(await makePass(), { ret: SELF + "/status" });
+    expect(r.status).toBe(303);
+    expect(r.headers.get("location")).toBe("/status");
+    const c = sessionOf(r);
+    expect(c).toMatch(/; HttpOnly; Secure; SameSite=Lax; Path=\/; Max-Age=\d+$/);
+    expect((await req("GET", "/api/tenants", { headers: { cookie: c.split(";")[0] } })).status).toBe(200);
+  });
+
+  test("the session ends no later than 180 days after id's face check", async () => {
+    const fa = now() - 179 * 86400;
+    const c = sessionOf(await callback(await makePass({ fa })));
+    const exp = Number(c.match(/^cos_session=(\d+)\./)[1]);
+    expect(exp).toBeLessThanOrEqual((fa + 180 * 86400) * 1000);
+    expect(exp).toBeGreaterThan(Date.now());
+  });
+
+  test("NEGATIVE CONTROLS: replay, wrong origin, wrong site, expired, other key, edited, old face, off-site return", async () => {
+    const once = await makePass();
+    expect((await callback(once)).status).toBe(303);
+    expect(refused(await callback(once))).toBe(true);
+    expect(refused(await callback(await makePass(), { origin: "https://market.meshtool.ai" }))).toBe(true);
+    expect(refused(await callback(await makePass({ aud: "https://market.meshtool.ai" })))).toBe(true);
+    expect(refused(await callback(await makePass({ iat: now() - 120, exp: now() - 60 })))).toBe(true);
+    expect(refused(await callback(await makePass({}, otherKey.privateKey)))).toBe(true);
+    const [p, s] = (await makePass()).split(".");
+    const edited = b64u(new TextEncoder().encode(JSON.stringify({ ...JSON.parse(Buffer.from(p, "base64url").toString()), sub: "owner", fa: now() }))) + "." + s;
+    expect(refused(await callback(edited))).toBe(true);
+    expect(refused(await callback(await makePass({ fa: now() - 181 * 86400 })))).toBe(true);
+    const off = await callback(await makePass(), { ret: "https://evil.example/x" });
+    expect(off.headers.get("location")).toBe("/");
+  });
+});
+
+// ------------------------------------------------------------------------------------
+// Sign out everywhere (2026-10-16): the last hop of id's signed notice. The runtime keeps the
+// latest time T and refuses any operator session made before it, and any pass whose Face ID
+// is not newer than T.
+describe("5d. sign out everywhere", () => {
+  const ID = "https://id.meshtool.ai", SELF = "https://runtime.meshtool.ai", TTL = 30 * 86400000;
+  const b64u = (b) => Buffer.from(b).toString("base64url");
+  const now = () => Math.floor(Date.now() / 1000);
+  let idKey, otherKey, n = 0, T = 0;
+  const sign = async (claims, key = idKey.privateKey) => { const p = b64u(new TextEncoder().encode(JSON.stringify(claims))); return p + "." + b64u(new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, key, new TextEncoder().encode(p)))); };
+  const notice = (over = {}, key) => { const t = now() - 10; return sign({ v: 1, iss: ID, sub: "owner", kind: "signout", iat: t, exp: t + 600, at: t, jti: "n_" + String(++n).padStart(20, "0"), ...over }, key); };
+  const pass = (over = {}) => { const t = now(); return sign({ v: 1, iss: ID, sub: "owner", aud: SELF, iat: t, exp: t + 60, jti: "p5d_" + String(++n).padStart(18, "0"), fa: t - 1, ...over }); };
+  const hop = (nt) => req("GET", "/sso/signout?" + new URLSearchParams({ notice: nt, next: "https://evil.example/" }));
+  const cookieFor = (expMs) => `cos_session=${expMs}.${hmacHex(ADMIN_KEY, `admin-session|${expMs}`)}`;
+  const tenantsWith = async (cookie) => (await req("GET", "/api/tenants", { headers: { cookie } })).status;
+  const setting = async () => Number((await dbQuery("SELECT value FROM settings WHERE key = 'owner_not_before'")).rows[0]?.value || 0);
+  const callback = (p) => req("POST", "/sso/callback", { raw: new URLSearchParams({ pass: p, return: SELF + "/status" }).toString(), headers: { "content-type": "application/x-www-form-urlencoded", origin: ID } });
+
+  beforeAll(async () => {
+    idKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    otherKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    process.env.ID_PUBLIC_KEY = (await crypto.subtle.exportKey("jwk", idKey.publicKey)).x;
+  });
+  afterAll(async () => { delete process.env.ID_PUBLIC_KEY; await dbQuery("DELETE FROM settings WHERE key = 'owner_not_before'"); });
+
+  test("NEGATIVE CONTROLS: off without ID_PUBLIC_KEY; another key's notice, a pass, an expired notice change nothing", async () => {
+    const saved = process.env.ID_PUBLIC_KEY; delete process.env.ID_PUBLIC_KEY;
+    expect((await hop(await notice())).status).toBe(404);
+    process.env.ID_PUBLIC_KEY = saved;
+    expect((await hop(await notice({}, otherKey.privateKey))).status).toBe(403);
+    expect((await hop(await pass())).status).toBe(403);
+    expect((await hop(await notice({ iat: now() - 700, exp: now() - 100, at: now() - 700 }))).status).toBe(403);
+    expect(await setting()).toBe(0);
+  });
+
+  test("a good notice: kept, this browser signed out, on to id's signed-out page (never elsewhere)", async () => {
+    const before = cookieFor(Date.now() + TTL - 120000);   // made two minutes ago
+    expect(await tenantsWith(before)).toBe(200);
+    T = now() - 10;
+    const r = await hop(await notice());
+    expect(r.status).toBe(303);
+    expect(r.headers.get("location")).toBe(ID + "/owner?out=1");
+    expect((r.headers.getSetCookie?.() || []).some((c) => /^cos_session=; .*Max-Age=0$/.test(c))).toBe(true);
+    expect(await setting()).toBe(T);
+    // and from now on that session (made before T) is no session at all
+    expect(await tenantsWith(before)).toBe(401);
+  });
+
+  test("after: new sessions and the admin key work; stale passes go back to id for a newer Face ID", async () => {
+    expect(await tenantsWith(cookieFor(Date.now() + TTL))).toBe(200);
+    expect((await admin("GET", "/api/tenants")).status).toBe(200);
+    const stale = await callback(await pass({ fa: T - 1 }));
+    const to = new URL(stale.headers.get("location"));
+    expect(stale.status).toBe(303);
+    expect(to.origin + to.pathname).toBe(ID + "/sso/pass");
+    expect(to.searchParams.get("after")).toBe(String(T));
+    expect((stale.headers.getSetCookie?.() || []).some((c) => c.startsWith("cos_session=") && !c.startsWith("cos_session=;"))).toBe(false);
+    const fresh = await callback(await pass({ fa: now() - 1 }));
+    const c = (fresh.headers.getSetCookie?.() || []).find((x) => /^cos_session=\d/.test(x));
+    expect(await tenantsWith(c.split(";")[0])).toBe(200);
+    expect(new URL((await req("GET", "/sso/start")).headers.get("location")).searchParams.get("after")).toBe(String(T));
+  });
+
+  test("NEGATIVE CONTROL: replaying an OLDER notice never moves the time back", async () => {
+    expect((await hop(await notice({ iat: T - 300, exp: T + 300, at: T - 300 }))).status).toBe(303);
+    expect(await setting()).toBe(T);
+  });
+});
+
+// ------------------------------------------------------------------------------------
 describe("6. webhooks", () => {
   test("github: good signature accepted, bad refused, replay not double-processed", async () => {
     const body = JSON.stringify({ repository: { full_name: "o/r" }, ref: "refs/heads/main", after: "abc" });

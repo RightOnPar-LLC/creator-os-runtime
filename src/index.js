@@ -21,6 +21,7 @@ import "./routes/railway-auth.js";
 import "./routes/webhooks.js";
 import "./routes/mcp.js";
 import "./routes/oauth.js";
+import "./routes/sso.js";
 import "./routes/a2a.js";
 import "./routes/cockpit.js";
 import "./routes/meta.js";
