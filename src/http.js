@@ -1,4 +1,5 @@
 // The Hono app, auth middleware (admin, grant, sync token), route inventory, source-hash state.
+import { apiReceiptMiddleware, bindToolReceipt } from "./tool-receipts.js";
 import { Hono } from "hono";
 import { env } from "./config.js";
 import { HttpError, hmacSha256, safeEqual, sha256Hex } from "./util.js";
@@ -15,6 +16,8 @@ export var sourceSha256 = "unknown";
 export var sourceBytes = 0;
 export var sourceText = "";
 export var app = new Hono();
+app.use("/api/*", apiReceiptMiddleware(() => app.routes));
+app.use("/auth/*", apiReceiptMiddleware(() => app.routes));
 export var bearerToken = (e) => {
   let t = e.req.header("authorization") || "";
   return t.startsWith("Bearer ") ? t.slice(7).trim() : e.req.header("x-grant") || void 0;
@@ -127,13 +130,17 @@ export var requireAdmin = tagAuth(async (e, t) => {
     viaCookie = sessionCookieExpiry(e);
     if (!viaCookie) throw new HttpError(401, "admin_required");
   }
+  await bindToolReceipt(e, null, true, viaCookie ? "operator_session" : "operator_key");
   await t();
   if (viaCookie) slideSession(e, viaCookie);
 }, "admin");
 export var requireGrant = (e) =>
   tagAuth(
     async (t, a) => {
-      (t.set("auth", await verifyGrant(bearerToken(t), e)), await a());
+      const auth = await verifyGrant(bearerToken(t), e);
+      t.set("auth", auth);
+      await bindToolReceipt(t, auth, true);
+      await a();
     },
     e ? `grant:${e}` : "grant",
   );

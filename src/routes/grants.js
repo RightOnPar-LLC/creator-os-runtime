@@ -1,3 +1,4 @@
+import { readToolReceipts } from "../tool-receipts.js";
 // Routes: grant-holder API: grants, cog, deploys, ledger, events, tenant. Registration order is significant.
 import { HttpError, nowSec, parseJson, withRedactedIntent } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "../db.js";
@@ -367,4 +368,11 @@ app.get("/api/hosts/:id", requireGrant(null), async (e) => {
     live: rows.slice(1).filter((g) => g.status === "active" && Number(g.exp) > now).length,
     pendingApprovals: pending,
   });
+});
+
+// Receipt readers have the same grant-subtree boundary as the monetary ledger.
+// Anonymous/authentication failures are visible only to the operator endpoint.
+app.get("/api/tool-receipts", requireGrant("ledger.read"), async (e) => {
+  const auth = e.get("auth");
+  return e.json({ receipts: await readToolReceipts(auth, 200) });
 });
