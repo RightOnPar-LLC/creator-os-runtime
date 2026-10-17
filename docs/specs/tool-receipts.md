@@ -5,7 +5,8 @@ Status: **FIRST BOUNDARY READY FOR REVIEW; overall tool routing IN PROGRESS. Not
 ## Agent handoff — start here
 
 Owner: codex:tool-receipts. Branch: feat/runtime-tool-receipts.
-Base: origin/master c947999. Follow this branch's files and the pull request;
+Pull request: https://github.com/RightOnPar-LLC/creator-os-runtime/pull/52 (draft).
+Implementation commit: 8a95e55. Base: origin/master c947999. Follow this branch's files and the pull request;
 local checkout details belong in the private shared handoff, not this public repo.
 
 | Work item | State | Evidence / what remains |
@@ -16,7 +17,7 @@ local checkout details belong in the private shared handoff, not this public rep
 | Negative controls | VERIFIED LOCALLY | Removing the boundary, forcing success and leaking siblings each cause assertion failures. |
 | Production bundle | VERIFIED LOCALLY | tools/build.mjs succeeds; built artifact suite 314 pass / 0 fail. |
 | Independent review | APPROVED FOR THIS SCOPE | Two independent reviewers approved after fixes; author ran source/artifact tests. |
-| Commit / pull request / CI | NOT YET FILED | Commit only this change after checks/review; open draft PR and link it here. |
+| Commit / pull request / CI | FILED; CI PENDING | Implementation 8a95e55; draft PR #52. Check CI before promotion. |
 | Merge / production deployment / live receipt | NOT DONE | No production code, schema, credentials or client routing changed. |
 | Market/gatehouse correlation | NOT BUILT | Reuse market settlement + existing gatehouse chain; reconcile their identities with runtime grants. |
 | Local shell/filesystem/Chrome adapters | NOT BUILT | Need runtime authorization before effects and executor-attested completion; direct calls still bypass runtime. |
@@ -24,7 +25,8 @@ local checkout details belong in the private shared handoff, not this public rep
 
 ### Where I left off / next executable step
 
-1. File this tested boundary as a pull request; update its link and CI status.
+1. Check draft PR #52 CI and agent comments. The branch is pushed; do not rebuild
+   the feature or open a duplicate PR.
 2. Check the PR checks and comments, resolve concrete findings, then merge/deploy
    under existing authority and verify an actual live grant receipt. Never mark
    the local test receipt as production evidence.
