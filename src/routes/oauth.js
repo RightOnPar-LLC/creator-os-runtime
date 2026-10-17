@@ -5,6 +5,7 @@ import { getGrant, getTenant, recordEvent, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { endedAbove, revokeGrantTree } from "../grants.js";
 import { app, readJsonBody, requireAdmin } from "../http.js";
+import { env } from "../config.js";
 import {
   effectiveCaps,
   ensureRootGrant,
@@ -88,7 +89,7 @@ app.get("/oauth/authorize", async (e) => {
       `<h1>Approve connector</h1><div class="card"><p><b>${escapeHtml(a.name)}</b> wants to act on this runtime as <code>${n.sub}</code>.</p>
 <p>It gets a <b>grant</b> (never the admin key): <code>${displayCaps.join(", ")}</code>${n.parts ? `<br>Memory only in <code>${n.parts.join(", ")}</code>` : ""}<br>Budget up to \xA2${n.usd} \xB7 ${n.calls} calls \xB7 0 deploys \xB7 no delete<br>${n === OPERATOR_PROFILE ? "Lifetime \u2264 7 days (capped by tier), then you approve again." : "Stays connected (auto-renews) until you revoke it."} Revoke anytime in Grants.</p>
 <p>Redirects to <code>${escapeHtml(new URL(t.redirect_uri).host)}</code></p></div>
-<div class="card" id="unlock" hidden><p>Unlock with the admin key — once. This browser is then signed in for 30 days; the key is not kept on the page.</p><input id="k" type="password" style="width:100%"><button id="u">Unlock</button></div>
+<div class="card" id="unlock" hidden>${env.ID_PUBLIC_KEY ? `<p><a href="/sso/start?return=${escapeHtml(encodeURIComponent(new URL(e.req.url).pathname + new URL(e.req.url).search))}">Sign in with MeshTool (Face ID)</a></p><p>Or:</p>` : ""}<p>Unlock with the admin key — once. This browser is then signed in for 30 days; the key is not kept on the page.</p><input id="k" type="password" style="width:100%"><button id="u">Unlock</button></div>
 <div class="card" id="go" hidden><label>Tenant <select id="t"></select></label><p><button id="ok">Approve</button> <button id="no">Deny</button></p><p id="msg"></p></div>
 <script>const C=${r};const $=i=>document.getElementById(i);let K=sessionStorage.getItem("cos_admin")||null;
 // Unlock trades the admin key for a signed HttpOnly session cookie (POST

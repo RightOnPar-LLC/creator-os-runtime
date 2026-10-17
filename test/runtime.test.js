@@ -480,6 +480,84 @@ describe("5b. operator session slides on use", () => {
 });
 
 // ------------------------------------------------------------------------------------
+// The owner's ONE sign-in (2026-10-16): id.meshtool.ai posts a one-time pass to
+// /sso/callback. A real Ed25519 key stands in for id's; passes are signed exactly as id
+// signs them (meshtool-frontdoor owner.mjs). Off until ID_PUBLIC_KEY is set.
+describe("5c. one sign-in: a pass from id.meshtool.ai", () => {
+  const ID = "https://id.meshtool.ai", SELF = "https://runtime.meshtool.ai";
+  const b64u = (b) => Buffer.from(b).toString("base64url");
+  let idKey, otherKey, n = 0;
+  const now = () => Math.floor(Date.now() / 1000);
+  const makePass = async (over = {}, key = idKey.privateKey) => {
+    const t = now();
+    const c = { v: 1, iss: ID, sub: "owner", aud: SELF, iat: t, exp: t + 60, jti: "rt_jti_" + String(++n).padStart(18, "0"), fa: t - 3600, ...over };
+    const p = b64u(new TextEncoder().encode(JSON.stringify(c)));
+    return p + "." + b64u(new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, key, new TextEncoder().encode(p))));
+  };
+  const callback = (pass, { origin = ID, ret = SELF + "/status" } = {}) =>
+    req("POST", "/sso/callback", { raw: new URLSearchParams({ pass, return: ret }).toString(), headers: { "content-type": "application/x-www-form-urlencoded", origin } });
+  const sessionOf = (r) => (r.headers.getSetCookie?.() || []).find((c) => c.startsWith("cos_session=")) || "";
+  const refused = (r, why = "refused") => r.status === 303 && r.headers.get("location") === `/?sso=${why}` && sessionOf(r) === "";
+
+  beforeAll(async () => {
+    idKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    otherKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  });
+  afterAll(() => { delete process.env.ID_PUBLIC_KEY; });
+
+  test("off until ID_PUBLIC_KEY is set: start is 404, a pass is refused", async () => {
+    delete process.env.ID_PUBLIC_KEY;
+    expect((await req("GET", "/sso/start")).status).toBe(404);
+    expect(refused(await callback(await makePass()), "off")).toBe(true);
+    process.env.ID_PUBLIC_KEY = (await crypto.subtle.exportKey("jwk", idKey.publicKey)).x;
+  });
+
+  test("start sends the owner to id for this runtime, coming back to the page asked for", async () => {
+    const r = await req("GET", "/sso/start?return=" + encodeURIComponent("/status?x=1"));
+    expect(r.status).toBe(302);
+    const u = new URL(r.headers.get("location"));
+    expect(u.origin + u.pathname).toBe(ID + "/sso/pass");
+    expect(u.searchParams.get("client")).toBe(SELF);
+    expect(u.searchParams.get("return")).toBe(SELF + "/status?x=1");
+    const off = new URL((await req("GET", "/sso/start?return=" + encodeURIComponent("//evil.example/x"))).headers.get("location"));
+    expect(off.searchParams.get("return")).toBe(SELF + "/");
+  });
+
+  test("a good pass becomes the operator session, and it works", async () => {
+    const r = await callback(await makePass(), { ret: SELF + "/status" });
+    expect(r.status).toBe(303);
+    expect(r.headers.get("location")).toBe("/status");
+    const c = sessionOf(r);
+    expect(c).toMatch(/; HttpOnly; Secure; SameSite=Lax; Path=\/; Max-Age=\d+$/);
+    expect((await req("GET", "/api/tenants", { headers: { cookie: c.split(";")[0] } })).status).toBe(200);
+  });
+
+  test("the session ends no later than 180 days after id's face check", async () => {
+    const fa = now() - 179 * 86400;
+    const c = sessionOf(await callback(await makePass({ fa })));
+    const exp = Number(c.match(/^cos_session=(\d+)\./)[1]);
+    expect(exp).toBeLessThanOrEqual((fa + 180 * 86400) * 1000);
+    expect(exp).toBeGreaterThan(Date.now());
+  });
+
+  test("NEGATIVE CONTROLS: replay, wrong origin, wrong site, expired, other key, edited, old face, off-site return", async () => {
+    const once = await makePass();
+    expect((await callback(once)).status).toBe(303);
+    expect(refused(await callback(once))).toBe(true);
+    expect(refused(await callback(await makePass(), { origin: "https://market.meshtool.ai" }))).toBe(true);
+    expect(refused(await callback(await makePass({ aud: "https://market.meshtool.ai" })))).toBe(true);
+    expect(refused(await callback(await makePass({ iat: now() - 120, exp: now() - 60 })))).toBe(true);
+    expect(refused(await callback(await makePass({}, otherKey.privateKey)))).toBe(true);
+    const [p, s] = (await makePass()).split(".");
+    const edited = b64u(new TextEncoder().encode(JSON.stringify({ ...JSON.parse(Buffer.from(p, "base64url").toString()), sub: "owner", fa: now() }))) + "." + s;
+    expect(refused(await callback(edited))).toBe(true);
+    expect(refused(await callback(await makePass({ fa: now() - 181 * 86400 })))).toBe(true);
+    const off = await callback(await makePass(), { ret: "https://evil.example/x" });
+    expect(off.headers.get("location")).toBe("/");
+  });
+});
+
+// ------------------------------------------------------------------------------------
 describe("6. webhooks", () => {
   test("github: good signature accepted, bad refused, replay not double-processed", async () => {
     const body = JSON.stringify({ repository: { full_name: "o/r" }, ref: "refs/heads/main", after: "abc" });
