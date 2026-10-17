@@ -310,6 +310,7 @@ describe("4. MCP", () => {
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
     expect(l.json.result.tools.map((x) => x.name)).toEqual([
+      "tool_receipts",
       "guest_welcome",
       "runtime_health", "grant_verify", "grant_issue", "grant_list", "grant_revoke", "cog_plan", "cog_execute",
       "deploy_worker", "deploy_status", "ledger_query", "memory_search", "memory_write", "memory_forget",
@@ -5262,6 +5263,10 @@ describe("22. the autonomy dial (src/autonomy.js)", () => {
     const ok = await req("POST", `/api/approvals/${d.json.approval.id}`, { token: root.token, body: { decision: "approve" } });
     expect(ok.status).toBe(200);
     expect(ok.json.status).toBe("approved_not_run"); // Railway is unarmed under test
+    const receipt = (await dbQuery("SELECT * FROM tool_receipts WHERE id = $1", [ok.headers.get("x-runtime-receipt")])).rows[0];
+    expect(receipt.outcome).toBe("not_run");
+    const waiting = (await dbQuery("SELECT * FROM tool_receipts WHERE id = $1", [d.headers.get("x-runtime-receipt")])).rows[0];
+    expect(waiting.outcome).toBe("pending_approval");
   });
 
   test("CONTROL: `observe` refuses value actions outright, and the refusal is recorded", async () => {
@@ -5695,5 +5700,207 @@ describe("26. the one events bus: outbox kind bus.publish (src/busout.js)", () =
       const [row] = await createdRow(before, t.id);
       expect([row.attempts, row.done, row.last_error, callsFor(seen, payloadOf(row).id).length]).toEqual([1, true, "bus 400", 1]);
     });
+  });
+});
+
+
+// Runtime-observed receipts: the response header correlates the invocation with
+// a persisted row. No test accepts a client assertion as execution evidence.
+describe("tool invocation receipts", () => {
+  async function receipt(response) {
+    const id = response.headers.get("x-runtime-receipt");
+    expect(id).toMatch(/^tr_/);
+    return (await dbQuery("SELECT * FROM tool_receipts WHERE id = $1", [id])).rows[0];
+  }
+  test("successful calls bind the verified grant and contain no arguments or results", async () => {
+    const t = await newTenant("receipt-success");
+    const r = await mcp(t.token, "tools/call", { name: "grant_verify", arguments: { secret: "never-save-this" } });
+    expect(r.status).toBe(200);
+    const row = await receipt(r);
+    expect(row.grant_id).toBe(t.grantId);
+    expect(row.tenant).toBe(t.id);
+    expect(row.auth_decision).toBe("authorized");
+    expect(row.authority_kind).toBe("grant");
+    expect(row.outcome).toBe("succeeded");
+    expect(row.finished_at).not.toBeNull();
+    expect(JSON.stringify(row)).not.toContain("never-save-this");
+    expect(JSON.stringify(row)).not.toContain(t.token);
+  });
+  test("HTTP 200 MCP capability denials persist as denied, not success", async () => {
+    const t = await newTenant("receipt-denied");
+    const child = await req("POST", "/api/grants", { token: t.token, body: {
+      sub: "receipt-reader", caps: ["ledger.read"], budget: { usd_cents: 0, calls: 10, deploys: 0 }, ttlSec: 300,
+    } });
+    expect(child.status).toBe(201);
+    const r = await mcp(child.json.token, "tools/call", { name: "memory_write", arguments: { partition: "x", key: "x", content: "denied" } });
+    expect(r.status).toBe(200);
+    const row = await receipt(r);
+    expect(row.grant_id).toBe(child.json.id);
+    expect(row.outcome).toBe("denied");
+    expect(row.auth_decision).toBe("denied");
+    expect(row.reason).toBe("missing_cap");
+  });
+  test("unauthenticated attempts cannot impersonate a tenant and unknown names are not stored", async () => {
+    const r = await mcp(undefined, "tools/call", { name: "sk-secret-in-name", arguments: { tenant: "forged", token: "secret" } });
+    expect(r.status).toBe(401);
+    const row = await receipt(r);
+    expect(row.tenant).toBeNull();
+    expect(row.grant_id).toBeNull();
+    expect(row.tool).toBe("authentication_rejected");
+    expect(row.record_kind).toBe("rejection_summary");
+    expect(row.outcome).toBe("denied");
+    expect(JSON.stringify(row)).not.toContain("sk-secret");
+    expect((await req("GET", "/api/admin/tool-receipts")).status).toBe(401);
+  });
+  test("readers see their subtree only; sibling and foreign-tenant receipts stay private", async () => {
+    const t = await newTenant("receipt-subtree"), other = await newTenant("receipt-other");
+    const kids = [];
+    for (const sub of ["a", "b"]) {
+      const r = await req("POST", "/api/grants", { token: t.token, body: { sub, caps: ["ledger.read"], budget: { usd_cents: 0, calls: 10, deploys: 0 }, ttlSec: 300 } });
+      expect(r.status).toBe(201); kids.push(r.json);
+    }
+    for (const token of [t.token, other.token, ...kids.map(k => k.token)])
+      await mcp(token, "tools/call", { name: "runtime_health", arguments: {} });
+    const leaf = await req("GET", "/api/tool-receipts", { token: kids[0].token });
+    expect(leaf.status).toBe(200);
+    expect(leaf.json.receipts.length).toBe(1);
+    expect(leaf.json.receipts.every(r => r.grant_id === kids[0].id)).toBe(true);
+    const root = await req("GET", "/api/tool-receipts", { token: t.token });
+    expect(root.json.receipts.length).toBe(5); // two HTTP grant issues + three MCP calls
+    expect(root.json.receipts.every(r => r.tenant === t.id)).toBe(true);
+    expect(root.json.receipts.some(r => r.grant_id === kids[1].id)).toBe(true);
+  });
+  test("failure to save the start prevents the tool side effect", async () => {
+    const t = await newTenant("receipt-start-fail");
+    await dbQuery(`CREATE FUNCTION refuse_receipt_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test receipt storage unavailable'; END $$`);
+    await dbQuery(`CREATE TRIGGER refuse_receipt_insert BEFORE INSERT ON tool_receipts FOR EACH ROW EXECUTE FUNCTION refuse_receipt_insert()`);
+    try {
+      const r = await mcp(t.token, "tools/call", { name: "grant_issue", arguments: { sub: "must-not-exist", caps: ["ledger.read"], budget: { calls: 1 }, ttlSec: 60 } });
+      expect(r.status).toBe(503);
+      expect(r.json.error).toBe("receipt_unavailable");
+      expect(r.json.executed).toBe(false);
+      expect((await dbQuery("SELECT id FROM grants WHERE parent = $1", [t.grantId])).rows.length).toBe(0);
+    } finally { await dbQuery("DROP TRIGGER refuse_receipt_insert ON tool_receipts"); await dbQuery("DROP FUNCTION refuse_receipt_insert()"); }
+  });
+  test("lost completion leaves a durable start and reports uncertainty, never safe retry", async () => {
+    const t = await newTenant("receipt-completion-fail");
+    await dbQuery(`CREATE FUNCTION refuse_receipt_finish() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.finished_at IS NOT NULL THEN RAISE EXCEPTION 'test completion unavailable'; END IF; RETURN NEW; END $$`);
+    await dbQuery(`CREATE TRIGGER refuse_receipt_finish BEFORE UPDATE ON tool_receipts FOR EACH ROW EXECUTE FUNCTION refuse_receipt_finish()`);
+    try {
+      const r = await mcp(t.token, "tools/call", { name: "runtime_health", arguments: {} });
+      expect(r.status).toBe(503);
+      expect(r.json.error).toBe("receipt_completion_unavailable");
+      expect(r.json.execution).toBe("unknown");
+      expect(r.json.retry_safe).toBe(false);
+      const row = await receipt(r);
+      expect(row.outcome).toBe("started");
+      expect(row.finished_at).toBeNull();
+      expect(row.grant_id).toBe(t.grantId);
+      expect(row.auth_decision).toBe("authorized");
+    } finally { await dbQuery("DROP TRIGGER refuse_receipt_finish ON tool_receipts"); await dbQuery("DROP FUNCTION refuse_receipt_finish()"); }
+  });
+  test("HTTP tool operations leave receipts using the route template, never raw target or query", async () => {
+    const t = await newTenant("receipt-http");
+    const r = await req("GET", `/api/grants/${t.grantId}?secret=never-save-query`, { token: t.token });
+    expect(r.status).toBe(200);
+    const row = await receipt(r);
+    expect(row.tool).toBe("GET /api/grants/:id");
+    expect(row.grant_id).toBe(t.grantId);
+    expect(row.auth_decision).toBe("authorized");
+    expect(JSON.stringify(row)).not.toContain("never-save-query");
+    const denied = await req("GET", "/api/grants/forged");
+    expect(denied.status).toBe(401);
+    expect((await receipt(denied)).outcome).toBe("denied");
+  });
+  test("HTTP 200 tool validation failures are recorded as failed", async () => {
+    const t = await newTenant("receipt-tool-failed");
+    const r = await mcp(t.token, "tools/call", { name: "memory_write", arguments: {} });
+    expect(r.status).toBe(200);
+    expect(r.json.result.isError).toBe(true);
+    expect((await receipt(r)).outcome).toBe("failed");
+  });
+  test("anonymous rejection bursts aggregate and cannot consume a legitimate caller's receipt capacity", async () => {
+    await inOneWindow(async () => {
+      const ids = new Set();
+      for (let i = 0; i < 25; i++) {
+        const r = await mcp(undefined, "tools/call", { name: "runtime_health", arguments: {} });
+        expect(r.status).toBe(401); ids.add(r.headers.get("x-runtime-receipt"));
+      }
+      expect(ids.size).toBe(1);
+      const summary = (await dbQuery("SELECT * FROM tool_receipts WHERE id = $1", [[...ids][0]])).rows[0];
+      expect(summary.record_kind).toBe("rejection_summary");
+      expect(Number(summary.attempts)).toBeGreaterThanOrEqual(25);
+      const t = await newTenant("receipt-after-burst");
+      const good = await mcp(t.token, "tools/call", { name: "runtime_health", arguments: {} });
+      expect((await receipt(good)).outcome).toBe("succeeded");
+    });
+  });
+  test("operator keys, operator sessions and public guest policy have distinct authority provenance", async () => {
+    const op = await admin("GET", "/api/admin/overview");
+    expect((await receipt(op)).authority_kind).toBe("operator_key");
+    const login = await admin("POST", "/api/admin/session");
+    const cookie = login.headers.get("set-cookie").split(";")[0];
+    const session = await req("GET", "/api/admin/overview", { headers: { cookie } });
+    expect((await receipt(session)).authority_kind).toBe("operator_session");
+    const guest = await req("POST", "/mcp", { headers: { "x-real-ip": "203.0.113.209" }, body: {
+      jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "guest_welcome", arguments: {} },
+    } });
+    expect(guest.status).toBe(200);
+    const row = await receipt(guest);
+    expect(row.authority_kind).toBe("public_guest_policy");
+    expect(row.grant_id).toBeNull();
+    expect(JSON.stringify(row)).not.toContain(cookie);
+  });
+  test("MCP receipt lookup uses the existing ledger.read permission and subtree", async () => {
+    const t = await newTenant("receipt-mcp-reader");
+    const call = await mcp(t.token, "tools/call", { name: "runtime_health", arguments: {} });
+    const read = await mcp(t.token, "tools/call", { name: "tool_receipts", arguments: { limit: 10 } });
+    expect(read.status).toBe(200);
+    expect(read.json.result.structuredContent.receipts.some(row => row.id === call.headers.get("x-runtime-receipt"))).toBe(true);
+    expect(read.json.result.structuredContent.receipts.every(row => row.tenant === t.id)).toBe(true);
+  });
+  test("implicit HEAD dispatch cannot bypass the receipt start before OAuth state insertion", async () => {
+    const t = await newTenant("receipt-head");
+    const beforeEnv = [Bun.env.RAILWAY_OAUTH_CLIENT_ID, Bun.env.RAILWAY_OAUTH_CLIENT_SECRET];
+    Bun.env.RAILWAY_OAUTH_CLIENT_ID = "test-head-client";
+    Bun.env.RAILWAY_OAUTH_CLIENT_SECRET = "test-head-secret";
+    try {
+      const good = await req("HEAD", "/auth/railway/start", { token: t.token });
+      expect(good.status).toBe(200);
+      const row = await receipt(good);
+      expect(row.tool).toBe("HEAD /auth/railway/start");
+      expect(row.grant_id).toBe(t.grantId);
+      const before = (await dbQuery("SELECT count(*)::int AS n FROM oauth_states WHERE tenant = $1", [t.id])).rows[0].n;
+      expect(before).toBe(1);
+      await dbQuery(`CREATE FUNCTION refuse_head_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test receipt start unavailable'; END $$`);
+      await dbQuery(`CREATE TRIGGER refuse_head_receipt BEFORE INSERT ON tool_receipts FOR EACH ROW EXECUTE FUNCTION refuse_head_receipt()`);
+      try {
+        const stopped = await req("HEAD", "/auth/railway/start", { token: t.token });
+        expect(stopped.status).toBe(503);
+        expect((await dbQuery("SELECT count(*)::int AS n FROM oauth_states WHERE tenant = $1", [t.id])).rows[0].n).toBe(before);
+      } finally { await dbQuery("DROP TRIGGER refuse_head_receipt ON tool_receipts"); await dbQuery("DROP FUNCTION refuse_head_receipt()"); }
+    } finally {
+      for (const [k, v] of [["RAILWAY_OAUTH_CLIENT_ID", beforeEnv[0]], ["RAILWAY_OAUTH_CLIENT_SECRET", beforeEnv[1]]]) {
+        if (v === undefined) delete Bun.env[k]; else Bun.env[k] = v;
+      }
+    }
+  });
+  test("a database statement that silently saves no receipt cannot authorize execution", async () => {
+    const t = await newTenant("receipt-silent-start");
+    await dbQuery(`CREATE FUNCTION drop_receipt_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$`);
+    await dbQuery(`CREATE TRIGGER drop_receipt_insert BEFORE INSERT ON tool_receipts FOR EACH ROW EXECUTE FUNCTION drop_receipt_insert()`);
+    try {
+      const r = await mcp(t.token, "tools/call", { name: "grant_issue", arguments: { sub: "must-not-exist", caps: ["ledger.read"], budget: { calls: 1 }, ttlSec: 60 } });
+      expect(r.status).toBe(503);
+      expect(r.json.error).toBe("receipt_unavailable");
+      expect((await dbQuery("SELECT id FROM grants WHERE parent = $1", [t.grantId])).rows.length).toBe(0);
+    } finally { await dbQuery("DROP TRIGGER drop_receipt_insert ON tool_receipts"); await dbQuery("DROP FUNCTION drop_receipt_insert()"); }
+  });
+  test("handshakes do not pretend to be tool calls", async () => {
+    const t = await newTenant("receipt-handshake");
+    const r = await mcp(t.token, "tools/list", {});
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-runtime-receipt")).toBeNull();
+    expect((await dbQuery("SELECT id FROM tool_receipts WHERE grant_id = $1", [t.grantId])).rows.length).toBe(0);
   });
 });

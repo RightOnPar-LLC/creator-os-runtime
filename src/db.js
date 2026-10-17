@@ -43,6 +43,15 @@ CREATE TABLE IF NOT EXISTS webhook_events (
   UNIQUE(source, event_id));
 CREATE TABLE IF NOT EXISTS events (
   id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT now(), tenant TEXT, type TEXT NOT NULL, actor TEXT, data JSONB);
+-- Tool invocation receipts are separate from monetary settlement rows. Arguments,
+-- results, tokens, paths and client-supplied identities are never stored here.
+CREATE TABLE IF NOT EXISTS tool_receipts (
+  id TEXT PRIMARY KEY, started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ,
+  tenant TEXT, grant_id TEXT, tool TEXT NOT NULL,
+  authority_kind TEXT NOT NULL DEFAULT 'unverified', record_kind TEXT NOT NULL DEFAULT 'invocation', attempts BIGINT NOT NULL DEFAULT 1,
+  auth_decision TEXT NOT NULL DEFAULT 'unverified', outcome TEXT NOT NULL DEFAULT 'started',
+  http_status INT, reason TEXT);
+CREATE INDEX IF NOT EXISTS tool_receipts_grant_started ON tool_receipts(grant_id, started_at DESC);
 CREATE TABLE IF NOT EXISTS vault (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, provider TEXT NOT NULL, ciphertext TEXT NOT NULL, iv TEXT NOT NULL,
   tag TEXT NOT NULL, meta JSONB, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(tenant, provider));
