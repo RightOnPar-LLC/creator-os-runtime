@@ -361,3 +361,6 @@ app.get("/api/admin/events", requireAdmin, async (e) =>
     events: await sql`SELECT * FROM events ORDER BY id DESC LIMIT 300`,
   }),
 );
+
+app.get("/api/admin/tool-receipts", requireAdmin, async (e) =>
+  e.json({ receipts: await sql`SELECT * FROM tool_receipts ORDER BY started_at DESC, id DESC LIMIT 200` }));
