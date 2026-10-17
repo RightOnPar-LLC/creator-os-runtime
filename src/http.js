@@ -69,8 +69,12 @@ export var signSession = (expMs) =>
 // front of requireAdmin, so a malformed cookie must read as "no session", not
 // as a 500 that locks the operator out of their own cockpit.
 export function verifySessionCookie(e) {
+  return sessionCookieExpiry(e) > 0;
+}
+// The expiry (ms) of a valid session cookie on this request, or 0 for none.
+export function sessionCookieExpiry(e) {
   try {
-    if (!env.RUNTIME_ADMIN_KEY) return !1;
+    if (!env.RUNTIME_ADMIN_KEY) return 0;
     let t = e.req.header("cookie") || "";
     if (!t) return !1;
     let a;
@@ -86,10 +90,32 @@ export function verifySessionCookie(e) {
       o = a.slice(n + 1);
     if (!/^[0-9]{1,15}$/.test(i)) return !1;
     let l = Number(i);
-    if (!Number.isSafeInteger(l) || l <= Date.now()) return !1;
-    return safeEqual(o, hmacSha256(env.RUNTIME_ADMIN_KEY, `${SESSION_CONTEXT}${i}`));
+    if (!Number.isSafeInteger(l) || l <= Date.now()) return 0;
+    return safeEqual(o, hmacSha256(env.RUNTIME_ADMIN_KEY, `${SESSION_CONTEXT}${i}`)) ? l : 0;
   } catch {
-    return !1;
+    return 0;
+  }
+}
+// The session SLIDES (DW, 2026-10-16: signed in "24/7 ... not have to chase
+// down a code everytime"). It used to end SESSION_TTL_SEC after the key was
+// pasted, however often it was used. Now an admin request that rode on the
+// cookie gets it re-signed to SESSION_TTL_SEC from now, at most once a day, so
+// an operator who comes back within 30 days never pastes the key again; one
+// idle for 30 days still lapses. Rotating RUNTIME_ADMIN_KEY still ends every
+// session at once. Never on a response that already sets the cookie (minting,
+// sign-out), and never on a request authenticated by the key itself.
+export var SESSION_TTL_SEC = 30 * 24 * 60 * 60;
+var RENEW_EVERY_MS = 24 * 60 * 60 * 1000;
+export var sessionCookie = (t, maxAge) =>
+  `${SESSION_COOKIE}=${t}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
+function slideSession(e, expMs) {
+  try {
+    let next = Date.now() + SESSION_TTL_SEC * 1000;
+    if (next - expMs < RENEW_EVERY_MS) return;
+    if (/(?:^|,\s*)cos_session=/.test(e.res.headers.get("set-cookie") || "")) return;
+    e.res.headers.append("set-cookie", sessionCookie(signSession(next), SESSION_TTL_SEC));
+  } catch {
+    // immutable headers: the current, still-valid session stays as it is
   }
 }
 export var requireAdmin = tagAuth(async (e, t) => {
@@ -99,9 +125,14 @@ export var requireAdmin = tagAuth(async (e, t) => {
     });
   // Either channel: the master key in Authorization (unchanged, and still the
   // only way to MINT a session), or a session cookie this runtime signed.
-  if (!isAdminRequest(e) && !verifySessionCookie(e)) throw new HttpError(401, "admin_required");
-  await bindToolReceipt(e, null, true, isAdminRequest(e) ? "operator_key" : "operator_session");
+  let viaCookie = 0;
+  if (!isAdminRequest(e)) {
+    viaCookie = sessionCookieExpiry(e);
+    if (!viaCookie) throw new HttpError(401, "admin_required");
+  }
+  await bindToolReceipt(e, null, true, viaCookie ? "operator_session" : "operator_key");
   await t();
+  if (viaCookie) slideSession(e, viaCookie);
 }, "admin");
 export var requireGrant = (e) =>
   tagAuth(
