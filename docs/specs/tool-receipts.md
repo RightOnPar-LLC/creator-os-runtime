@@ -1,6 +1,65 @@
 # Runtime tool receipts — first coverage boundary
 
-Status: **FIRST BOUNDARY READY FOR REVIEW; overall tool routing IN PROGRESS. Not merged or deployed.**
+Status: **FIRST BOUNDARY LIVE AND OPERATOR READ-BACK VERIFIED; overall tool routing IN PROGRESS.**
+
+## Current checkpoint — 2026-10-17, codex
+
+PR #52 merged as `bf91893dde7694efa6ea35cfb82bf9cca97d3e66` after the source and
+artifact suites (314/0 each), three negative controls, two independent source
+reviews, and both PR GitHub checks passed. The merged commit's `test` check also
+passed. Railway deployment `caaed56c-ca4a-413b-81b3-fcf436ba93f7` succeeded from
+that commit. Live health returned 200 with database healthy and source SHA-256
+`780dac1bde9ba81e73e5379c2bdee8ded5bd7cf6772a9fafb547df942655f817`.
+
+Live authenticated receipt lookup is **VERIFIED FOR AN OPERATOR READ**. The local
+operator key initially returned 401; automatic review blocked service-secret
+retrieval. The owner then explicitly approved one read-only check using the
+existing service key in memory only. That check passed at 02:27:43 UTC:
+`GET /api/tenants` returned 200 and receipt `tr_NDHP8qRAgDvP`; the operator-only
+lookup returned the persisted row with `authority_kind=operator_key`,
+`auth_decision=authorized`, `outcome=succeeded`, and both timestamps populated.
+An unauthenticated MCP read was denied with receipt header
+`tr_rejected_29870066`. No credentials were created, changed, persisted or exposed.
+This is operator proof only; a real agent-grant test is still required. The
+one-time approval does not authorize recurring service-secret retrieval.
+
+Owner: codex:receipt-live-verification. Destination: existing runtime service,
+then the existing Desk. Next: claim and implement the external adapter contract
+below using verified existing caller authority; prove a real agent-grant call
+before rerouting clients. The earlier review-stage snapshot below is historical and superseded
+by this checkpoint.
+
+## Where this comes together
+
+Use the existing Desk as the presentation surface; do not create another console.
+The runtime owns authority and invocation records. Gatehouse remains the adapter
+for external MCP tools. MeshMarket retains payment/settlement records. Shared
+handoffs, claims and owning status documents retain work state and next steps.
+
+Before connecting an external tool, implement this contract:
+
+1. Verify the actual caller and tool scope; never turn a gatehouse token or an
+   operator key into a runtime caller grant by assumption.
+2. Commit a runtime authorization/start record before the adapter forwards the
+   call. Runtime or receipt storage unavailable means no forwarding.
+3. Correlate the runtime invocation ID with the adapter receipt and, when present,
+   the existing market delivery/settlement receipt. Do not duplicate a debit.
+4. Record adapter-reported completion as executor-attested. A lost response stays
+   unknown; do not automatically replay a mutation.
+5. Show the linked records and actual coverage in the Desk. Keep credentials and
+   raw tool arguments/results out of that display and the invocation record.
+
+Adapter states: Gatehouse correlation **NOT BUILT**; local shell/filesystem/Chrome
+executor **NOT BUILT**; unified Desk view **NOT BUILT**. Claim one step at a time.
+Acceptance controls before client rerouting: allowed call, denied call with zero
+upstream executions, unavailable runtime with zero executions, and lost completion
+with unknown status and no automatic retry. Existing direct calls still bypass
+this planned adapter boundary.
+
+Automatic pickup: all five local agent instruction surfaces pass the handoff
+rule check; exact-project selection controls and an actual shared-brain read
+pass. Fresh-session hook invocation/trust and fleet-wide delivery are still
+**UNVERIFIED**. Startup context is not an unattended worker.
 
 ## Agent handoff — start here
 

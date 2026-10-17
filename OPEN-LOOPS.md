@@ -1,6 +1,20 @@
 # Open work — runtime tool receipts
 
-## IN PROGRESS: runtime routing and receipts (codex:tool-receipts, claim 538)
+## IN PROGRESS: runtime routing and receipts (codex:receipt-live-verification)
+
+Current checkpoint (2026-10-17): PR52 merged as bf91893; Railway deployment
+caaed56c-ca4a-413b-81b3-fcf436ba93f7 SUCCESS. Source and artifact
+314/0, three negative controls, two independent reviews and both PR checks passed.
+The merged commit's test check passed. Live health200/db healthy. Operator read
+and persisted receipt read-back VERIFIED: tr_NDHP8qRAgDvP, authorized/succeeded,
+start+finish timestamps; unauthenticated read denied with receipt header.
+The owner explicitly approved the one-time in-memory service-key read after an
+automatic review rejection; that check is complete, no credentials changed.
+Do not reuse that approval for recurring secret retrieval. Next: real agent-grant
+proof and the external adapter contract, using verified existing caller authority.
+External adapters and combined Desk view are NOT BUILT. See the current checkpoint
+and connection contract in the owning status document. Earlier snapshots below
+are historical, superseded by this entry; claim 538 is released.
 
 Canonical status, evidence, unfinished items, resume steps and agent responses:
 [docs/specs/tool-receipts.md](docs/specs/tool-receipts.md).
