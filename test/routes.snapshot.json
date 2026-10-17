@@ -1,5 +1,5 @@
 {
-  "count": 176,
+  "count": 178,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -166,6 +166,8 @@
     "POST /oauth/approve",
     "POST /oauth/approve",
     "POST /oauth/token",
+    "GET /sso/start",
+    "POST /sso/callback",
     "GET /.well-known/agent.json",
     "GET /",
     "GET /cockpit/:page",
@@ -269,6 +271,8 @@
     "GET /oauth/authorize :: public(consent page)",
     "POST /oauth/approve :: admin",
     "POST /oauth/token :: public(pkce/refresh)",
+    "GET /sso/start :: public",
+    "POST /sso/callback :: public",
     "GET /.well-known/agent.json :: public",
     "GET / :: public",
     "GET /cockpit/:page :: public(page)+admin(data)",
