@@ -422,6 +422,64 @@ describe("5. admin fail-closed + kill switch", () => {
 });
 
 // ------------------------------------------------------------------------------------
+// The operator session slides (2026-10-16): a cookie used within its 30 days is
+// re-signed to 30 days from now (at most once a day), so the admin key is pasted
+// once, not once a month. Cookies are signed here exactly as the runtime signs
+// them, with chosen expiries, so no clock has to be faked.
+describe("5b. operator session slides on use", () => {
+  const DAY = 86400000;
+  const TTL = 30 * DAY;
+  const cookieFor = (expMs, key = ADMIN_KEY) => `cos_session=${expMs}.${hmacHex(key, `admin-session|${expMs}`)}`;
+  const sessionOf = (r) => (r.headers.getSetCookie?.() || [r.headers.get("set-cookie") || ""]).find((c) => c.startsWith("cos_session=")) || "";
+  const expOf = (c) => Number((c.match(/^cos_session=(\d+)\./) || [])[1] || 0);
+
+  test("a cookie with days left is renewed to 30 days from now, same flags", async () => {
+    const before = Date.now();
+    const r = await req("GET", "/api/tenants", { headers: { cookie: cookieFor(before + 10 * DAY) } });
+    expect(r.status).toBe(200);
+    const c = sessionOf(r);
+    expect(expOf(c)).toBeGreaterThanOrEqual(before + TTL);
+    expect(expOf(c)).toBeLessThanOrEqual(Date.now() + TTL);
+    expect(c).toMatch(/; HttpOnly; Secure; SameSite=Lax; Path=\/; Max-Age=2592000$/);
+    // and the renewed cookie is itself a working session
+    const again = await req("GET", "/api/tenants", { headers: { cookie: c.split(";")[0] } });
+    expect(again.status).toBe(200);
+  });
+
+  test("renewed at most once a day: a cookie minted moments ago is not re-signed", async () => {
+    const r = await req("GET", "/api/tenants", { headers: { cookie: cookieFor(Date.now() + TTL - 60000) } });
+    expect(r.status).toBe(200);
+    expect(sessionOf(r)).toBe("");
+  });
+
+  test("NEGATIVE CONTROL: an expired cookie is refused and not revived", async () => {
+    const r = await req("GET", "/api/tenants", { headers: { cookie: cookieFor(Date.now() - 1000) } });
+    expect(r.status).toBe(401);
+    expect(sessionOf(r)).toBe("");
+  });
+
+  test("NEGATIVE CONTROL: a cookie signed with another key is refused and not renewed", async () => {
+    const r = await req("GET", "/api/tenants", { headers: { cookie: cookieFor(Date.now() + 10 * DAY, ADMIN_KEY + "-not-the-key") } });
+    expect(r.status).toBe(401);
+    expect(sessionOf(r)).toBe("");
+  });
+
+  test("the admin key itself gets no cookie (only a session slides)", async () => {
+    const r = await admin("GET", "/api/tenants");
+    expect(r.status).toBe(200);
+    expect(sessionOf(r)).toBe("");
+  });
+
+  test("sign-out is not undone by a renewal on the same response", async () => {
+    const r = await req("DELETE", "/api/admin/session", { headers: { cookie: cookieFor(Date.now() + 10 * DAY) } });
+    expect(r.status).toBe(200);
+    const all = r.headers.getSetCookie?.() || [r.headers.get("set-cookie") || ""];
+    expect(all.filter((c) => c.startsWith("cos_session=")).length).toBe(1);
+    expect(sessionOf(r)).toMatch(/^cos_session=; .*Max-Age=0$/);
+  });
+});
+
+// ------------------------------------------------------------------------------------
 describe("6. webhooks", () => {
   test("github: good signature accepted, bad refused, replay not double-processed", async () => {
     const body = JSON.stringify({ repository: { full_name: "o/r" }, ref: "refs/heads/main", after: "abc" });

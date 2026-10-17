@@ -8,7 +8,7 @@ import { endedAbove, grantsLeftUnderEnded, mintRootGrant, reapExpiredGrants, rev
 import { readGuestPool, guestPoolStatus } from "../guest.js";
 import { notATourReason, sweepTours } from "../tours.js";
 import { TEMPLATES } from "../railway.js";
-import { app, readJsonBody, requireAdmin, SESSION_COOKIE, signSession } from "../http.js";
+import { app, readJsonBody, requireAdmin, SESSION_TTL_SEC, sessionCookie, signSession } from "../http.js";
 
 // The operator session (0.3.5). Mint: present the admin key once (requireAdmin,
 // and minting deliberately accepts the cookie channel too, so a live session can
@@ -21,9 +21,8 @@ import { app, readJsonBody, requireAdmin, SESSION_COOKIE, signSession } from "..
 // clear and no cookie that can outlive its key. The TTL is inside the signature
 // (see signSession in ../http.js), so the holder cannot extend it. Nothing is
 // persisted; this route adds no table and does not touch the grant engine.
-var SESSION_TTL_SEC = 30 * 24 * 60 * 60;
-var sessionCookie = (t, maxAge) =>
-  `${SESSION_COOKIE}=${t}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
+// SESSION_TTL_SEC and sessionCookie live in ../http.js, which also slides the
+// session on use (requireAdmin).
 app.post("/api/admin/session", requireAdmin, (e) => {
   let expMs = Date.now() + SESSION_TTL_SEC * 1000;
   return (
