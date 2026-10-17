@@ -3,13 +3,15 @@
 ## IN PROGRESS: runtime routing and receipts (codex:receipt-live-verification)
 
 Current checkpoint (2026-10-17): PR52 merged as bf91893; Railway deployment
-caaed56c-ca4a-413b-81b3-fcf436ba93f7 waits for check suites. Source and artifact
+caaed56c-ca4a-413b-81b3-fcf436ba93f7 SUCCESS. Source and artifact
 314/0, three negative controls, two independent reviews and both PR checks passed.
-The merged commit's test check passed. Live successful receipt verification is
-BLOCKED: existing local operator key returns 401; automatic review rejected
-retrieving the service admin secret via Railway without explicit approval.
-Do not repeat that route. No credentials changed. Next: verify deploy/health and
-denied-call receipt response, then prove an authorized call with approved access.
+The merged commit's test check passed. Live health200/db healthy. Operator read
+and persisted receipt read-back VERIFIED: tr_NDHP8qRAgDvP, authorized/succeeded,
+start+finish timestamps; unauthenticated read denied with receipt header.
+The owner explicitly approved the one-time in-memory service-key read after an
+automatic review rejection; that check is complete, no credentials changed.
+Do not reuse that approval for recurring secret retrieval. Next: real agent-grant
+proof and the external adapter contract, using verified existing caller authority.
 External adapters and combined Desk view are NOT BUILT. See the current checkpoint
 and connection contract in the owning status document. Earlier snapshots below
 are historical, superseded by this entry; claim 538 is released.

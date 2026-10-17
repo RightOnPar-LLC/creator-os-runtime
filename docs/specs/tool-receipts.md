@@ -1,26 +1,32 @@
 # Runtime tool receipts — first coverage boundary
 
-Status: **FIRST BOUNDARY MERGED; production deployment pending verification; overall tool routing IN PROGRESS.**
+Status: **FIRST BOUNDARY LIVE AND OPERATOR READ-BACK VERIFIED; overall tool routing IN PROGRESS.**
 
 ## Current checkpoint — 2026-10-17, codex
 
 PR #52 merged as `bf91893dde7694efa6ea35cfb82bf9cca97d3e66` after the source and
 artifact suites (314/0 each), three negative controls, two independent source
 reviews, and both PR GitHub checks passed. The merged commit's `test` check also
-passed. Railway deployment `caaed56c-ca4a-413b-81b3-fcf436ba93f7` was created from
-that commit and is waiting for check suites. Do not redeploy the previous build.
+passed. Railway deployment `caaed56c-ca4a-413b-81b3-fcf436ba93f7` succeeded from
+that commit. Live health returned 200 with database healthy and source SHA-256
+`780dac1bde9ba81e73e5379c2bdee8ded5bd7cf6772a9fafb547df942655f817`.
 
-Live authenticated receipt lookup is **BLOCKED**: the existing local operator
-credential returned 401. Automatic approval review rejected retrieving the
-service admin secret through Railway after that failure as beyond authorized
-read-only verification. Do not bypass or retry that retrieval without explicit
-owner approval. No credential was created, changed or exposed. An operator test
-would prove operator coverage only; a real agent-grant test is still required.
+Live authenticated receipt lookup is **VERIFIED FOR AN OPERATOR READ**. The local
+operator key initially returned 401; automatic review blocked service-secret
+retrieval. The owner then explicitly approved one read-only check using the
+existing service key in memory only. That check passed at 02:27:43 UTC:
+`GET /api/tenants` returned 200 and receipt `tr_NDHP8qRAgDvP`; the operator-only
+lookup returned the persisted row with `authority_kind=operator_key`,
+`auth_decision=authorized`, `outcome=succeeded`, and both timestamps populated.
+An unauthenticated MCP read was denied with receipt header
+`tr_rejected_29870066`. No credentials were created, changed, persisted or exposed.
+This is operator proof only; a real agent-grant test is still required. The
+one-time approval does not authorize recurring service-secret retrieval.
 
 Owner: codex:receipt-live-verification. Destination: existing runtime service,
-then the existing Desk. Next: verify the deployed commit, health and denied-call
-receipt response; with approved existing caller access, read back a successful
-receipt. The earlier review-stage snapshot below is historical and superseded
+then the existing Desk. Next: claim and implement the external adapter contract
+below using verified existing caller authority; prove a real agent-grant call
+before rerouting clients. The earlier review-stage snapshot below is historical and superseded
 by this checkpoint.
 
 ## Where this comes together
