@@ -3096,6 +3096,17 @@ describe("12. creator-worker deploy guard", () => {
 });
 
 describe("12. guest-welcome (Phase 1)", () => {
+  test("GUEST_DOOR=closed refuses new guests on both doors; reopening works", async () => {
+    process.env.GUEST_DOOR = "closed";
+    try {
+      const r = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.77.1" }, body: { agent_name: "Locked" } });
+      expect(r.status).toBe(403);
+      expect(JSON.stringify(r.json)).toContain("guest_door_closed");
+    } finally { delete process.env.GUEST_DOOR; }
+    const open = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.77.2" }, body: { agent_name: "Open" } });
+    expect(open.status).toBe(201);
+  });
+
   test("POST /api/guest issues a working grant + welcome package in one keyless call", async () => {
     const r = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.1.1" }, body: { agent_name: "Wanderer" } });
     expect(r.status).toBe(201);
