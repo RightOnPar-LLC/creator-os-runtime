@@ -2623,6 +2623,62 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
     expect(g).toEqual({ ok: true, reasons: [] });
   });
 
+  // The Z-13's Ollama is a physical box that sleeps and reboots. A planner with no
+  // deadline hung with it; it must fall back to the deterministic plan and say why.
+  describe("cog plan when Ollama is slow, dead or answering", () => {
+    const OLLAMA = "http://z13-ollama.test:11435";
+    const seen = [];
+    let answer;   // (signal, body) => Promise<Response>
+    const outer = globalThis.fetch;
+    const withOllama = async (fn) => {
+      process.env.OLLAMA_URL = OLLAMA;
+      process.env.COG_LLM_TIMEOUT_MS = "300";
+      globalThis.fetch = async (input, init) => {
+        const url = typeof input === "string" ? input : input.url ?? String(input);
+        if (!url.startsWith(OLLAMA)) return outer(input, init);
+        seen.push(JSON.parse(init.body));
+        return answer(init.signal);
+      };
+      try { return await fn(); } finally {
+        globalThis.fetch = outer;
+        delete process.env.OLLAMA_URL;
+        delete process.env.COG_LLM_TIMEOUT_MS;
+      }
+    };
+    const plan = (t) => req("POST", "/api/cog/plan", { token: t.token, body: { intent: "send tip alerts to discord" } });
+
+    test("a hung Ollama: the deterministic plan answers within the deadline and says timeout", async () => {
+      const t = await newTenant("cog-hung");
+      answer = (signal) => new Promise((_, no) => signal.addEventListener("abort", () => no(signal.reason)));
+      const t0 = Date.now();
+      const p = await withOllama(() => plan(t));
+      expect(p.status).toBe(200);
+      expect(Date.now() - t0).toBeLessThan(5000);
+      expect(p.json.proposal.planner).toBe("deterministic");
+      expect(p.json.proposal.template).toBe("tip-alert-bot");
+      expect(p.json.proposal.warnings).toContain("planner_fallback:timeout");
+    });
+
+    test("a refused connection: deterministic plan, says error", async () => {
+      const t = await newTenant("cog-dead");
+      answer = async () => { throw new TypeError("fetch failed"); };
+      const p = await withOllama(() => plan(t));
+      expect(p.json.proposal.planner).toBe("deterministic");
+      expect(p.json.proposal.warnings).toContain("planner_fallback:error");
+    });
+
+    test("a live Ollama: the model's choice is used, keep_alive pins it, no fallback warning", async () => {
+      const t = await newTenant("cog-live");
+      seen.length = 0;
+      answer = async () => new Response(JSON.stringify({ message: { content: '{"template":"tip-alert-bot","env":{},"why":"tips"}' } }));
+      const p = await withOllama(() => plan(t));
+      expect(p.json.proposal.planner).toBe("llm+deterministic");
+      expect(p.json.proposal.warnings.some((w) => w.startsWith("planner_fallback"))).toBe(false);
+      expect(seen[0].keep_alive).toBe("30m");
+    });
+
+  });
+
   test("docs: admin PUT, public GET, underscore docs hidden", async () => {
     expect((await req("PUT", "/api/admin/docs/guide", { raw: "# Hi" })).status).toBe(401);
     expect((await admin("PUT", "/api/admin/docs/guide", { raw: "# Hi\n\n`code`" })).json).toEqual({ ok: true, name: "guide", bytes: 12 });

@@ -144,8 +144,15 @@ async function planWithLlm(e, t, a, n, r) {
             headers: {
               "content-type": "application/json",
             },
+            // The Z-13 is a physical box: it sleeps, reboots, drops off the tailnet.
+            // Without a deadline a dead Ollama hung the plan request with it; now the
+            // planner gives up after cogLlmTimeoutMs() and the deterministic plan
+            // answers instead. keep_alive pins the model between plans so a warm
+            // planner doesn't pay a cold load every time.
+            signal: AbortSignal.timeout(cogLlmTimeoutMs()),
             body: JSON.stringify({
               model: env.COG_MODEL || "gpt-oss:120b",
+              keep_alive: env.COG_KEEP_ALIVE || "30m",
               stream: false,
               messages: [
                 {
@@ -182,9 +189,18 @@ Evidence (prior memory): ${JSON.stringify(r.evidence.map((l) => l.snippet))}`,
       r,
     );
     return ((o.planner = "llm+deterministic"), (o.rationale = `${i.why || ""} \u2014 ${o.rationale}`), o);
-  } catch {
-    return null;
+  } catch (l) {
+    // Say WHY the deterministic plan answered, so a slow or dead Ollama shows up in
+    // the proposal instead of passing silently.
+    return { fallback: l?.name === "TimeoutError" || l?.name === "AbortError" ? "timeout" : "error" };
   }
+}
+// How long the planner waits for Ollama before falling back. A cold gpt-oss:120b
+// load measured ~2 minutes on the Z-13, so the default leaves room for a warm
+// answer, not a cold one; keep_alive is what keeps it warm.
+export function cogLlmTimeoutMs() {
+  let e = Number(env.COG_LLM_TIMEOUT_MS);
+  return e > 0 ? Math.min(Math.floor(e), 240000) : 60000;
 }
 export async function cogPlan(e, t, a) {
   let n = await gatherPlanEvidence(
@@ -193,7 +209,9 @@ export async function cogPlan(e, t, a) {
       a.template && TEMPLATES[a.template] ? a.template : guessTemplateFromIntent(t),
       e.row,
     ),
-    r = (await planWithLlm(e.tenant, e.row, t, a, n)) || buildDeterministicPlan(e.tenant, e.row, t, a, n);
+    m = await planWithLlm(e.tenant, e.row, t, a, n),
+    r = m && !m.fallback ? m : buildDeterministicPlan(e.tenant, e.row, t, a, n);
+  if (m?.fallback) r.warnings = [...(r.warnings || []), `planner_fallback:${m.fallback}`];
   return (
     await recordEvent(
       "cog.planned",
