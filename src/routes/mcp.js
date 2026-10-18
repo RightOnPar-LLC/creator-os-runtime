@@ -14,8 +14,21 @@ import { jsonRpcResponse, MCP_TOOLS } from "../mcp.js";
 import { publicBaseUrl } from "../oauth.js";
 import { issueGuestGrantGuarded, welcomePackage } from "../guest.js";
 
+// Protocol versions this server really speaks. initialize used to echo WHATEVER the
+// client asked for, so a client asking for 2026-07-28 was told "yes" and then spoke
+// the stateless revision (server/discover first) to a server that doesn't implement
+// it -> method_not_found -> "no MCP server found at this URL". The spec rule: echo a
+// version we support, otherwise answer with our latest and let the client decide.
+export const MCP_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+export const negotiateVersion = (v) => (MCP_VERSIONS.includes(v) ? v : MCP_VERSIONS[0]);
 app.get("/mcp", (e) =>
-  e.json({
+  // A streamable-HTTP client GETs /mcp asking for an SSE stream. We offer none, and
+  // the spec answer is 405; a 200 JSON page here reads to strict clients as "this
+  // is not an MCP server". Browsers and curl (no event-stream Accept) still get the
+  // description below.
+  /text\/event-stream/i.test(e.req.header("accept") || "")
+    ? e.body(null, 405, { Allow: "POST" })
+    : e.json({
     transport: "streamable-http",
     methods: ["initialize", "tools/list", "tools/call", "ping"],
     tools: MCP_TOOLS.map((t) => t.name),
@@ -84,7 +97,7 @@ app.post("/mcp", async (e) => {
   if (n.method === "initialize")
     return e.json(
       jsonRpcResponse(r, {
-        protocolVersion: n.params?.protocolVersion || "2025-06-18",
+        protocolVersion: negotiateVersion(n.params?.protocolVersion),
         capabilities: {
           tools: {},
         },

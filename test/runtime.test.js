@@ -321,6 +321,27 @@ describe("4. MCP", () => {
     expect(n.status).toBe(202);
   });
 
+  test("initialize never claims a protocol version it does not speak", async () => {
+    // A 2026-07-28 client told "yes, 2026-07-28" calls server/discover next, gets
+    // method_not_found, and the connector reports "no MCP server found".
+    for (const [asked, told] of [["2025-06-18", "2025-06-18"], ["2025-03-26", "2025-03-26"], ["2024-11-05", "2024-11-05"],
+      ["2025-11-25", "2025-06-18"], ["2026-07-28", "2025-06-18"], [undefined, "2025-06-18"], ["garbage", "2025-06-18"]]) {
+      const i = await mcp(t.token, "initialize", asked === undefined ? {} : { protocolVersion: asked });
+      expect([asked, i.json.result.protocolVersion]).toEqual([asked, told]);
+    }
+  });
+
+  test("GET /mcp asking for an SSE stream gets 405 (no stream offered); a plain GET still describes", async () => {
+    const s = await req("GET", "/mcp", { headers: { accept: "text/event-stream" } });
+    expect(s.status).toBe(405);
+    expect(s.headers.get("allow")).toBe("POST");
+    const both = await req("GET", "/mcp", { headers: { accept: "application/json, text/event-stream" } });
+    expect(both.status).toBe(405);
+    const plain = await req("GET", "/mcp", { headers: { accept: "application/json" } });
+    expect(plain.status).toBe(200);
+    expect(plain.json.transport).toBe("streamable-http");
+  });
+
   test("memory write then search round-trip with a grant", async () => {
     const w = await mcp(t.token, "tools/call", { name: "memory_write", arguments: { partition: "notes", key: "k1", content: "the orchid blooms at dawn", tags: ["a"] } });
     expect(w.status).toBe(200);
