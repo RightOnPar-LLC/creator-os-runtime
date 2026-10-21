@@ -693,6 +693,67 @@ describe("6. webhooks", () => {
     expect(sameId.json).toEqual({ received: true, replay: true });
   });
 
+  test("github: PR, review, CI events become compact receipts, filed under GITHUB_EVENTS_TENANT", async () => {
+    const owner = await newTenant("github-owner");
+    const send = (event, payload, delivery) => {
+      const body = JSON.stringify(payload);
+      return req("POST", "/webhooks/github", {
+        raw: body,
+        headers: { "content-type": "application/json", "x-github-event": event, "x-github-delivery": delivery, "x-hub-signature-256": "sha256=" + hmacHex(GITHUB_SECRET, body) },
+      });
+    };
+    const repo = { full_name: "RightOnPar-LLC/park" };
+    const SECRET_LOOKING = "ghp_" + "x".repeat(36);
+    const saved = process.env.GITHUB_EVENTS_TENANT;
+    process.env.GITHUB_EVENTS_TENANT = owner.id;
+    try {
+      // A merged PR: the receipt says who, which PR, and that it merged; the body never travels.
+      expect((await send("pull_request", {
+        action: "closed", repository: repo, sender: { login: "Flanny8080" },
+        pull_request: { number: 41, title: "PARK Phase 16", state: "closed", merged: true, draft: false, user: { login: "Flanny8080" },
+          base: { ref: "main" }, head: { ref: "optimization/rust-fillet-chamfer", sha: "896e3cc" }, html_url: "https://github.com/RightOnPar-LLC/park/pull/41",
+          body: "pasted by mistake: " + SECRET_LOOKING },
+      }, "gh-pr-1")).json).toEqual({ received: true });
+      // A comment: author and link, never the text.
+      await send("issue_comment", {
+        action: "created", repository: repo, sender: { login: "Flanny8080" },
+        issue: { number: 42, pull_request: {} }, comment: { user: { login: "Flanny8080" }, body: "answer: " + SECRET_LOOKING, html_url: "https://github.com/x#c1" },
+      }, "gh-c-1");
+      // CI: a passing check_run is noise (no event); a failed one and a completed workflow_run are receipts.
+      const pass = await send("check_run", { action: "completed", repository: repo, check_run: { name: "eslint", conclusion: "success", head_sha: "a1", pull_requests: [{ number: 42 }] } }, "gh-cr-ok");
+      expect(pass.json).toEqual({ received: true, skipped: true });
+      await send("check_run", { action: "completed", repository: repo, check_run: { name: "node --test (Node 18)", conclusion: "failure", head_sha: "a1", pull_requests: [{ number: 42 }], html_url: "https://github.com/x/job/1" } }, "gh-cr-bad");
+      await send("workflow_run", { action: "in_progress", repository: repo, workflow_run: { name: "test", head_sha: "a1" } }, "gh-wr-run");
+      await send("workflow_run", { action: "completed", repository: repo, workflow_run: { name: "test", conclusion: "success", head_sha: "a1", head_branch: "claude/x", pull_requests: [{ number: 42 }], html_url: "https://github.com/x/run/1" } }, "gh-wr-done");
+
+      const seen = (await req("GET", "/api/events", { token: owner.token })).json.events.filter((e) => e.actor === "github");
+      const byType = (t) => seen.filter((e) => e.type === t);
+      expect(byType("repo.pull_request").length).toBe(1);
+      expect(byType("repo.pull_request")[0].data).toMatchObject({ repo: "RightOnPar-LLC/park", action: "closed", number: 41, merged: true, title: "PARK Phase 16", author: "Flanny8080", url: "https://github.com/RightOnPar-LLC/park/pull/41" });
+      expect(byType("repo.issue_comment")[0].data).toMatchObject({ number: 42, on: "pull_request", author: "Flanny8080", chars: ("answer: " + SECRET_LOOKING).length });
+      expect(byType("repo.check_run").length).toBe(1);
+      expect(byType("repo.check_run")[0].data).toMatchObject({ name: "node --test (Node 18)", conclusion: "failure", prs: [42] });
+      expect(byType("repo.workflow_run").length).toBe(1);
+      expect(byType("repo.workflow_run")[0].data).toMatchObject({ conclusion: "success", branch: "claude/x", prs: [42] });
+      // No body text reached the events table, the tenant's view, or anywhere a receipt goes.
+      expect(JSON.stringify(seen)).not.toContain(SECRET_LOOKING);
+      const all = JSON.stringify((await admin("GET", "/api/admin/events")).json.events);
+      expect(all).not.toContain(SECRET_LOOKING);
+      // The skipped check_run is still on the webhook log, marked as noise, not lost.
+      const hooks = (await admin("GET", "/api/admin/webhooks")).json.webhooks.filter((w) => w.source === "github" && w.type === "check_run");
+      expect(hooks.some((w) => w.handled && w.result?.skipped === "noise")).toBe(true);
+
+      // An unknown tenant id files tenantless (as before), never under someone else.
+      process.env.GITHUB_EVENTS_TENANT = "t_does_not_exist";
+      await send("pull_request", { action: "opened", repository: repo, pull_request: { number: 43, title: "x" } }, "gh-pr-2");
+      const opened = (await admin("GET", "/api/admin/events")).json.events.find((e) => e.type === "repo.pull_request" && e.data?.number === 43);
+      expect(opened.tenant).toBe(null);
+    } finally {
+      if (saved === undefined) delete process.env.GITHUB_EVENTS_TENANT;
+      else process.env.GITHUB_EVENTS_TENANT = saved;
+    }
+  });
+
   test("brain + mesh HMAC; railway token; stripe unarmed", async () => {
     const b = JSON.stringify({ id: "b1", type: "ping", data: { x: 1 } });
     expect((await req("POST", "/webhooks/brain", { raw: b, headers: { "x-brain-signature": "nope" } })).status).toBe(401);
