@@ -1,7 +1,8 @@
 // Routes: inbound webhooks: stripe, railway, github, brain, mesh. Registration order is significant.
 import { env } from "../config.js";
 import { hmacSha256, HttpError, safeEqual, sha256Hex } from "../util.js";
-import { getSetting, isKillSwitchOn, recordEvent, sql } from "../db.js";
+import { getSetting, getTenant, isKillSwitchOn, recordEvent, sql } from "../db.js";
+import { githubReceipt } from "../github-receipts.js";
 import {
   handleRailwayEvent,
   handleStripeEvent,
@@ -112,17 +113,17 @@ app.post("/webhooks/github", async (e) => {
       received: !0,
       replay: !0,
     });
+  // One compact receipt per event (src/github-receipts.js). Filed under GITHUB_EVENTS_TENANT when
+  // that names a real tenant, so the owner's own /api/events (and Mesh Deck) shows it; otherwise
+  // tenantless, exactly as before. Per-check noise is recorded above but emits no event.
+  let receipt = githubReceipt(s, n);
+  if (!receipt) {
+    await markWebhookHandled(i, { emitted: !1, skipped: "noise" });
+    return e.json({ received: !0, skipped: !0 });
+  }
+  let tenant = env.GITHUB_EVENTS_TENANT ? await getTenant(env.GITHUB_EVENTS_TENANT) : null;
   return (
-    await recordEvent(
-      "repo." + s,
-      {
-        repo: n.repository?.full_name,
-        ref: n.ref,
-        after: n.after,
-      },
-      null,
-      "github",
-    ),
+    await recordEvent("repo." + s, receipt, tenant ? tenant.id : null, "github"),
     await markWebhookHandled(i, {
       emitted: !0,
     }),
