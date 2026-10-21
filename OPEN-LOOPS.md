@@ -1,5 +1,20 @@
 # Open work — runtime tool receipts
 
+## BLOCKED (needs DW): gatekeeper-bridge holds RUNTIME_ADMIN_KEY (found 2026-10-21)
+
+Owner: DW to decide, then the next runtime agent. Evidence: `demos/gatekeeper-bridge/FOLDED-FROM.md`
+(PR #64). Railway project `gatekeeper-bridge` is live, runs a build older than the homed source
+(every GET returns 501), and holds the runtime master admin key as a variable.
+An attenuated grant cannot replace it as-is: `/onboard` calls `POST /api/tenants` and
+`/api/tenants/:id/root-grant`, which are admin-only, so only `/grant-soul` and `/soul/write`
+could move to a grant. Next step, in order:
+1. DW: is the character-builder demo still wanted? If not, stop the Railway service and delete its
+   `RUNTIME_ADMIN_KEY` variable (irreversible-delete floor).
+2. Either way, treat the admin key as at-risk and rotate it in the sweep. First list every holder
+   of the current value, because rotating breaks each one.
+3. If the demo stays, it needs a scoped way to create tenants rather than the master key. That
+   capability does not exist yet (NOT BUILT).
+
 ## IN PROGRESS: runtime routing and receipts (codex:receipt-live-verification)
 
 Current checkpoint (2026-10-17): PR52 merged as bf91893; Railway deployment
