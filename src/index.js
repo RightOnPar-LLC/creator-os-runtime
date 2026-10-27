@@ -13,6 +13,8 @@ import "./routes/core.js";
 import "./routes/admin.js";
 import "./routes/grants.js";
 import "./routes/escrow.js";
+import "./routes/broker.js";
+import "./routes/market.js";
 import "./routes/guest.js";
 import "./routes/memory.js";
 import "./routes/railway-auth.js";
