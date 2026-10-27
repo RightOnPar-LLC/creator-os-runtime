@@ -36,5 +36,10 @@ if (arg === "dist") env.RUNTIME_ENTRY = join(root, "dist", "runtime.js");
 else if (arg) env.RUNTIME_ENTRY = resolve(root, arg);
 // The per-test time limit has to be given HERE. This bun reads [test] in bunfig.toml but ignores a
 // `timeout` key there: from 2026-09-25 bunfig said 30 s and every test ran with bun's own 5 s.
-const r = spawnSync(bun, ["test", "--timeout", "30000", "runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "hostpolicy.test.js", "bus.test.js"], { cwd: here, env, stdio: "inherit" });
-process.exit(r.status ?? 1);
+const run = (files) => spawnSync(bun, ["test", "--timeout", "30000", ...files], { cwd: here, env, stdio: "inherit" });
+const main = run(["runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "hostpolicy.test.js", "bus.test.js"]);
+// Each file that imports harness.js boots its own runtime and database when it is imported, and
+// shuts them down when it ends. runtime.test.js holds that boot, so any other such file runs in its
+// own bun process, after it, and the run fails if either failed.
+const market = run(["market.test.js"]);
+process.exit((main.status ?? 1) || (market.status ?? 1));
