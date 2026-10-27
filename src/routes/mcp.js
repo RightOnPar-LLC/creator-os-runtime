@@ -1,6 +1,8 @@
 // Routes: MCP streamable-http endpoint. Registration order is significant.
+import { toolReceiptMiddleware, bindToolReceipt, bindPublicToolReceipt, readToolReceipts } from "../tool-receipts.js";
 import { armedIntegrations, SERVICE_NAME, VERSION } from "../config.js";
 import { HttpError, parseJson } from "../util.js";
+import { notATourReason } from "../tours.js";
 import { isKillSwitchOn, sql } from "../db.js";
 import { memoryPartitions, remainingBudget } from "../policy.js";
 import { issueChildGrant, revokeGrantTree, verifyGrant } from "../grants.js";
@@ -12,14 +14,28 @@ import { jsonRpcResponse, MCP_TOOLS } from "../mcp.js";
 import { publicBaseUrl } from "../oauth.js";
 import { issueGuestGrantGuarded, welcomePackage } from "../guest.js";
 
+// Protocol versions this server really speaks. initialize used to echo WHATEVER the
+// client asked for, so a client asking for 2026-07-28 was told "yes" and then spoke
+// the stateless revision (server/discover first) to a server that doesn't implement
+// it -> method_not_found -> "no MCP server found at this URL". The spec rule: echo a
+// version we support, otherwise answer with our latest and let the client decide.
+export const MCP_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+export const negotiateVersion = (v) => (MCP_VERSIONS.includes(v) ? v : MCP_VERSIONS[0]);
 app.get("/mcp", (e) =>
-  e.json({
+  // A streamable-HTTP client GETs /mcp asking for an SSE stream. We offer none, and
+  // the spec answer is 405; a 200 JSON page here reads to strict clients as "this
+  // is not an MCP server". Browsers and curl (no event-stream Accept) still get the
+  // description below.
+  /text\/event-stream/i.test(e.req.header("accept") || "")
+    ? e.body(null, 405, { Allow: "POST" })
+    : e.json({
     transport: "streamable-http",
     methods: ["initialize", "tools/list", "tools/call", "ping"],
     tools: MCP_TOOLS.map((t) => t.name),
     auth: "Bearer <grant>",
   }),
 );
+app.use("/mcp", toolReceiptMiddleware(MCP_TOOLS.map((t) => t.name)));
 app.post("/mcp", async (e) => {
   let n = await readJsonBody(e),
     r = n.id ?? null,
@@ -34,6 +50,7 @@ app.post("/mcp", async (e) => {
   // returns, so control never reaches the grant gate below; every other method and
   // every other tools/call name falls through to the unchanged gate.
   if (n.method === "tools/call" && n.params?.name === "guest_welcome") {
+    await bindPublicToolReceipt(e);
     if (await isKillSwitchOn()) throw new HttpError(503, "runtime_paused");
     let ip = e.req.header("x-real-ip") || (e.req.header("x-forwarded-for") || "").split(",")[0].trim() || "noip",
       g = await issueGuestGrantGuarded({ ip, agentName: n.params?.arguments?.agent_name, homeUrl: n.params?.arguments?.home_url });
@@ -52,7 +69,8 @@ app.post("/mcp", async (e) => {
       );
   if (!t) return a("missing_grant");
   try {
-    await verifyGrant(t, null);
+    const verified = await verifyGrant(t, null);
+    await bindToolReceipt(e, verified);
   } catch (l) {
     if (l instanceof HttpError) {
       // 401 (missing/bad/expired/revoked grant) carries the OAuth discovery
@@ -79,7 +97,7 @@ app.post("/mcp", async (e) => {
   if (n.method === "initialize")
     return e.json(
       jsonRpcResponse(r, {
-        protocolVersion: n.params?.protocolVersion || "2025-06-18",
+        protocolVersion: negotiateVersion(n.params?.protocolVersion),
         capabilities: {
           tools: {},
         },
@@ -107,6 +125,7 @@ app.post("/mcp", async (e) => {
     i = n.params?.arguments || {};
   try {
     if (s === "runtime_health") {
+      await bindToolReceipt(e, e.get("toolReceiptAuth"), true);
       let E = !1;
       try {
         (await sql`SELECT 1`, (E = !0));
@@ -121,6 +140,7 @@ app.post("/mcp", async (e) => {
       );
     }
     let l = {
+      tool_receipts: "ledger.read",
       grant_verify: null,
       grant_issue: "grant.issue",
       grant_list: "grant.read",
@@ -146,7 +166,10 @@ app.post("/mcp", async (e) => {
     // spends two units of budget while the same call over REST spends one
     // (2026-09-25 fix).
     let c = await verifyGrant(bearerToken(e), l[s], null, !1);
+    await bindToolReceipt(e, c, true);
     switch (s) {
+      case "tool_receipts":
+        return e.json(o({ receipts: await readToolReceipts(c, i.limit) }));
       case "grant_verify":
         return e.json(
           o({
@@ -195,15 +218,9 @@ app.post("/mcp", async (e) => {
           ).length
         )
           throw new HttpError(403, "not_in_subtree");
-        return e.json(
-          o({
-            revoked: await revokeGrantTree(
-              E,
-              String(i.reason || "revoked by " + c.row.sub).slice(0, 200),
-              c.row.sub,
-            ),
-          }),
-        );
+        let reason = String(i.reason || "revoked by " + c.row.sub).slice(0, 200);
+        notATourReason(reason); // "tour: ..." is the runtime's own (tours.js): the alarm reads one of them back
+        return e.json(o({ revoked: await revokeGrantTree(E, reason, c.row.sub) }));
       }
       case "cog_plan":
         return e.json(
@@ -272,7 +289,8 @@ app.post("/mcp", async (e) => {
       }
     }
   } catch (l) {
-    if (l instanceof HttpError)
+    if (l instanceof HttpError) {
+      e.set("toolReceiptErrorStatus", l.status);
       return e.json({
         jsonrpc: "2.0",
         id: r,
@@ -289,6 +307,7 @@ app.post("/mcp", async (e) => {
           ],
         },
       });
+    }
     throw l;
   }
   return e.json(

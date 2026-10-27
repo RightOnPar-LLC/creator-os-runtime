@@ -191,7 +191,11 @@ async function claimGuestFingerprint(fp, predictedExp) {
 // The guarded entrypoint the route calls: fingerprint-gate, mint, then bind the
 // real grant id/exp. A mint failure releases the active-lock (grant_exp=0) so a
 // failed attempt can't lock a fingerprint for a window.
+// The keyless guest door can be shut without a deploy: GUEST_DOOR=closed refuses every new
+// guest mint (HTTP route and the guest_welcome MCP tool alike). Existing grants are untouched.
+export const guestDoorClosed = () => String((globalThis.Bun?.env ?? process.env).GUEST_DOOR || "").trim().toLowerCase() === "closed";
 export async function issueGuestGrantGuarded({ ip = "noip", agentName = "", homeUrl = "" } = {}) {
+  if (guestDoorClosed()) throw new HttpError(403, "guest_door_closed");
   let fp = await guestFingerprint(ip),
     predictedExp = nowSec() + TIERS.guest.maxTtlSec;
   await claimGuestFingerprint(fp, predictedExp);

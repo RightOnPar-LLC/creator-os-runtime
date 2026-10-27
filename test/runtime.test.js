@@ -7,7 +7,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   mod, entryPath, BASE, ADMIN_KEY, GITHUB_SECRET, BRAIN_SECRET, MESH_SECRET, RAILWAY_TOKEN, RATE_LIMIT,
-  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown, dbQuery, lsp, overlayHash,
+  blockedFetches, req, admin, hmacHex, sha256Hex, s256, newTenant, mcp, shutdown, dbQuery, lsp, overlayHash, inOneWindow,
 } from "./harness.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -27,7 +27,7 @@ describe("1. /health", () => {
     expect(h.killSwitch).toBe(false);
     expect(h.armed).toEqual({
       admin: true, vault: true, railway: false, railwayOAuth: false, stripe: false,
-      railwayWebhook: true, github: true, brain: true, mesh: true, anthropic: false,
+      railwayWebhook: true, github: true, brain: true, mesh: true, ollama: false,
       brainOut: false, cognitiveBridge: false, sync: false, lspMcp: true,
     });
     // 2026-09-25: fingerprints are no longer public.
@@ -66,6 +66,7 @@ describe("1. /health", () => {
     expect(mod.CAPS.length).toBe(29);
     expect(mod.CAPS.slice(20)).toEqual(["code.write", "lsp.diagnose", "lsp.hover", "lsp.definition", "lsp.references", "escrow.hold", "repo.read", "repo.diff", "repo.pr"]);
     expect(mod.default.port).toBe(3000);
+    expect(mod.default.idleTimeout).toBe(255); // harness.js gives its own listener the same
     expect(mod.default.fetch).toBe(mod.app.fetch);
     expect(Object.keys(mod).sort()).toEqual(
       ["CAPS", "TEMPLATES", "TIERS", "VERSION", "app", "attenuationViolations", "default", "gatehouseEvaluate"],
@@ -309,6 +310,7 @@ describe("4. MCP", () => {
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
     expect(l.json.result.tools.map((x) => x.name)).toEqual([
+      "tool_receipts",
       "guest_welcome",
       "runtime_health", "grant_verify", "grant_issue", "grant_list", "grant_revoke", "cog_plan", "cog_execute",
       "deploy_worker", "deploy_status", "ledger_query", "memory_search", "memory_write", "memory_forget",
@@ -317,6 +319,27 @@ describe("4. MCP", () => {
     expect((await mcp(t.token, "nope", {})).json.error.code).toBe(-32601);
     const n = await mcp(t.token, "notifications/initialized", {});
     expect(n.status).toBe(202);
+  });
+
+  test("initialize never claims a protocol version it does not speak", async () => {
+    // A 2026-07-28 client told "yes, 2026-07-28" calls server/discover next, gets
+    // method_not_found, and the connector reports "no MCP server found".
+    for (const [asked, told] of [["2025-06-18", "2025-06-18"], ["2025-03-26", "2025-03-26"], ["2024-11-05", "2024-11-05"],
+      ["2025-11-25", "2025-06-18"], ["2026-07-28", "2025-06-18"], [undefined, "2025-06-18"], ["garbage", "2025-06-18"]]) {
+      const i = await mcp(t.token, "initialize", asked === undefined ? {} : { protocolVersion: asked });
+      expect([asked, i.json.result.protocolVersion]).toEqual([asked, told]);
+    }
+  });
+
+  test("GET /mcp asking for an SSE stream gets 405 (no stream offered); a plain GET still describes", async () => {
+    const s = await req("GET", "/mcp", { headers: { accept: "text/event-stream" } });
+    expect(s.status).toBe(405);
+    expect(s.headers.get("allow")).toBe("POST");
+    const both = await req("GET", "/mcp", { headers: { accept: "application/json, text/event-stream" } });
+    expect(both.status).toBe(405);
+    const plain = await req("GET", "/mcp", { headers: { accept: "application/json" } });
+    expect(plain.status).toBe(200);
+    expect(plain.json.transport).toBe("streamable-http");
   });
 
   test("memory write then search round-trip with a grant", async () => {
@@ -421,6 +444,211 @@ describe("5. admin fail-closed + kill switch", () => {
 });
 
 // ------------------------------------------------------------------------------------
+// The operator session slides (2026-10-16): a cookie used within its 30 days is
+// re-signed to 30 days from now (at most once a day), so the admin key is pasted
+// once, not once a month. Cookies are signed here exactly as the runtime signs
+// them, with chosen expiries, so no clock has to be faked.
+describe("5b. operator session slides on use", () => {
+  const DAY = 86400000;
+  const TTL = 30 * DAY;
+  const cookieFor = (expMs, key = ADMIN_KEY) => `cos_session=${expMs}.${hmacHex(key, `admin-session|${expMs}`)}`;
+  const sessionOf = (r) => (r.headers.getSetCookie?.() || [r.headers.get("set-cookie") || ""]).find((c) => c.startsWith("cos_session=")) || "";
+  const expOf = (c) => Number((c.match(/^cos_session=(\d+)\./) || [])[1] || 0);
+
+  test("a cookie with days left is renewed to 30 days from now, same flags", async () => {
+    const before = Date.now();
+    const r = await req("GET", "/api/tenants", { headers: { cookie: cookieFor(before + 10 * DAY) } });
+    expect(r.status).toBe(200);
+    const c = sessionOf(r);
+    expect(expOf(c)).toBeGreaterThanOrEqual(before + TTL);
+    expect(expOf(c)).toBeLessThanOrEqual(Date.now() + TTL);
+    expect(c).toMatch(/; HttpOnly; Secure; SameSite=Lax; Path=\/; Max-Age=2592000$/);
+    // and the renewed cookie is itself a working session
+    const again = await req("GET", "/api/tenants", { headers: { cookie: c.split(";")[0] } });
+    expect(again.status).toBe(200);
+  });
+
+  test("renewed at most once a day: a cookie minted moments ago is not re-signed", async () => {
+    const r = await req("GET", "/api/tenants", { headers: { cookie: cookieFor(Date.now() + TTL - 60000) } });
+    expect(r.status).toBe(200);
+    expect(sessionOf(r)).toBe("");
+  });
+
+  test("NEGATIVE CONTROL: an expired cookie is refused and not revived", async () => {
+    const r = await req("GET", "/api/tenants", { headers: { cookie: cookieFor(Date.now() - 1000) } });
+    expect(r.status).toBe(401);
+    expect(sessionOf(r)).toBe("");
+  });
+
+  test("NEGATIVE CONTROL: a cookie signed with another key is refused and not renewed", async () => {
+    const r = await req("GET", "/api/tenants", { headers: { cookie: cookieFor(Date.now() + 10 * DAY, ADMIN_KEY + "-not-the-key") } });
+    expect(r.status).toBe(401);
+    expect(sessionOf(r)).toBe("");
+  });
+
+  test("the admin key itself gets no cookie (only a session slides)", async () => {
+    const r = await admin("GET", "/api/tenants");
+    expect(r.status).toBe(200);
+    expect(sessionOf(r)).toBe("");
+  });
+
+  test("sign-out is not undone by a renewal on the same response", async () => {
+    const r = await req("DELETE", "/api/admin/session", { headers: { cookie: cookieFor(Date.now() + 10 * DAY) } });
+    expect(r.status).toBe(200);
+    const all = r.headers.getSetCookie?.() || [r.headers.get("set-cookie") || ""];
+    expect(all.filter((c) => c.startsWith("cos_session=")).length).toBe(1);
+    expect(sessionOf(r)).toMatch(/^cos_session=; .*Max-Age=0$/);
+  });
+});
+
+// ------------------------------------------------------------------------------------
+// The owner's ONE sign-in (2026-10-16): id.meshtool.ai posts a one-time pass to
+// /sso/callback. A real Ed25519 key stands in for id's; passes are signed exactly as id
+// signs them (meshtool-frontdoor owner.mjs). Off until ID_PUBLIC_KEY is set.
+describe("5c. one sign-in: a pass from id.meshtool.ai", () => {
+  const ID = "https://id.meshtool.ai", SELF = "https://runtime.meshtool.ai";
+  const b64u = (b) => Buffer.from(b).toString("base64url");
+  let idKey, otherKey, n = 0;
+  const now = () => Math.floor(Date.now() / 1000);
+  const makePass = async (over = {}, key = idKey.privateKey) => {
+    const t = now();
+    const c = { v: 1, iss: ID, sub: "owner", aud: SELF, iat: t, exp: t + 60, jti: "rt_jti_" + String(++n).padStart(18, "0"), fa: t - 3600, ...over };
+    const p = b64u(new TextEncoder().encode(JSON.stringify(c)));
+    return p + "." + b64u(new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, key, new TextEncoder().encode(p))));
+  };
+  const callback = (pass, { origin = ID, ret = SELF + "/status" } = {}) =>
+    req("POST", "/sso/callback", { raw: new URLSearchParams({ pass, return: ret }).toString(), headers: { "content-type": "application/x-www-form-urlencoded", origin } });
+  const sessionOf = (r) => (r.headers.getSetCookie?.() || []).find((c) => c.startsWith("cos_session=")) || "";
+  const refused = (r, why = "refused") => r.status === 303 && r.headers.get("location") === `/?sso=${why}` && sessionOf(r) === "";
+
+  beforeAll(async () => {
+    idKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    otherKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  });
+  afterAll(() => { delete process.env.ID_PUBLIC_KEY; });
+
+  test("off until ID_PUBLIC_KEY is set: start is 404, a pass is refused", async () => {
+    delete process.env.ID_PUBLIC_KEY;
+    expect((await req("GET", "/sso/start")).status).toBe(404);
+    expect(refused(await callback(await makePass()), "off")).toBe(true);
+    process.env.ID_PUBLIC_KEY = (await crypto.subtle.exportKey("jwk", idKey.publicKey)).x;
+  });
+
+  test("start sends the owner to id for this runtime, coming back to the page asked for", async () => {
+    const r = await req("GET", "/sso/start?return=" + encodeURIComponent("/status?x=1"));
+    expect(r.status).toBe(302);
+    const u = new URL(r.headers.get("location"));
+    expect(u.origin + u.pathname).toBe(ID + "/sso/pass");
+    expect(u.searchParams.get("client")).toBe(SELF);
+    expect(u.searchParams.get("return")).toBe(SELF + "/status?x=1");
+    const off = new URL((await req("GET", "/sso/start?return=" + encodeURIComponent("//evil.example/x"))).headers.get("location"));
+    expect(off.searchParams.get("return")).toBe(SELF + "/");
+  });
+
+  test("a good pass becomes the operator session, and it works", async () => {
+    const r = await callback(await makePass(), { ret: SELF + "/status" });
+    expect(r.status).toBe(303);
+    expect(r.headers.get("location")).toBe("/status");
+    const c = sessionOf(r);
+    expect(c).toMatch(/; HttpOnly; Secure; SameSite=Lax; Path=\/; Max-Age=\d+$/);
+    expect((await req("GET", "/api/tenants", { headers: { cookie: c.split(";")[0] } })).status).toBe(200);
+  });
+
+  test("the session ends no later than 180 days after id's face check", async () => {
+    const fa = now() - 179 * 86400;
+    const c = sessionOf(await callback(await makePass({ fa })));
+    const exp = Number(c.match(/^cos_session=(\d+)\./)[1]);
+    expect(exp).toBeLessThanOrEqual((fa + 180 * 86400) * 1000);
+    expect(exp).toBeGreaterThan(Date.now());
+  });
+
+  test("NEGATIVE CONTROLS: replay, wrong origin, wrong site, expired, other key, edited, old face, off-site return", async () => {
+    const once = await makePass();
+    expect((await callback(once)).status).toBe(303);
+    expect(refused(await callback(once))).toBe(true);
+    expect(refused(await callback(await makePass(), { origin: "https://market.meshtool.ai" }))).toBe(true);
+    expect(refused(await callback(await makePass({ aud: "https://market.meshtool.ai" })))).toBe(true);
+    expect(refused(await callback(await makePass({ iat: now() - 120, exp: now() - 60 })))).toBe(true);
+    expect(refused(await callback(await makePass({}, otherKey.privateKey)))).toBe(true);
+    const [p, s] = (await makePass()).split(".");
+    const edited = b64u(new TextEncoder().encode(JSON.stringify({ ...JSON.parse(Buffer.from(p, "base64url").toString()), sub: "owner", fa: now() }))) + "." + s;
+    expect(refused(await callback(edited))).toBe(true);
+    expect(refused(await callback(await makePass({ fa: now() - 181 * 86400 })))).toBe(true);
+    const off = await callback(await makePass(), { ret: "https://evil.example/x" });
+    expect(off.headers.get("location")).toBe("/");
+  });
+});
+
+// ------------------------------------------------------------------------------------
+// Sign out everywhere (2026-10-16): the last hop of id's signed notice. The runtime keeps the
+// latest time T and refuses any operator session made before it, and any pass whose Face ID
+// is not newer than T.
+describe("5d. sign out everywhere", () => {
+  const ID = "https://id.meshtool.ai", SELF = "https://runtime.meshtool.ai", TTL = 30 * 86400000;
+  const b64u = (b) => Buffer.from(b).toString("base64url");
+  const now = () => Math.floor(Date.now() / 1000);
+  let idKey, otherKey, n = 0, T = 0;
+  const sign = async (claims, key = idKey.privateKey) => { const p = b64u(new TextEncoder().encode(JSON.stringify(claims))); return p + "." + b64u(new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, key, new TextEncoder().encode(p)))); };
+  const notice = (over = {}, key) => { const t = now() - 10; return sign({ v: 1, iss: ID, sub: "owner", kind: "signout", iat: t, exp: t + 600, at: t, jti: "n_" + String(++n).padStart(20, "0"), ...over }, key); };
+  const pass = (over = {}) => { const t = now(); return sign({ v: 1, iss: ID, sub: "owner", aud: SELF, iat: t, exp: t + 60, jti: "p5d_" + String(++n).padStart(18, "0"), fa: t - 1, ...over }); };
+  const hop = (nt) => req("GET", "/sso/signout?" + new URLSearchParams({ notice: nt, next: "https://evil.example/" }));
+  const cookieFor = (expMs) => `cos_session=${expMs}.${hmacHex(ADMIN_KEY, `admin-session|${expMs}`)}`;
+  const tenantsWith = async (cookie) => (await req("GET", "/api/tenants", { headers: { cookie } })).status;
+  const setting = async () => Number((await dbQuery("SELECT value FROM settings WHERE key = 'owner_not_before'")).rows[0]?.value || 0);
+  const callback = (p) => req("POST", "/sso/callback", { raw: new URLSearchParams({ pass: p, return: SELF + "/status" }).toString(), headers: { "content-type": "application/x-www-form-urlencoded", origin: ID } });
+
+  beforeAll(async () => {
+    idKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    otherKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    process.env.ID_PUBLIC_KEY = (await crypto.subtle.exportKey("jwk", idKey.publicKey)).x;
+  });
+  afterAll(async () => { delete process.env.ID_PUBLIC_KEY; await dbQuery("DELETE FROM settings WHERE key = 'owner_not_before'"); });
+
+  test("NEGATIVE CONTROLS: off without ID_PUBLIC_KEY; another key's notice, a pass, an expired notice change nothing", async () => {
+    const saved = process.env.ID_PUBLIC_KEY; delete process.env.ID_PUBLIC_KEY;
+    expect((await hop(await notice())).status).toBe(404);
+    process.env.ID_PUBLIC_KEY = saved;
+    expect((await hop(await notice({}, otherKey.privateKey))).status).toBe(403);
+    expect((await hop(await pass())).status).toBe(403);
+    expect((await hop(await notice({ iat: now() - 700, exp: now() - 100, at: now() - 700 }))).status).toBe(403);
+    expect(await setting()).toBe(0);
+  });
+
+  test("a good notice: kept, this browser signed out, on to id's signed-out page (never elsewhere)", async () => {
+    const before = cookieFor(Date.now() + TTL - 120000);   // made two minutes ago
+    expect(await tenantsWith(before)).toBe(200);
+    T = now() - 10;
+    const r = await hop(await notice());
+    expect(r.status).toBe(303);
+    expect(r.headers.get("location")).toBe(ID + "/owner?out=1");
+    expect((r.headers.getSetCookie?.() || []).some((c) => /^cos_session=; .*Max-Age=0$/.test(c))).toBe(true);
+    expect(await setting()).toBe(T);
+    // and from now on that session (made before T) is no session at all
+    expect(await tenantsWith(before)).toBe(401);
+  });
+
+  test("after: new sessions and the admin key work; stale passes go back to id for a newer Face ID", async () => {
+    expect(await tenantsWith(cookieFor(Date.now() + TTL))).toBe(200);
+    expect((await admin("GET", "/api/tenants")).status).toBe(200);
+    const stale = await callback(await pass({ fa: T - 1 }));
+    const to = new URL(stale.headers.get("location"));
+    expect(stale.status).toBe(303);
+    expect(to.origin + to.pathname).toBe(ID + "/sso/pass");
+    expect(to.searchParams.get("after")).toBe(String(T));
+    expect((stale.headers.getSetCookie?.() || []).some((c) => c.startsWith("cos_session=") && !c.startsWith("cos_session=;"))).toBe(false);
+    const fresh = await callback(await pass({ fa: now() - 1 }));
+    const c = (fresh.headers.getSetCookie?.() || []).find((x) => /^cos_session=\d/.test(x));
+    expect(await tenantsWith(c.split(";")[0])).toBe(200);
+    expect(new URL((await req("GET", "/sso/start")).headers.get("location")).searchParams.get("after")).toBe(String(T));
+  });
+
+  test("NEGATIVE CONTROL: replaying an OLDER notice never moves the time back", async () => {
+    expect((await hop(await notice({ iat: T - 300, exp: T + 300, at: T - 300 }))).status).toBe(303);
+    expect(await setting()).toBe(T);
+  });
+});
+
+// ------------------------------------------------------------------------------------
 describe("6. webhooks", () => {
   test("github: good signature accepted, bad refused, replay not double-processed", async () => {
     const body = JSON.stringify({ repository: { full_name: "o/r" }, ref: "refs/heads/main", after: "abc" });
@@ -463,6 +691,67 @@ describe("6. webhooks", () => {
       headers: { ...hdr, "x-github-event": "ping", "x-github-delivery": "legacy-delivery-7", "x-hub-signature-256": "sha256=" + hmacHex(GITHUB_SECRET, JSON.stringify({ zen: "ping" })) },
     });
     expect(sameId.json).toEqual({ received: true, replay: true });
+  });
+
+  test("github: PR, review, CI events become compact receipts, filed under GITHUB_EVENTS_TENANT", async () => {
+    const owner = await newTenant("github-owner");
+    const send = (event, payload, delivery) => {
+      const body = JSON.stringify(payload);
+      return req("POST", "/webhooks/github", {
+        raw: body,
+        headers: { "content-type": "application/json", "x-github-event": event, "x-github-delivery": delivery, "x-hub-signature-256": "sha256=" + hmacHex(GITHUB_SECRET, body) },
+      });
+    };
+    const repo = { full_name: "RightOnPar-LLC/park" };
+    const SECRET_LOOKING = "ghp_" + "x".repeat(36);
+    const saved = process.env.GITHUB_EVENTS_TENANT;
+    process.env.GITHUB_EVENTS_TENANT = owner.id;
+    try {
+      // A merged PR: the receipt says who, which PR, and that it merged; the body never travels.
+      expect((await send("pull_request", {
+        action: "closed", repository: repo, sender: { login: "Flanny8080" },
+        pull_request: { number: 41, title: "PARK Phase 16", state: "closed", merged: true, draft: false, user: { login: "Flanny8080" },
+          base: { ref: "main" }, head: { ref: "optimization/rust-fillet-chamfer", sha: "896e3cc" }, html_url: "https://github.com/RightOnPar-LLC/park/pull/41",
+          body: "pasted by mistake: " + SECRET_LOOKING },
+      }, "gh-pr-1")).json).toEqual({ received: true });
+      // A comment: author and link, never the text.
+      await send("issue_comment", {
+        action: "created", repository: repo, sender: { login: "Flanny8080" },
+        issue: { number: 42, pull_request: {} }, comment: { user: { login: "Flanny8080" }, body: "answer: " + SECRET_LOOKING, html_url: "https://github.com/x#c1" },
+      }, "gh-c-1");
+      // CI: a passing check_run is noise (no event); a failed one and a completed workflow_run are receipts.
+      const pass = await send("check_run", { action: "completed", repository: repo, check_run: { name: "eslint", conclusion: "success", head_sha: "a1", pull_requests: [{ number: 42 }] } }, "gh-cr-ok");
+      expect(pass.json).toEqual({ received: true, skipped: true });
+      await send("check_run", { action: "completed", repository: repo, check_run: { name: "node --test (Node 18)", conclusion: "failure", head_sha: "a1", pull_requests: [{ number: 42 }], html_url: "https://github.com/x/job/1" } }, "gh-cr-bad");
+      await send("workflow_run", { action: "in_progress", repository: repo, workflow_run: { name: "test", head_sha: "a1" } }, "gh-wr-run");
+      await send("workflow_run", { action: "completed", repository: repo, workflow_run: { name: "test", conclusion: "success", head_sha: "a1", head_branch: "claude/x", pull_requests: [{ number: 42 }], html_url: "https://github.com/x/run/1" } }, "gh-wr-done");
+
+      const seen = (await req("GET", "/api/events", { token: owner.token })).json.events.filter((e) => e.actor === "github");
+      const byType = (t) => seen.filter((e) => e.type === t);
+      expect(byType("repo.pull_request").length).toBe(1);
+      expect(byType("repo.pull_request")[0].data).toMatchObject({ repo: "RightOnPar-LLC/park", action: "closed", number: 41, merged: true, title: "PARK Phase 16", author: "Flanny8080", url: "https://github.com/RightOnPar-LLC/park/pull/41" });
+      expect(byType("repo.issue_comment")[0].data).toMatchObject({ number: 42, on: "pull_request", author: "Flanny8080", chars: ("answer: " + SECRET_LOOKING).length });
+      expect(byType("repo.check_run").length).toBe(1);
+      expect(byType("repo.check_run")[0].data).toMatchObject({ name: "node --test (Node 18)", conclusion: "failure", prs: [42] });
+      expect(byType("repo.workflow_run").length).toBe(1);
+      expect(byType("repo.workflow_run")[0].data).toMatchObject({ conclusion: "success", branch: "claude/x", prs: [42] });
+      // No body text reached the events table, the tenant's view, or anywhere a receipt goes.
+      expect(JSON.stringify(seen)).not.toContain(SECRET_LOOKING);
+      const all = JSON.stringify((await admin("GET", "/api/admin/events")).json.events);
+      expect(all).not.toContain(SECRET_LOOKING);
+      // The skipped check_run is still on the webhook log, marked as noise, not lost.
+      const hooks = (await admin("GET", "/api/admin/webhooks")).json.webhooks.filter((w) => w.source === "github" && w.type === "check_run");
+      expect(hooks.some((w) => w.handled && w.result?.skipped === "noise")).toBe(true);
+
+      // An unknown tenant id files tenantless (as before), never under someone else.
+      process.env.GITHUB_EVENTS_TENANT = "t_does_not_exist";
+      await send("pull_request", { action: "opened", repository: repo, pull_request: { number: 43, title: "x" } }, "gh-pr-2");
+      const opened = (await admin("GET", "/api/admin/events")).json.events.find((e) => e.type === "repo.pull_request" && e.data?.number === 43);
+      expect(opened.tenant).toBe(null);
+    } finally {
+      if (saved === undefined) delete process.env.GITHUB_EVENTS_TENANT;
+      else process.env.GITHUB_EVENTS_TENANT = saved;
+    }
   });
 
   test("brain + mesh HMAC; railway token; stripe unarmed", async () => {
@@ -531,19 +820,23 @@ describe("6. webhooks", () => {
 
 // ------------------------------------------------------------------------------------
 describe("7. rate limit", () => {
+  // The meter starts again every wall-clock minute. Each test here that fills it (or reads its row)
+  // counts only if the minute did not turn while it ran: see inOneWindow in harness.js.
   test(`exceeding RATE_LIMIT_PER_MIN (${RATE_LIMIT}) for one grant -> 429`, async () => {
-    const t = await newTenant("rate-tenant");
-    const other = await newTenant("rate-other");
-    let last;
-    for (let i = 0; i < RATE_LIMIT; i++) {
+    await inOneWindow(async () => {
+      const t = await newTenant("rate-tenant");
+      const other = await newTenant("rate-other");
+      let last;
+      for (let i = 0; i < RATE_LIMIT; i++) {
+        last = await req("GET", "/api/grants/verify", { token: t.token });
+        expect(last.status).toBe(200);
+      }
       last = await req("GET", "/api/grants/verify", { token: t.token });
-      expect(last.status).toBe(200);
-    }
-    last = await req("GET", "/api/grants/verify", { token: t.token });
-    expect(last.status).toBe(429);
-    expect(last.json.error).toBe("rate_limited");
-    // per grant: another grant is unaffected
-    expect((await req("GET", "/api/grants/verify", { token: other.token })).status).toBe(200);
+      expect(last.status).toBe(429);
+      expect(last.json.error).toBe("rate_limited");
+      // per grant: another grant is unaffected
+      expect((await req("GET", "/api/grants/verify", { token: other.token })).status).toBe(200);
+    });
     // admin is not grant-rate-limited
     expect((await admin("GET", "/api/admin/policy")).json.rateLimitPerMin).toBe(RATE_LIMIT);
   });
@@ -559,29 +852,83 @@ describe("7. rate limit", () => {
   // calls it only ever exercises the first, pre-check verifyGrant, pass or
   // fail, on both the buggy and the fixed line. "grant_verify" routes through
   // both calls, so it actually proves the fix.
+  //
+  // One window matters here in BOTH directions. A minute turning in the loop made the last call 200
+  // (seen 2026-10-09). And on the buggy line, a minute turning exactly half way would let every call
+  // through at two units each and still refuse the last one: a pass that proves nothing.
   test(`a single MCP tools/call spends exactly one rate-limit unit, matching REST`, async () => {
-    const t = await newTenant("mcp-rate-tenant");
-    let last;
-    for (let i = 0; i < RATE_LIMIT; i++) {
-      last = await mcp(t.token, "tools/call", { name: "grant_verify" }, i);
-      expect(last.status).toBe(200);
-      expect(last.json.result.isError).toBeUndefined();
-    }
-    last = await mcp(t.token, "tools/call", { name: "grant_verify" }, RATE_LIMIT);
-    expect(last.status).toBe(429);
-    expect(last.json.error).toBe("rate_limited");
+    await inOneWindow(async () => {
+      const t = await newTenant("mcp-rate-tenant");
+      let last;
+      for (let i = 0; i < RATE_LIMIT; i++) {
+        last = await mcp(t.token, "tools/call", { name: "grant_verify" }, i);
+        expect(last.status).toBe(200);
+        expect(last.json.result.isError).toBeUndefined();
+      }
+      last = await mcp(t.token, "tools/call", { name: "grant_verify" }, RATE_LIMIT);
+      expect(last.status).toBe(429);
+      expect(last.json.error).toBe("rate_limited");
+    });
   });
 
   // 2026-09-25: the bucket used to be a process-local Map — invisible to, and
   // reset independently by, every other replica. It now lives in Postgres.
   test("rate-limit counters are Postgres-backed, not process-local state", async () => {
-    const t = await newTenant("db-rate-tenant");
-    await req("GET", "/api/grants/verify", { token: t.token });
-    await req("GET", "/api/grants/verify", { token: t.token });
-    await req("GET", "/api/grants/verify", { token: t.token });
-    const rows = await dbQuery("SELECT count FROM rate_limits WHERE grant_id = $1", [t.grantId]);
-    expect(rows.rows.length).toBe(1);
-    expect(Number(rows.rows[0].count)).toBe(3);
+    // three calls are ONE row of 3 only inside one minute: across a turn they are two rows
+    await inOneWindow(async () => {
+      const t = await newTenant("db-rate-tenant");
+      await req("GET", "/api/grants/verify", { token: t.token });
+      await req("GET", "/api/grants/verify", { token: t.token });
+      await req("GET", "/api/grants/verify", { token: t.token });
+      const rows = await dbQuery("SELECT count, window_start FROM rate_limits WHERE grant_id = $1", [t.grantId]);
+      expect(rows.rows.length).toBe(1);
+      expect(Number(rows.rows[0].count)).toBe(3);
+      // the window the harness reasons about is the window the meter really used
+      expect(Number(rows.rows[0].window_start)).toBe(Math.floor(Date.now() / 60000) * 60000);
+    });
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("7a. the harness's one-window rule (inOneWindow), tried on a 200 ms window", () => {
+  const W = 200;
+  const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+  const pastNextTurn = () => pause(W - (Date.now() % W) + 2);
+  // start a test early in a window, so a body that does not wait cannot meet a turn by bad luck
+  const earlyInAWindow = async () => { do await pastNextTurn(); while (Date.now() % W > 50); };
+
+  test("a run that straddled a turn is thrown away, whether it passed or failed, and done again", async () => {
+    await earlyInAWindow();
+    const runs = [];
+    const out = await inOneWindow(async (attempt) => {
+      runs.push(attempt);
+      if (attempt === 1) (await pastNextTurn(), expect("a wrong answer from a straddled run").toBe("never reported"));
+      if (attempt === 2) return (await pastNextTurn(), "a right answer from a straddled run");
+      return "inside one window";
+    }, W);
+    expect(out).toBe("inside one window");
+    expect(runs).toEqual([1, 2, 3]);
+  });
+
+  test("a failure inside one window is the failure: no second run", async () => {
+    await earlyInAWindow();
+    let runs = 0;
+    const boom = new Error("the 41st call was 200");
+    await expect(inOneWindow(async () => { runs++; throw boom; }, W)).rejects.toBe(boom);
+    expect(runs).toBe(1);
+  });
+
+  test("a pass inside one window is the pass: no second run", async () => {
+    await earlyInAWindow();
+    let runs = 0;
+    expect(await inOneWindow(async () => (runs++, "ok"), W)).toBe("ok");
+    expect(runs).toBe(1);
+  });
+
+  test("three straddled runs in a row is a loud failure, never a pass", async () => {
+    let runs = 0;
+    await expect(inOneWindow(async () => (runs++, await pastNextTurn(), "looked fine"), W)).rejects.toThrow("window turned during each of 3 runs");
+    expect(runs).toBe(3);
   });
 });
 
@@ -611,9 +958,1689 @@ describe("7b. memory partition scope is a real prefix, not a bare string match",
     const nested = await req("POST", "/api/memory", { token: child.json.token, body: { partition: "worker:a-shard1", content: "nested ok" } });
     expect(nested.status).toBe(201);
   });
+
+  // Listing must never reach further than assertMemoryScope allows. It used to be a bare
+  // `LIKE prefix%`, so a key for "article:job4" could LIST "article:job42" although it
+  // could not read or write it by name.
+  test("listing memory keeps the same boundary: a key for one section never lists a longer-named one", async () => {
+    const t = await newTenant("list-boundary");
+    for (const [partition, content] of [
+      ["agent:report:", "report brief"], ["agent:report:notes", "report notes"], ["agent:report2:", "report2 brief"],
+      ["worker:a", "a"], ["worker:ab", "ab"], ["worker:a-shard1", "a shard"], ["a_c", "underscore"], ["abc", "letters"],
+    ]) expect((await req("POST", "/api/memory", { token: t.token, body: { partition, content } })).status).toBe(201);
+    const key = async (partitions) =>
+      (await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:reader", caps: ["memory.read"], ttlSec: 600, scope: { memory: { partitions } } } })).json.token;
+    const list = async (token, q = "") =>
+      ((await req("GET", "/api/memory?limit=50" + (q ? "&q=" + q : ""), { token })).json.memories || []).map((m) => m.partition).sort();
+    expect(await list(await key(["agent:report:"]))).toEqual(["agent:report:", "agent:report:notes"]);
+    expect(await list(await key(["worker:a"]))).toEqual(["worker:a", "worker:a-shard1"]);
+    // % and _ in a scope are ordinary characters, not wildcards.
+    expect(await list(await key(["a_c"]))).toEqual(["a_c"]);
+    // The same boundary holds when searching by words.
+    expect(await list(await key(["agent:report:"]), "brief")).toEqual(["agent:report:"]);
+    // The root key (no memory scope = everything) still lists everything.
+    expect((await list(t.token)).length).toBe(8);
+  });
+
+  test("a key with an empty memory scope lists nothing and reads nothing", async () => {
+    const t = await newTenant("empty-scope");
+    expect((await req("POST", "/api/memory", { token: t.token, body: { partition: "tenant", content: "the past" } })).status).toBe(201);
+    // The old code searched for `partition LIKE 'undefined%'`: it returned nothing only by
+    // accident, and it DID return this one.
+    expect((await req("POST", "/api/memory", { token: t.token, body: { partition: "undefined-leftovers", content: "must never be listed" } })).status).toBe(201);
+    const blank = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:new", caps: ["memory.read"], ttlSec: 600, scope: { memory: { partitions: [] } } } });
+    expect(blank.status).toBe(201);
+    const listed = await req("GET", "/api/memory?limit=50", { token: blank.json.token });
+    expect(listed.status).toBe(200);
+    expect(listed.json.memories).toEqual([]);
+    const asked = await req("GET", "/api/memory?partition=tenant", { token: blank.json.token });
+    expect(asked.status).toBe(403);
+    expect(asked.json.error).toBe("out_of_scope");
+  });
+
+  // The owner's rule: a key an AGENT hands to a sub-agent lives 24 hours at most. The
+  // owner's own (root) key keeps the tier's limit.
+  test("a key handed out by an agent lives 24 hours at most; the owner's own key keeps the tier's limit", async () => {
+    const t = await newTenant("ttl-owner", "studio"); // studio allows 7 days
+    const week = 7 * 86400;
+    const now = Math.floor(Date.now() / 1000);
+    const lead = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:lead", caps: ["grant.issue", "grant.read"], ttlSec: week } });
+    expect(lead.status).toBe(201);
+    expect(lead.json.exp).toBeGreaterThan(now + 6 * 86400); // owner-issued: unchanged
+    const helper = await req("POST", "/api/grants", { token: lead.json.token, body: { sub: "agent:helper", caps: ["grant.read"], ttlSec: week } });
+    expect(helper.status).toBe(201);
+    expect(helper.json.exp).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 86400);
+    expect(helper.json.exp).toBeGreaterThan(now + 86400 - 120); // capped at a day, not cut further
+    // Asking for less than a day is still honoured.
+    const brief = await req("POST", "/api/grants", { token: lead.json.token, body: { sub: "agent:brief", caps: ["grant.read"], ttlSec: 600 } });
+    expect(brief.json.exp).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 600);
+  });
+
+  test("the 24-hour rule reaches every level and a host's hires, but not a payment hold", async () => {
+    const t = await newTenant("ttl-levels", "studio");
+    const week = 7 * 86400;
+    const day = 86400;
+    const now = () => Math.floor(Date.now() / 1000);
+    const lead = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:lead", caps: ["grant.issue", "grant.read", "escrow.hold"], ttlSec: week, budget: { usd_cents: 1000, calls: 10, deploys: 0 } },
+    });
+    expect(lead.status).toBe(201);
+    const second = await req("POST", "/api/grants", { token: lead.json.token, body: { sub: "agent:second", caps: ["grant.issue", "grant.read"], ttlSec: week } });
+    expect(second.status).toBe(201);
+    expect(second.json.exp).toBeLessThanOrEqual(now() + day);
+    const third = await req("POST", "/api/grants", { token: second.json.token, body: { sub: "agent:third", caps: ["grant.read"], ttlSec: week } });
+    expect(third.status).toBe(201);
+    expect(third.json.exp).toBeLessThanOrEqual(now() + day);
+    // A host is made by the owner (root), so it keeps the tier's limit. What it HIRES is an
+    // agent's sub-agent.
+    const host = await req("POST", "/api/hosts", { token: t.token, body: { name: "desk" } });
+    expect(host.status).toBe(201);
+    const hire = await req("POST", "/api/grants", {
+      token: host.json.token,
+      body: { sub: "agent:worker", caps: ["grant.read"], ttlSec: week, budget: { usd_cents: 10, calls: 5, deploys: 0 } },
+    });
+    expect(hire.status).toBe(201);
+    expect(hire.json.exp).toBeLessThanOrEqual(now() + day);
+    // A payment hold opened by an agent keeps the deadline the payer chose. Cutting it to a
+    // day would refund the payer early and leave a later, valid delivery unpaid.
+    const hold = await req("POST", "/api/escrow", {
+      token: lead.json.token,
+      body: { amount: 500, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, deadline: now() + 3 * day },
+    });
+    expect(hold.status).toBe(201);
+    expect(hold.json.escrow.deadline).toBeGreaterThan(now() + 2 * day);
+  });
+
+  // A hold cannot outlive the key that pays for it, and a key an agent was handed lives a day.
+  // So an agent's sub-agent asking for a 3-day hold must be TOLD no, never given a 1-day hold
+  // that looks like a 3-day one.
+  test("a payment hold asked to outlast the payer's own key is refused, never quietly shortened", async () => {
+    const t = await newTenant("hold-outlives-payer", "studio");
+    const week = 7 * 86400;
+    const day = 86400;
+    const now = () => Math.floor(Date.now() / 1000);
+    const lead = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:lead", caps: ["grant.issue", "grant.read", "escrow.hold"], ttlSec: week, budget: { usd_cents: 1000, calls: 10, deploys: 0 } },
+    });
+    const second = await req("POST", "/api/grants", {
+      token: lead.json.token,
+      body: { sub: "agent:second", caps: ["grant.read", "escrow.hold"], ttlSec: week, budget: { usd_cents: 600, calls: 5, deploys: 0 } },
+    });
+    expect(second.status).toBe(201);
+    expect(second.json.exp).toBeLessThanOrEqual(now() + day);
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    for (const over of [{ deadline: now() + 3 * day }, { ttlSec: 3 * day }]) {
+      const r = await req("POST", "/api/escrow", { token: second.json.token, body: body(over) });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toBe("escrow_deadline_exceeds_payer_key");
+      expect(r.json.detail.payer_exp).toBe(second.json.exp);
+    }
+    // nothing was held by the refusals: the whole budget is still there for a hold that fits
+    const fits = await req("POST", "/api/escrow", { token: second.json.token, body: body({ amount: 600, deadline: second.json.exp }) });
+    expect(fits.status).toBe(201);
+    expect(fits.json.escrow.deadline).toBe(second.json.exp);
+    // with no deadline asked, the default (an hour) still opens
+    const lead2 = await req("POST", "/api/escrow", { token: lead.json.token, body: body({}) });
+    expect(lead2.status).toBe(201);
+    expect(lead2.json.escrow.deadline).toBeLessThanOrEqual(now() + 3600);
+  });
+
+  // A deadline that cannot be read, or has already passed, used to be swapped for the default
+  // hour with a 201: the payer got a hold it never asked for.
+  test("a hold deadline that is not a time, or has already passed, is refused, never swapped for the default hour", async () => {
+    const t = await newTenant("hold-deadline-odd", "pro");
+    const now = () => Math.floor(Date.now() / 1000);
+    const left = async () => (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining.usd_cents;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const before = await left();
+    for (const deadline of ["2026-12-25T00:00:00Z", "soon", "", "0", true, false, [], {}, [now() + 600], now() - 5, 1, -1]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline }) });
+      expect([JSON.stringify(deadline), r.status, r.json.error]).toEqual([JSON.stringify(deadline), 400, "escrow_deadline_invalid"]);
+    }
+    expect(await left()).toBe(before); // the refusals held nothing
+    // "Not given" is exactly: absent, null, or the number 0. Those still open the default hour.
+    for (const over of [{}, { deadline: null }, { deadline: 0 }]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body(over) });
+      expect(r.status).toBe(201);
+      expect(r.json.escrow.deadline).toBeGreaterThan(now() + 3500);
+      expect(r.json.escrow.deadline).toBeLessThanOrEqual(now() + 3600);
+    }
+    // A real deadline is kept, written as a number or as a string that reads as one.
+    for (const deadline of [now() + 600, String(now() + 600)]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline }) });
+      expect(r.status).toBe(201);
+      expect(r.json.escrow.deadline).toBe(Number(deadline)); // to the second
+    }
+  });
+
+  // The owner's approval runs the request as it was asked. If its deadline has gone by while it
+  // waited, there is nothing left to honour: it used to open a fresh one-hour hold instead.
+  test("a hold whose deadline passes while it waits for the owner is refused at approval, not opened for a fresh hour", async () => {
+    const t = await newTenant("hold-deadline-late", "pro");
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const left = async () => (await req("GET", "/api/grants/verify", { token: asker.json.token })).json.remaining.usd_cents;
+    const intent = { amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, deadline: now() + 600 };
+    const d = await req("POST", "/api/escrow", { token: asker.json.token, body: intent });
+    expect(d.status).toBe(202);
+    // Time passes: the same request, its deadline now behind us.
+    await dbQuery("UPDATE approvals SET intent = $1::jsonb WHERE id = $2", [JSON.stringify({ ...intent, deadline: now() - 5 }), d.json.approval.id]);
+    const ok = await req("POST", `/api/approvals/${d.json.approval.id}`, { token: t.token, body: { decision: "approve" } });
+    expect(ok.status).toBe(400);
+    expect(ok.json.error).toBe("escrow_deadline_invalid");
+    expect(await left()).toBe(500); // nothing was held
+    const row = (await req("GET", "/api/approvals", { token: t.token })).json.approvals.find((a) => a.id === d.json.approval.id);
+    expect(row.status).toBe("failed");
+    expect((typeof row.result === "string" ? JSON.parse(row.result) : row.result).reason).toBe("escrow_deadline_invalid");
+  });
+
+  // A lifetime that is not a number was only refused when the hold was issued. For a payer whose
+  // dial says "ask" that is AFTER the approval was filed: the owner was asked to approve a hold
+  // that could never open.
+  test("a hold lifetime that is not a number is refused before anything is filed for the owner", async () => {
+    const t = await newTenant("hold-ttl-odd", "pro");
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const filed = async () => (await req("GET", "/api/approvals", { token: t.token })).json.approvals.length;
+    const left = async () => (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining.usd_cents;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const before = await left();
+    for (const ttlSec of ["abc", {}, "", true, []]) {
+      for (const token of [asker.json.token, t.token]) {
+        const r = await req("POST", "/api/escrow", { token, body: body({ ttlSec }) });
+        expect([JSON.stringify(ttlSec), r.status, r.json.error]).toEqual([JSON.stringify(ttlSec), 400, "ttl_invalid"]);
+      }
+    }
+    // It is refused even when a good deadline is given with it (the deadline would have won).
+    const both = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: now() + 600, ttlSec: "abc" }) });
+    expect([both.status, both.json.error]).toEqual([400, "ttl_invalid"]);
+    expect(await filed()).toBe(0); // the owner was never asked
+    expect(await left()).toBe(before); // and nothing was held
+    // A lifetime that is a number still works on both paths.
+    const opened = await req("POST", "/api/escrow", { token: t.token, body: body({ ttlSec: "600" }) });
+    expect(opened.status).toBe(201);
+    expect(opened.json.escrow.deadline).toBeLessThanOrEqual(now() + 600);
+    expect((await req("POST", "/api/escrow", { token: asker.json.token, body: body({ ttlSec: 600 }) })).status).toBe(202);
+    expect(await filed()).toBe(1);
+  });
+
+  // No request can give a payer key an unreadable end (the column is BIGINT NOT NULL), so the
+  // runtime proves this one on itself: /selftest calls the same check with such a key.
+  test("a hold is refused, not waved through, when the payer key's end cannot be read", async () => {
+    const r = await req("GET", "/selftest");
+    const check = r.json.results.find((c) => c.name === "payment hold refused when the payer key's end cannot be read");
+    expect(check).toEqual({ name: "payment hold refused when the payer key's end cannot be read", pass: true });
+  });
+
+  // The rule used where a hold's end is written (holdExpiry, policy.js): exactly the time asked,
+  // refused if a limit would end it sooner. /selftest runs it with a clock that moved on between
+  // the asking and the writing, which no request here can arrange.
+  test("where a hold's end is written, it is the time asked or a refusal, never sooner and never later", async () => {
+    const r = await req("GET", "/selftest");
+    const check = r.json.results.find((c) => c.name === "payment hold ends at the time asked, or is refused, never sooner");
+    expect(check).toEqual({ name: "payment hold ends at the time asked, or is refused, never sooner", pass: true });
+  });
+
+  // The tier's longest lifetime was the other thing that cut a hold short without a word: the
+  // owner's key asking for 20 days on a 7-day tier got a 201 and a 7-day hold.
+  test("a payment hold asked to outlast the tier's longest lifetime is refused, never quietly shortened", async () => {
+    const t = await newTenant("hold-outlives-tier", "studio"); // 7 days; the owner's own key lasts longer
+    const day = 86400;
+    const week = 7 * day;
+    const now = () => Math.floor(Date.now() / 1000);
+    const left = async () => (await req("GET", "/api/grants/verify", { token: t.token })).json.remaining.usd_cents;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const before = await left();
+    let named;
+    for (const over of [{ deadline: now() + 20 * day }, { ttlSec: 20 * day }, { ttlSec: week + 1 }]) {
+      const r = await req("POST", "/api/escrow", { token: t.token, body: body(over) });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toBe("escrow_deadline_exceeds_tier_max");
+      expect(r.json.detail.max_ttl_sec).toBe(week);
+      expect(Math.abs(r.json.detail.latest_deadline - (now() + week))).toBeLessThanOrEqual(2);
+      named = r.json.detail.latest_deadline;
+    }
+    expect(await left()).toBe(before); // the refusals held nothing
+    // The longest the tier allows still opens: asked as a lifetime, and as the deadline the refusal named.
+    const full = await req("POST", "/api/escrow", { token: t.token, body: body({ ttlSec: week }) });
+    expect(full.status).toBe(201);
+    expect(full.json.escrow.deadline).toBeGreaterThan(now() + week - 5);
+    const byName = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: named }) });
+    expect(byName.status).toBe(201);
+    expect(byName.json.escrow.deadline).toBe(named);
+  });
+
+  // A key handed out on a bigger tier can outlive a move to a smaller one. Its holds follow the
+  // tier the tenant is on NOW, and the refusal comes before the owner is asked anything.
+  test("after a move to a smaller tier, a hold past the new limit is refused before an approval is filed", async () => {
+    const t = await newTenant("hold-tier-moved", "studio");
+    const day = 86400;
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 7 * day, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const filed = async () => (await req("GET", "/api/approvals", { token: t.token })).json.approvals.length;
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    // On studio a 3-day hold from this key is fine: it goes to the owner.
+    const waiting = await req("POST", "/api/escrow", { token: asker.json.token, body: body({ deadline: now() + 3 * day }) });
+    expect(waiting.status).toBe(202);
+    expect(await filed()).toBe(1);
+    expect((await admin("POST", `/api/tenants/${t.id}/tier`, { body: { tier: "pro" } })).status).toBe(200); // pro: 1 day
+    const r = await req("POST", "/api/escrow", { token: asker.json.token, body: body({ deadline: now() + 3 * day }) });
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("escrow_deadline_exceeds_tier_max");
+    expect(r.json.detail.max_ttl_sec).toBe(day);
+    expect(await filed()).toBe(1); // nothing new was filed
+    // The request filed before the move is held to the new limit too when the owner approves it.
+    const ok = await req("POST", `/api/approvals/${waiting.json.approval.id}`, { token: t.token, body: { decision: "approve" } });
+    expect(ok.status).toBe(409);
+    expect(ok.json.error).toBe("escrow_deadline_exceeds_tier_max");
+    expect((await req("GET", "/api/grants/verify", { token: asker.json.token })).json.remaining.usd_cents).toBe(500); // nothing was held
+  });
+
+  // The tier is read more than once while a hold opens (the key check, the hold's own check,
+  // the issuing). If the tenant moves to a smaller tier between any two of those reads, the hold
+  // must be refused or kept whole. It used to come back 201, cut to the smaller tier's limit.
+  // One request cannot land in the middle of another here (one database session), so for this
+  // test `tenants` is a view that answers studio for the first K reads of this tenant and pro
+  // after that. Every K is tried, on the direct path and on the approvals path.
+  test("a tier that moves while a hold is being opened never cuts the hold short", async () => {
+    const t = await newTenant("hold-tier-races", "studio");
+    const day = 86400;
+    const now = () => Math.floor(Date.now() / 1000);
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 7 * day, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    const held = async () => (await dbQuery("SELECT count(*)::int AS n FROM grants WHERE tenant = $1 AND sub LIKE 'escrow:%'", [t.id])).rows[0].n;
+    const cols = (await dbQuery("SELECT column_name FROM information_schema.columns WHERE table_name = 'tenants' ORDER BY ordinal_position")).rows.map((r) => r.column_name);
+    const flipAfter = (k) => dbQuery("UPDATE tier_flip SET after = $1, seen = 0", [k]);
+    const direct = [], approved = [];
+    try {
+      await dbQuery("CREATE TABLE tier_flip (after int NOT NULL, seen int NOT NULL)");
+      await dbQuery("INSERT INTO tier_flip VALUES (1000000, 0)");
+      await dbQuery(`CREATE FUNCTION tier_seen(tid text, real_tier text) RETURNS text LANGUAGE plpgsql VOLATILE AS $f$
+        DECLARE flipped boolean;
+        BEGIN
+          IF tid <> '${t.id}' THEN RETURN real_tier; END IF;
+          UPDATE tier_flip SET seen = seen + 1 RETURNING seen > after INTO flipped;
+          RETURN CASE WHEN flipped THEN 'pro' ELSE real_tier END;
+        END $f$`);
+      await dbQuery("ALTER TABLE tenants RENAME TO tenants_real");
+      await dbQuery(`CREATE VIEW tenants AS SELECT ${cols.map((c) => (c === "tier" ? "tier_seen(id, tier) AS tier" : c)).join(", ")} FROM tenants_real`);
+      for (let k = 0; k <= 6; k++) {
+        const before = await held();
+        const asked = now() + 3 * day; // fine on studio (7 days), too long for pro (1 day)
+        await flipAfter(k);
+        const r = await req("POST", "/api/escrow", { token: t.token, body: body({ deadline: asked }) });
+        await flipAfter(1000000);
+        if (r.status === 201) {
+          expect([k, r.json.escrow.deadline]).toEqual([k, asked]); // kept whole, to the second
+          expect(await held()).toBe(before + 1);
+        } else {
+          expect([k, r.status, r.json.error]).toEqual([k, 409, "escrow_deadline_exceeds_tier_max"]);
+          expect(r.json.detail.max_ttl_sec).toBe(day);
+          expect(await held()).toBe(before); // refused: nothing held
+        }
+        direct.push(r.status);
+      }
+      for (let k = 0; k <= 6; k++) {
+        const before = await held();
+        const asked = now() + 3 * day;
+        const filed = await req("POST", "/api/escrow", { token: asker.json.token, body: body({ deadline: asked }) });
+        expect(filed.status).toBe(202);
+        await flipAfter(k);
+        const r = await req("POST", `/api/approvals/${filed.json.approval.id}`, { token: t.token, body: { decision: "approve" } });
+        await flipAfter(1000000);
+        if (r.status === 200) {
+          expect([k, r.json.status, r.json.result.escrow.deadline]).toEqual([k, "executed", asked]);
+          expect(await held()).toBe(before + 1);
+        } else {
+          expect([k, r.status, r.json.error]).toEqual([k, 409, "escrow_deadline_exceeds_tier_max"]);
+          expect(await held()).toBe(before);
+        }
+        approved.push(r.status);
+      }
+    } finally {
+      // Put the real table back whatever happened above, even a failure half-way through the swap.
+      await dbQuery("DROP VIEW IF EXISTS tenants");
+      if ((await dbQuery("SELECT to_regclass('tenants_real') IS NOT NULL AS there")).rows[0].there) await dbQuery("ALTER TABLE tenants_real RENAME TO tenants");
+      await dbQuery("DROP FUNCTION IF EXISTS tier_seen(text, text)");
+      await dbQuery("DROP TABLE IF EXISTS tier_flip");
+    }
+    // The sweep really crossed the window: early moves are refused, late ones (after the last
+    // read) open, and once K is past the last read it stays open.
+    for (const seen of [direct, approved]) {
+      expect(seen[0]).toBe(409);
+      expect(seen[6] === 201 || seen[6] === 200).toBe(true);
+      const firstOpen = seen.findIndex((x) => x !== 409);
+      expect(seen.slice(firstOpen).every((x) => x !== 409)).toBe(true);
+    }
+    // and the table is back: a new tenant can be made
+    expect((await newTenant("hold-tier-races-after", "pro")).id).toBeTruthy();
+  });
+
+  // A tier name the runtime does not know (a wrong name in the price map, say) used to answer
+  // 500 for the owner's key and file an approval that could never open for an "ask" key.
+  test("no hold opens under a tier the runtime does not know, and the owner is not asked", async () => {
+    const t = await newTenant("hold-tier-unknown", "pro");
+    const asker = await req("POST", "/api/grants", {
+      token: t.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const body = (over) => ({ amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
+    await dbQuery("UPDATE tenants SET tier = 'bogus' WHERE id = $1", [t.id]);
+    for (const token of [t.token, asker.json.token]) {
+      for (const over of [{}, { ttlSec: 600 }]) {
+        const r = await req("POST", "/api/escrow", { token, body: body(over) });
+        expect([r.status, r.json.error]).toEqual([403, "unknown_tier"]);
+      }
+    }
+    expect((await req("GET", "/api/approvals", { token: t.token })).json.approvals.length).toBe(0);
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE tenant = $1 AND sub LIKE 'escrow:%'", [t.id])).rows[0].n).toBe(0);
+  });
+
+  test("a lifetime that is not a number is a clean 400, not a server error", async () => {
+    const t = await newTenant("ttl-odd");
+    for (const ttlSec of ["abc", {}]) {
+      const r = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:x", caps: ["grant.read"], ttlSec } });
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("ttl_invalid");
+    }
+    const numeric = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:x", caps: ["grant.read"], ttlSec: "600" } });
+    expect(numeric.status).toBe(201);
+  });
+
+  test("% and backslash in a memory scope are plain characters too", async () => {
+    const t = await newTenant("list-literal");
+    for (const partition of ["50%", "50x", "a\\b", "a\\b:c", "axb"])
+      expect((await req("POST", "/api/memory", { token: t.token, body: { partition, content: partition } })).status).toBe(201);
+    const key = async (partitions) =>
+      (await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:reader", caps: ["memory.read"], ttlSec: 600, scope: { memory: { partitions } } } })).json.token;
+    const list = async (token) => ((await req("GET", "/api/memory?limit=50", { token })).json.memories || []).map((m) => m.partition).sort();
+    expect(await list(await key(["50%"]))).toEqual(["50%"]);
+    expect(await list(await key(["a\\b"]))).toEqual(["a\\b", "a\\b:c"]);
+  });
+
+  // The planner used to search the WHOLE tenant for anyone allowed to plan, so its evidence
+  // leaked memory the caller's key could not read.
+  test("the planner's evidence comes only from memory the caller's own key may read", async () => {
+    const t = await newTenant("plan-evidence");
+    for (const [partition, content] of [["owner:private", "zebraquartz owner secret"], ["agent:a:", "zebraquartz agent a note"], ["agent:b:", "zebraquartz agent b note"]])
+      expect((await req("POST", "/api/memory", { token: t.token, body: { partition, content } })).status).toBe(201);
+    const key = async (caps, partitions) =>
+      (await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:p", caps, ttlSec: 600, scope: { memory: { partitions } } } })).json.token;
+    const evidence = async (token) => {
+      const r = await req("POST", "/api/cog/plan", { token, body: { intent: "zebraquartz" } });
+      expect(r.status).toBe(200);
+      return (r.json.proposal.evidence || []).map((e) => e.partition).sort();
+    };
+    // may plan, may not read memory: no evidence at all
+    expect(await evidence(await key(["cog.plan"], ["agent:a:"]))).toEqual([]);
+    // may plan and read, but its memory scope is empty: no evidence
+    expect(await evidence(await key(["cog.plan", "memory.read"], []))).toEqual([]);
+    // may plan and read agent a's memory: only that
+    expect(await evidence(await key(["cog.plan", "memory.read"], ["agent:a:"]))).toEqual(["agent:a:"]);
+    // the owner's own key still gets all of it
+    expect((await evidence(t.token)).length).toBe(3);
+  });
+
+  test("a guest cannot read another guest's memory through the planner", async () => {
+    const a = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.41.1" } });
+    const b = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.42.1" } });
+    expect(a.status).toBe(201);
+    expect(b.status).toBe(201);
+    const mine = (await req("GET", "/api/grants/verify", { token: a.json.grant })).json.scope.memory.partitions[0];
+    expect((await req("POST", "/api/memory", { token: a.json.grant, body: { partition: mine, content: "quartzzebra guest a private note" } })).status).toBe(201);
+    const plan = await req("POST", "/api/cog/plan", { token: b.json.grant, body: { intent: "quartzzebra" } });
+    expect(plan.status).toBe(200);
+    expect(JSON.stringify(plan.json)).not.toContain("guest a private note");
+    expect(plan.json.proposal.evidence || []).toEqual([]);
+  });
 });
 
 // ------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------
+// Tours (src/tours.js, docs/specs/tours.md): more TIME for an agent without a longer key.
+describe("7c. tours: an agent keeps getting a fresh 24-hour key until a date the owner set", () => {
+  const DAY = 86400;
+  const now = () => Math.floor(Date.now() / 1000);
+  const SPEC = { agent: "report.agent", days: 3, caps: ["memory.read", "memory.write", "grant.read", "ledger.read"], budget: { usd_cents: 0, calls: 100, deploys: 0 } };
+  const open = (t, over = {}) => req("POST", "/api/tours", { token: t.token, body: { ...SPEC, ...over } });
+  const renew = (token) => req("POST", "/api/tours/renew", { token, body: {} });
+  const works = async (token) => (await req("GET", "/api/grants", { token })).status;
+  const tourOf = async (t, id) => (await req("GET", "/api/tours", { token: t.token })).json.tours.find((x) => x.id === id);
+  // a renewal may not follow another within a minute: move the tour's clock back instead of waiting
+  const rested = (tourId) => dbQuery("UPDATE tours SET last_renewed_at = last_renewed_at - 3600 WHERE id = $1", [tourId]);
+  const reservedOf = async (grantId) => JSON.parse(JSON.stringify((await dbQuery("SELECT reserved FROM grants WHERE id = $1", [grantId])).rows[0].reserved));
+  // every key that works under a tour, counted where the runtime itself looks: by parent
+  const liveUnder = async (holdId) => (await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1 AND status = 'active'", [holdId])).rows[0].n;
+  // as if ten minutes had passed since a key was cancelled (the alarm's grace is two)
+  const longAgo = (grantId) => dbQuery("UPDATE grants SET revoked_at = now() - interval '10 minutes' WHERE id = $1", [grantId]);
+  // Make ONE chosen statement fail, or make something else happen at that exact moment, for the length of `fn`:
+  // a database trigger that exists only inside one test. This is how a step is made to fail half way.
+  const during = async (name, table, timing, when, body, fn) => {
+    await dbQuery(`CREATE OR REPLACE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN ${body} END $f$`);
+    await dbQuery(`CREATE TRIGGER ${name} ${timing} ON ${table} FOR EACH ROW WHEN (${when}) EXECUTE FUNCTION ${name}()`);
+    try {
+      return await fn();
+    } finally {
+      await dbQuery(`DROP TRIGGER IF EXISTS ${name} ON ${table}`);
+      await dbQuery(`DROP FUNCTION IF EXISTS ${name}()`);
+    }
+  };
+  // At a chosen moment a key appears under the holding grant, as a renewal that was in hand would write one. It is
+  // a copy of `likeKeyId` with nothing held, so no balance moves; only whether it WORKS afterwards is of interest.
+  const keySlipsIn = (name, table, timing, when, likeKeyId, newId, fn) =>
+    during(name, table, timing, when,
+      `INSERT INTO grants (id, tenant, parent, depth, sub, status, caps, scope, budget, constraints, payload, iat, exp)
+       SELECT '${newId}', tenant, parent, depth, sub, 'active', caps, scope, '{"usd_cents":0,"calls":0,"deploys":0}'::jsonb, constraints, payload, iat, exp FROM grants WHERE id = '${likeKeyId}'; RETURN NEW;`,
+      fn);
+  const statusOf = async (grantId) => (await dbQuery("SELECT status FROM grants WHERE id = $1", [grantId])).rows[0]?.status;
+  const cannotCancel = (name, grantId, fn) => during(name, "grants", "BEFORE UPDATE", `OLD.id = '${grantId}' AND NEW.status = 'revoked'`, "RAISE EXCEPTION 'test: this key cannot be cancelled right now';", fn);
+
+  test("the owner opens a tour: the stay is days long, the key is 24 hours at most, and it opens only that agent's memory", async () => {
+    const t = await newTenant("tour-open", "studio");
+    const r = await open(t);
+    expect(r.status).toBe(201);
+    const { tour, key, receipt } = r.json;
+    expect(tour.status).toBe("active");
+    expect(tour.agent).toBe("report.agent");
+    expect(tour.until).toBeGreaterThan(now() + 3 * DAY - 60);
+    expect(tour.until).toBeLessThanOrEqual(now() + 3 * DAY);
+    expect(tour.key.id).toBe(key.id);
+    expect(tour.live_keys).toBe(1);
+    expect(key.exp).toBeLessThanOrEqual(now() + DAY); // the KEY is never longer than a day
+    expect(key.exp).toBeGreaterThan(now() + DAY - 60);
+    expect(key.sub).toBe("agent:report.agent");
+    expect(key.caps).toEqual(SPEC.caps);
+    expect(key.budget.calls).toBe(100);
+    expect(receipt.tour).toBe(tour.id);
+    expect(receipt.first_key).toBe(key.id);
+    expect(receipt.until).toBe(tour.until);
+    expect(receipt.limited_by).toBe("asked");
+    // exactly ONE key is handed out: the holding grant's token is never in the answer
+    expect(r.text.match(/cog1\./g).length).toBe(1);
+    expect(await works(key.token)).toBe(200);
+    // its memory is the section kept under the agent's NAME, and no other
+    expect((await req("POST", "/api/memory", { token: key.token, body: { partition: "agent:report.agent:", key: "k", content: "mine" } })).status).toBe(201);
+    expect((await req("POST", "/api/memory", { token: key.token, body: { partition: "agent:report.agent2:", key: "k", content: "not mine" } })).status).toBe(403);
+    expect((await req("GET", "/api/memory?partition=tenant", { token: key.token })).status).toBe(403);
+  });
+
+  test("a tour that must end sooner than asked says so: the owner's own key ends first", async () => {
+    const t = await newTenant("tour-short-owner", "studio");
+    const ownerEnds = now() + 2 * DAY;
+    await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [t.grantId, ownerEnds]);
+    const r = await open(t, { days: 3 });
+    expect(r.status).toBe(201);
+    expect(r.json.receipt.limited_by).toBe("owner_key");
+    expect(r.json.receipt.until).toBe(ownerEnds);
+    expect(r.json.tour.until).toBe(ownerEnds);
+    const note = (await req("GET", "/api/ledger", { token: t.token })).json.ledger.find((l) => l.kind === "tour-open").note;
+    expect(note).toContain("asked 3 day(s)");
+    expect(note).toContain("sooner");
+  });
+
+  test("the holding grant is a record, never a credential: even a token minted for it by the admin is refused", async () => {
+    const t = await newTenant("tour-holder", "studio");
+    const r = await open(t);
+    const minted = await admin("POST", `/api/admin/grants/${r.json.receipt.holding_grant}/token`);
+    expect(minted.status).toBe(200);
+    const use = await req("GET", "/api/tenant", { token: minted.json.token });
+    expect(use.status).toBe(401);
+    expect(use.json.error).toBe("holding_grant");
+    expect((await req("POST", "/api/grants", { token: minted.json.token, body: { sub: "agent:x", caps: ["grant.read"] } })).status).toBe(401);
+    expect((await renew(minted.json.token)).status).toBe(401);
+  });
+
+  test("an old token for the holding grant cannot end an extended tour early: the row's end decides, not the token's", async () => {
+    const t = await newTenant("tour-old-token", "studio");
+    const first = (await open(t, { days: 2 })).json;
+    const hold = first.receipt.holding_grant;
+    // the token text says it ended an hour ago; the row (as after an extension) says it has days to go
+    await dbQuery("UPDATE grants SET payload = jsonb_set(payload::jsonb, '{exp}', to_jsonb($2::bigint))::text WHERE id = $1", [hold, now() - 3600]);
+    const stale = (await admin("POST", `/api/admin/grants/${hold}/token`)).json.token;
+    // with no key working under it, nothing but the end date stands between that token and ending the tour
+    expect((await admin("POST", `/api/admin/grants/${first.key.id}/revoke`, { body: { reason: "test: key lost" } })).status).toBe(200);
+    const use = await req("GET", "/api/tenant", { token: stale });
+    expect(use.status).toBe(401);
+    expect(use.json.error).toBe("grant_expired");
+    expect((await dbQuery("SELECT status FROM grants WHERE id = $1", [hold])).rows[0].status).toBe("active");
+    const fresh = await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} });
+    expect(fresh.status).toBe(201);
+    expect(fresh.json.key.budget.calls).toBe(100);
+  });
+
+  test("only the owner opens a tour, and a bad request holds nothing", async () => {
+    const t = await newTenant("tour-refuse", "studio");
+    const before = await reservedOf(t.grantId);
+    const helper = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:helper", caps: ["grant.issue", "grant.read", "memory.read"], ttlSec: 3600, budget: { usd_cents: 0, calls: 10, deploys: 0 } } });
+    const mid = await reservedOf(t.grantId);
+    const notOwner = await req("POST", "/api/tours", { token: helper.json.token, body: SPEC });
+    expect(notOwner.status).toBe(403);
+    expect(notOwner.json.error).toBe("owner_required");
+    for (const [over, error] of [
+      [{ agent: "Report Agent" }, "tour_agent_required"], [{ agent: "" }, "tour_agent_required"], [{ agent: "../x" }, "tour_agent_required"], [{ agent: "a:b" }, "tour_agent_required"], [{ agent: ["report"] }, "tour_agent_required"],
+      [{ days: 0 }, "tour_days_invalid"], [{ days: 8 }, "tour_days_invalid"], [{ days: 1.5 }, "tour_days_invalid"], [{ days: "3" }, "tour_days_invalid"], [{ days: undefined }, "tour_days_invalid"],
+      [{ caps: [] }, "tour_caps_required"], [{ caps: "memory.read" }, "tour_caps_required"], [{ caps: [1] }, "tour_caps_required"],
+      [{ budget: undefined }, "tour_budget_required"], [{ budget: { usd_cents: 0, calls: 0, deploys: 0 } }, "tour_budget_required"], [{ budget: [100] }, "tour_budget_required"],
+    ]) {
+      const r = await open(t, over);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe(error);
+    }
+    // powers the owner's own key does not have, or more money than it has, are refused by the ordinary rule
+    expect((await open(t, { caps: ["memory.read", "not.a.cap"] })).status).toBe(403);
+    expect((await open(t, { budget: { usd_cents: 99999999, calls: 1, deploys: 0 } })).status).toBeGreaterThanOrEqual(402);
+    expect(await reservedOf(t.grantId)).toEqual(mid); // none of the refusals left anything held
+    expect(mid.calls).toBe(before.calls + 10);
+    // a tier that allows keys of one day cannot be given a three-day stay
+    const pro = await newTenant("tour-tier", "pro");
+    const tooLong = await open(pro);
+    expect(tooLong.status).toBe(403);
+    expect(tooLong.json.error).toBe("tour_exceeds_tier");
+    expect(tooLong.json.detail.max_days).toBe(1);
+    // one tour per agent name
+    expect((await open(t)).status).toBe(201);
+    const again = await open(t);
+    expect(again.status).toBe(409);
+    expect(again.json.error).toBe("tour_exists");
+    expect((await open(t, { agent: "other.agent" })).status).toBe(201);
+  });
+
+  test("opening: if the tour cannot be recorded nothing stays held, and two opens at the same moment cannot both win", async () => {
+    const t = await newTenant("tour-open-fail", "studio");
+    const before = await reservedOf(t.grantId);
+    const below = async () => (await dbQuery("SELECT count(*)::int AS n FROM grants WHERE tenant = $1 AND status = 'active' AND depth > 0", [t.id])).rows[0].n;
+    const liveTours = async () => (await dbQuery("SELECT count(*)::int AS n FROM tours WHERE tenant = $1 AND agent = $2 AND status IN ('active', 'frozen')", [t.id, SPEC.agent])).rows[0].n;
+    // the record cannot be written at all: no holding grant is left behind holding the owner's budget
+    const failed = await during("tr_tour_insert_fails", "tours", "BEFORE INSERT", `NEW.tenant = '${t.id}'`, "RAISE EXCEPTION 'test: the tour cannot be recorded';", () => open(t));
+    expect(failed.status).toBe(500);
+    expect(failed.text).not.toContain("cog1.");
+    expect(await reservedOf(t.grantId)).toEqual(before);
+    expect(await below()).toBe(0);
+    // the other open got its record in first (the look before the insert saw nothing): the table itself refuses the second
+    const lost = await during("tr_tour_insert_dup", "tours", "BEFORE INSERT", `NEW.tenant = '${t.id}'`, "RAISE EXCEPTION 'duplicate key value violates unique constraint \"tours_one_live_per_agent\"' USING ERRCODE = 'unique_violation';", () => open(t));
+    expect(lost.status).toBe(409);
+    expect(lost.json.error).toBe("tour_exists");
+    expect(await reservedOf(t.grantId)).toEqual(before);
+    expect(await below()).toBe(0);
+    // and for real: two at once
+    const both = await Promise.all([open(t), open(t)]);
+    expect(both.map((r) => r.status).sort()).toEqual([201, 409]);
+    expect(both.find((r) => r.status === 409).json.error).toBe("tour_exists");
+    expect(await liveTours()).toBe(1);
+    expect(await below()).toBe(2); // one holding grant and its one key
+    expect((await reservedOf(t.grantId)).calls).toBe(before.calls + 100); // one tour's budget held, not two
+    // the rule is the table's own, not only a look before the insert
+    const winner = both.find((r) => r.status === 201).json;
+    await expect(
+      dbQuery("INSERT INTO tours (id, tenant, grant_id, agent, status, opened_at, until, last_renewed_at) VALUES ('tr_second', $1, $2, $3, 'active', 0, 0, 0)", [t.id, winner.receipt.holding_grant, SPEC.agent]),
+    ).rejects.toThrow();
+  });
+
+  test("renewing: the old key stops, the new one works, and time never refills money", async () => {
+    const t = await newTenant("tour-renew", "studio");
+    const first = (await open(t)).json;
+    expect((await req("POST", "/api/grants/settle", { token: first.key.token, body: { calls: 30, ref: "work:day1" } })).status).toBe(200);
+    const soon = await renew(first.key.token);
+    expect(soon.status).toBe(429); // not twice within a minute
+    expect(soon.json.error).toBe("tour_renew_too_soon");
+    expect(await works(first.key.token)).toBe(200); // a refused renewal changes nothing
+    await rested(first.tour.id);
+    const second = await renew(first.key.token);
+    expect(second.status).toBe(201);
+    expect(second.json.key.id).not.toBe(first.key.id);
+    expect(second.json.key.exp).toBeLessThanOrEqual(now() + DAY);
+    expect(second.json.key.budget.calls).toBe(70); // 100 at the start, 30 spent on day one
+    expect(second.json.tour.renewals).toBe(1);
+    expect(second.json.tour.left.calls).toBe(70);
+    expect(second.json.tour.key.id).toBe(second.json.key.id);
+    expect(second.json.receipt.replaced_key).toBe(first.key.id);
+    expect(await works(first.key.token)).toBe(401);
+    expect(await works(second.json.key.token)).toBe(200);
+    expect(await liveUnder(first.receipt.holding_grant)).toBe(1);
+    // the same memory, the moment the new key exists
+    expect((await req("POST", "/api/memory", { token: second.json.key.token, body: { partition: "agent:report.agent:", key: "day2", content: "carried on" } })).status).toBe(201);
+    // the old key cannot renew again, and neither can a key that is not a tour's current key
+    expect((await renew(first.key.token)).status).toBe(401);
+    expect((await renew(t.token)).status).toBe(404);
+    const plain = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:plain", caps: ["grant.read"], ttlSec: 600 } });
+    const notTour = await renew(plain.json.token);
+    expect(notTour.status).toBe(404);
+    expect(notTour.json.error).toBe("not_a_tour_key");
+    // two renewals with the same key at the same moment: exactly one new key. Never two, and never none.
+    // (Many times over, a little apart each time: which one reads the tour first must not matter.)
+    let key = second.json.key;
+    for (let i = 0; i < 12; i++) {
+      await rested(first.tour.id);
+      const token = key.token;
+      const pair = await Promise.all([renew(token), new Promise((r) => setTimeout(r, i % 5)).then(() => renew(token))]);
+      expect(pair.filter((r) => r.status === 201).length).toBe(1);
+      expect(pair.filter((r) => r.status !== 201).every((r) => [401, 409].includes(r.status) && !r.text.includes("cog1."))).toBe(true);
+      expect(await liveUnder(first.receipt.holding_grant)).toBe(1);
+      key = pair.find((r) => r.status === 201).json.key;
+      expect(await works(key.token)).toBe(200);
+      expect(key.budget.calls).toBe(70);
+    }
+    expect((await tourOf(t, first.tour.id)).status).toBe("active");
+  }, 60000);
+
+  test("a renewal that fails at its first step changes nothing: the key still works and can renew", async () => {
+    const t = await newTenant("tour-renew-fail", "studio");
+    const first = (await open(t)).json;
+    await rested(first.tour.id);
+    const failed = await cannotCancel("tr_renew_cancel_fails", first.key.id, () => renew(first.key.token));
+    expect(failed.status).toBe(500);
+    expect(failed.text).not.toContain("cog1.");
+    // nothing moved: the tour still points at the key, the key still works, and no other key exists
+    expect(await works(first.key.token)).toBe(200);
+    const tour = await tourOf(t, first.tour.id);
+    expect(tour.status).toBe("active");
+    expect(tour.key.id).toBe(first.key.id);
+    expect(tour.live_keys).toBe(1);
+    const second = await renew(first.key.token);
+    expect(second.status).toBe(201);
+    expect(second.json.key.budget.calls).toBe(100);
+    expect(await works(first.key.token)).toBe(401);
+  });
+
+  test("the alarm: a key that a renewal replaced, used again later, freezes the tour until the owner steps in", async () => {
+    const t = await newTenant("tour-alarm", "studio");
+    const first = (await open(t, { caps: [...SPEC.caps, "grant.issue"] })).json;
+    const helper = await req("POST", "/api/grants", { token: first.key.token, body: { sub: "agent:helper", caps: ["grant.read"], ttlSec: 600, budget: { usd_cents: 0, calls: 5, deploys: 0 } } });
+    expect(helper.status).toBe(201);
+    await rested(first.tour.id);
+    const second = (await renew(first.key.token)).json;
+    // straight after the renewal the old key is simply refused: a call that was already on its way is not an alarm
+    expect(await works(first.key.token)).toBe(401);
+    expect(await works(second.key.token)).toBe(200);
+    expect((await tourOf(t, first.tour.id)).status).toBe("active");
+    // a helper the old key had hired is gone with it, and ITS late use is not the alarm either
+    await longAgo(helper.json.id);
+    expect(await works(helper.json.token)).toBe(401);
+    expect((await tourOf(t, first.tour.id)).status).toBe("active");
+    // a day later the agent renews again, so two replaced keys now exist
+    await rested(first.tour.id);
+    const third = (await renew(second.key.token)).json;
+    // ten minutes later the FIRST replaced key turns up again: somebody else has a copy
+    await longAgo(first.key.id);
+    expect(await works(first.key.token)).toBe(401);
+    const frozen = await tourOf(t, first.tour.id);
+    expect(frozen.status).toBe("frozen");
+    expect(frozen.frozen_reason).toContain("used again");
+    expect(frozen.live_keys).toBe(0);
+    expect(await works(third.key.token)).toBe(401); // the current key is cancelled with it
+    expect((await renew(third.key.token)).status).toBe(401);
+    // only the owner can put it right, and then the agent carries on with what the tour has left
+    const fresh = await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} });
+    expect(fresh.status).toBe(201);
+    expect(fresh.json.tour.status).toBe("active");
+    expect(fresh.json.key.budget.calls).toBe(100);
+    expect(await works(fresh.json.key.token)).toBe(200);
+    // the same dead key cannot freeze the tour a second time: it raised its alarm once
+    expect(await works(first.key.token)).toBe(401);
+    expect((await tourOf(t, first.tour.id)).status).toBe("active");
+    // nor can the OTHER key that was replaced before the owner looked: the reissue started the tour afresh
+    await longAgo(second.key.id);
+    expect(await works(second.key.token)).toBe(401);
+    expect((await tourOf(t, first.tour.id)).status).toBe("active");
+    expect(await works(fresh.json.key.token)).toBe(200);
+    // but the alarm itself is still set: the next key to be replaced and used late raises it again
+    await rested(first.tour.id);
+    const fourth = (await renew(fresh.json.key.token)).json;
+    await longAgo(fresh.json.key.id);
+    expect(await works(fresh.json.key.token)).toBe(401);
+    expect((await tourOf(t, first.tour.id)).status).toBe("frozen");
+    expect(await works(fourth.key.token)).toBe(401);
+    const ledger = (await req("GET", "/api/ledger", { token: t.token })).json.ledger;
+    for (const k of ["tour-open", "tour-renew", "tour-freeze", "tour-reissue"]) expect(ledger.map((l) => l.kind)).toContain(k);
+    expect(ledger.filter((l) => l.kind === "tour-freeze").length).toBe(2); // one line per freeze, not one per use of the dead key
+    const events = (await admin("GET", "/api/admin/events")).json.events.map((e) => e.type);
+    for (const e of ["tour.opened", "tour.renewed", "tour.frozen", "tour.reissued"]) expect(events).toContain(e);
+  });
+
+  test("a freeze that lands in the middle of a renewal: the renewal is refused and no key is left working", async () => {
+    const t = await newTenant("tour-freeze-mid", "studio");
+    const first = (await open(t)).json;
+    const hold = first.receipt.holding_grant;
+    await rested(first.tour.id);
+    // the moment the next key is written, the tour is frozen (exactly what the alarm does), before the renewal can hand the key over
+    const r = await during(
+      "tr_freeze_mid_renewal", "grants", "AFTER INSERT", `NEW.parent = '${hold}'`,
+      `UPDATE tours SET status = 'frozen', frozen_reason = 'test: frozen in the middle of a renewal', current_key = NULL WHERE id = '${first.tour.id}'; RETURN NULL;`,
+      () => renew(first.key.token),
+    );
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_frozen");
+    expect(r.text).not.toContain("cog1."); // no key is handed out
+    expect(await liveUnder(hold)).toBe(0); // and the one that was written does not work
+    expect(await works(first.key.token)).toBe(401);
+    const tour = await tourOf(t, first.tour.id);
+    expect(tour.status).toBe("frozen");
+    expect(tour.renewals).toBe(0);
+    expect(tour.left.calls).toBe(100);
+    expect((await reservedOf(hold)).calls).toBe(0); // nothing is held under the tour any more
+    // The other way round: the renewal's key is written just as the alarm marks the tour frozen, after the alarm has
+    // already cancelled what it found. The alarm looks under the tour once more before it is done.
+    const u = await newTenant("tour-freeze-mid-2", "studio");
+    const one = (await open(u)).json;
+    await rested(one.tour.id);
+    const two = (await renew(one.key.token)).json;
+    await longAgo(one.key.id);
+    await keySlipsIn("tr_key_slips_in_at_freeze", "tours", "AFTER UPDATE", `NEW.id = '${one.tour.id}' AND NEW.status = 'frozen' AND OLD.status = 'active'`, two.key.id, "gr_slipped_freeze", async () => {
+      expect(await works(one.key.token)).toBe(401); // the alarm
+    });
+    // (looked at in the table first: the owner's list would itself sweep a frozen tour clean)
+    expect(await statusOf("gr_slipped_freeze")).toBe("revoked");
+    expect(await liveUnder(one.receipt.holding_grant)).toBe(0);
+    expect((await tourOf(u, one.tour.id)).status).toBe("frozen");
+  });
+
+  test("a tour never reads frozen while a key under it still works", async () => {
+    const t = await newTenant("tour-freeze-fail", "studio");
+    const first = (await open(t)).json;
+    const hold = first.receipt.holding_grant;
+    await rested(first.tour.id);
+    const second = (await renew(first.key.token)).json;
+    await longAgo(first.key.id);
+    // the alarm goes off but the current key cannot be cancelled: the tour must not claim to be frozen
+    await cannotCancel("tr_freeze_cancel_fails", second.key.id, async () => {
+      expect(await works(first.key.token)).toBe(401);
+      expect((await tourOf(t, first.tour.id)).status).toBe("active");
+      expect(await works(second.key.token)).toBe(200);
+    });
+    // the very next use of the old key tries again, and this time finishes
+    expect(await works(first.key.token)).toBe(401);
+    expect((await tourOf(t, first.tour.id)).status).toBe("frozen");
+    expect(await works(second.key.token)).toBe(401);
+    expect(await liveUnder(hold)).toBe(0);
+    // Backstop: a tour that IS marked frozen with a key still working under it (the mark was written and the last
+    // cancel then failed) is put right by the sweep, whether or not the old key is ever used again.
+    const fresh = (await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} })).json;
+    await dbQuery("UPDATE tours SET status = 'frozen', current_key = NULL WHERE id = $1", [first.tour.id]);
+    expect(await works(fresh.key.token)).toBe(200);
+    expect((await admin("POST", "/api/admin/grants/reap")).status).toBe(200);
+    expect(await works(fresh.key.token)).toBe(401);
+    expect(await liveUnder(hold)).toBe(0);
+    expect((await tourOf(t, first.tour.id)).status).toBe("frozen"); // still the owner's to put right
+  });
+
+  test("a key the tour lost sight of is cancelled at the next reissue, and the new key gets everything the tour has left", async () => {
+    const t = await newTenant("tour-stray", "studio");
+    const first = (await open(t)).json;
+    // as if a step had died half way: a key works under the tour, and the tour's own note of it is gone
+    await dbQuery("UPDATE tours SET current_key = NULL WHERE id = $1", [first.tour.id]);
+    const lost = await tourOf(t, first.tour.id);
+    expect(lost.status).toBe("key_run_out");
+    expect(lost.key).toBe(null);
+    expect(lost.live_keys).toBe(1); // counted, not hidden
+    expect(await works(first.key.token)).toBe(200);
+    expect((await renew(first.key.token)).status).toBe(404); // it is not the tour's current key
+    const fresh = await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} });
+    expect(fresh.status).toBe(201);
+    expect(fresh.json.key.budget.calls).toBe(100); // not 0: what the lost key held came back first
+    expect(await works(first.key.token)).toBe(401);
+    expect(fresh.json.tour.live_keys).toBe(1);
+    expect(await liveUnder(first.receipt.holding_grant)).toBe(1);
+    // the same when the alarm goes off: every key under the tour stops, whichever one the tour's note points at
+    await rested(first.tour.id);
+    const next = (await renew(fresh.json.key.token)).json;
+    await dbQuery("UPDATE tours SET current_key = NULL WHERE id = $1", [first.tour.id]);
+    await longAgo(fresh.json.key.id);
+    expect(await works(fresh.json.key.token)).toBe(401);
+    expect((await tourOf(t, first.tour.id)).status).toBe("frozen");
+    expect(await works(next.key.token)).toBe(401);
+    // and when the tour is ended
+    const again = (await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} })).json;
+    await dbQuery("UPDATE tours SET current_key = NULL WHERE id = $1", [first.tour.id]);
+    expect((await req("POST", `/api/tours/${first.tour.id}/end`, { token: t.token, body: {} })).status).toBe(200);
+    expect(await works(again.key.token)).toBe(401);
+  });
+
+  test("a cancel reason beginning \"tour:\" is the runtime's to write: the revoke routes refuse it, and one written by hand is not the alarm", async () => {
+    const t = await newTenant("tour-spoof", "studio");
+    const first = (await open(t)).json;
+    // neither route writes such a reason, whoever asks; refused means nothing happened
+    for (const reason of ["tour: renewed", "TOUR: renewed", " tour: anything at all"]) {
+      const mine = await req("POST", `/api/grants/${first.key.id}/revoke`, { token: t.token, body: { reason } });
+      expect(mine.status).toBe(400);
+      expect(mine.json.error).toBe("reason_reserved");
+      const theirs = await admin("POST", `/api/admin/grants/${first.key.id}/revoke`, { body: { reason } });
+      expect(theirs.status).toBe(400);
+      expect(theirs.json.error).toBe("reason_reserved");
+    }
+    expect(await works(first.key.token)).toBe(200);
+    expect((await tourOf(t, first.tour.id)).status).toBe("active");
+    // the tour's CURRENT key, cancelled with the very words a renewal writes (in the table: no route writes them now),
+    // long ago, and given back as a real cancel gives back
+    await dbQuery("UPDATE grants SET status = 'revoked', revoked_at = now() - interval '10 minutes', revoke_reason = 'tour: renewed' WHERE id = $1", [first.key.id]);
+    await dbQuery(`UPDATE grants SET reserved = '{"usd_cents":0,"calls":0,"deploys":0}'::jsonb WHERE id = $1`, [first.receipt.holding_grant]);
+    expect(await works(first.key.token)).toBe(401);
+    const tour = await tourOf(t, first.tour.id);
+    expect(tour.status).toBe("key_run_out"); // not frozen: no renewal ever replaced that key
+    expect((await req("GET", "/api/ledger", { token: t.token })).json.ledger.map((l) => l.kind)).not.toContain("tour-freeze");
+    expect((await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} })).status).toBe(201);
+    // the MCP tool is the third door: the owner's key can cancel a key with it too
+    const plain = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:plain", caps: ["grant.read"], ttlSec: 600 } });
+    const viaMcp = await mcp(t.token, "tools/call", { name: "grant_revoke", arguments: { id: plain.json.id, reason: "tour: renewed" } });
+    expect(viaMcp.json.result.isError).toBe(true); // an MCP tool answers a refusal as a result, not as a status
+    expect(JSON.parse(viaMcp.json.result.content[0].text).error).toBe("reason_reserved");
+    expect((await req("GET", "/api/grants/verify", { token: plain.json.token })).status).toBe(200); // refused means nothing happened
+    // an ordinary reason still goes through on both routes; only the prefix is the runtime's
+    expect((await req("POST", `/api/grants/${plain.json.id}/revoke`, { token: t.token, body: { reason: "about a tour: not the prefix" } })).status).toBe(200);
+    const other = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:other", caps: ["grant.read"], ttlSec: 600 } });
+    expect((await admin("POST", `/api/admin/grants/${other.json.id}/revoke`, { body: { reason: "test: key lost" } })).status).toBe(200);
+  });
+
+  test("a key that ran out can be reissued by the owner only, and a tour left alone for two days is finished", async () => {
+    const t = await newTenant("tour-lapse", "studio");
+    const before = await reservedOf(t.grantId);
+    const first = (await open(t)).json;
+    // the key is cancelled from outside (the kill switch for one agent): the tour's record remains
+    expect((await admin("POST", `/api/admin/grants/${first.key.id}/revoke`, { body: { reason: "test: key lost" } })).status).toBe(200);
+    expect((await renew(first.key.token)).status).toBe(401);
+    expect((await tourOf(t, first.tour.id)).status).toBe("key_run_out");
+    const helper = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:helper", caps: ["grant.issue", "grant.read"], ttlSec: 600 } });
+    expect((await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: helper.json.token, body: {} })).status).toBe(403);
+    const fresh = await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} });
+    expect(fresh.status).toBe(201);
+    expect(await works(fresh.json.key.token)).toBe(200);
+    expect((await req("POST", "/api/grants/settle", { token: fresh.json.key.token, body: { calls: 10, ref: "work:1" } })).status).toBe(200);
+    // nobody renews for more than 48 hours: the sweep that runs with the reaper ends it, nobody has to ask
+    await dbQuery("UPDATE tours SET last_renewed_at = last_renewed_at - $2 WHERE id = $1", [first.tour.id, 49 * 3600]);
+    expect(await works(fresh.json.key.token)).toBe(200); // until the sweep comes round
+    const swept = await admin("POST", "/api/admin/grants/reap");
+    expect(swept.json.tours_ended).toContain(first.tour.id);
+    const ended = await tourOf(t, first.tour.id);
+    expect(ended.status).toBe("ended");
+    expect(ended.ended_reason).toContain("idle");
+    expect(await works(fresh.json.key.token)).toBe(401);
+    expect((await reservedOf(t.grantId)).calls).toBe(before.calls + 10); // everything it had not spent is back with the owner
+    expect((await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} })).json.error).toBe("tour_ended");
+    expect((await admin("POST", "/api/admin/grants/reap")).json.tours_ended).not.toContain(first.tour.id); // ended once
+    expect((await open(t)).status).toBe(201); // and a new tour for the same name can be opened
+  });
+
+  test("a tour whose end date has passed, or whose holding grant was cancelled from outside, is finished and frees the name", async () => {
+    const t = await newTenant("tour-over", "studio");
+    const before = await reservedOf(t.grantId);
+    const a = (await open(t, { agent: "agent.a" })).json;
+    const b = (await open(t, { agent: "agent.b" })).json;
+    // a: its end date passes (the key ends with it: a key never outlives the tour)
+    await dbQuery("UPDATE tours SET until = $2 WHERE id = $1", [a.tour.id, now() - 5]);
+    await dbQuery("UPDATE grants SET exp = $2 WHERE id IN ($1, $3)", [a.receipt.holding_grant, now() - 5, a.key.id]);
+    // nothing has swept yet, and the owner opens the name again at once: the finished tour is ended first, not in the way
+    expect((await tourOf(t, a.tour.id)).status).toBe("ended");
+    const a2 = await open(t, { agent: "agent.a" });
+    expect(a2.status).toBe(201);
+    expect((await req("POST", `/api/tours/${a2.json.tour.id}/end`, { token: t.token, body: {} })).status).toBe(200);
+    // b: the owner cancels the holding grant through the ordinary route, not through the tour
+    expect((await req("POST", `/api/grants/${b.receipt.holding_grant}/revoke`, { token: t.token, body: { reason: "test: cancelled from outside" } })).status).toBe(200);
+    expect(await works(b.key.token)).toBe(401);
+    const swept = (await admin("POST", "/api/admin/grants/reap")).json;
+    expect(swept.tours_ended).not.toContain(a.tour.id); // ended already, when the owner looked
+    expect(swept.tours_ended).toContain(b.tour.id);
+    const [ta, tb] = [await tourOf(t, a.tour.id), await tourOf(t, b.tour.id)];
+    expect(ta.status).toBe("ended");
+    expect(ta.ended_reason).toContain("end date");
+    expect(tb.status).toBe("ended");
+    expect(tb.ended_reason).toContain("holding grant");
+    expect(await reservedOf(t.grantId)).toEqual(before);
+    expect((await open(t, { agent: "agent.a" })).status).toBe(201);
+    expect((await open(t, { agent: "agent.b" })).status).toBe(201);
+    // without the sweep too: the owner looking at the list, or opening the name again, finds it finished
+    const c = (await open(t, { agent: "agent.c" })).json;
+    expect((await req("POST", `/api/grants/${c.receipt.holding_grant}/revoke`, { token: t.token, body: {} })).status).toBe(200);
+    expect((await open(t, { agent: "agent.c" })).status).toBe(201);
+    expect((await tourOf(t, c.tour.id)).status).toBe("ended");
+    // A key written under the holding grant at the very moment that grant was cancelled used to be missed by the
+    // cancel (grants.js: the gap closed on 2026-10-09). The state it left is written here by hand: the holding grant
+    // cancelled, its key not. The key stops WORKING at once, because a grant above it has ended (grants.js,
+    // endedAbove; before that it answered 200). It is still there, though, until ending the tour looks under it.
+    const d = (await open(t, { agent: "agent.d" })).json;
+    await dbQuery("UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'test: cancelled, one key missed' WHERE id = $1", [d.receipt.holding_grant]);
+    expect(await works(d.key.token)).toBe(401);
+    expect(await liveUnder(d.receipt.holding_grant)).toBe(1);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.tours_ended).toContain(d.tour.id);
+    expect(await works(d.key.token)).toBe(401);
+    expect(await liveUnder(d.receipt.holding_grant)).toBe(0);
+    // and the same moment for real: a key is written under the holding grant just as the owner ends the tour
+    const e = (await open(t, { agent: "agent.e" })).json;
+    const end = await keySlipsIn("tr_key_slips_in_at_end", "grants", "BEFORE UPDATE", `OLD.id = '${e.receipt.holding_grant}' AND OLD.status = 'active' AND NEW.status = 'revoked'`, e.key.id, "gr_slipped_end",
+      () => req("POST", `/api/tours/${e.tour.id}/end`, { token: t.token, body: {} }));
+    expect(end.status).toBe(200);
+    expect(end.json.receipt.cancelled_keys).toBe(3); // the holding grant, its key, and the one that slipped in
+    expect(await statusOf("gr_slipped_end")).toBe("revoked");
+    expect(await liveUnder(e.receipt.holding_grant)).toBe(0);
+  });
+
+  test("what a tour has left is its budget less everything used under it, whoever used it and whatever state the keys are in", async () => {
+    const t = await newTenant("tour-left", "studio");
+    const first = (await open(t, { caps: [...SPEC.caps, "grant.issue"] })).json;
+    const helper = await req("POST", "/api/grants", { token: first.key.token, body: { sub: "agent:helper", caps: ["grant.read"], ttlSec: 600, budget: { usd_cents: 0, calls: 20, deploys: 0 } } });
+    expect(helper.status).toBe(201);
+    expect((await req("POST", "/api/grants/settle", { token: helper.json.token, body: { calls: 5, ref: "help:1" } })).status).toBe(200);
+    expect((await req("POST", "/api/grants/settle", { token: first.key.token, body: { calls: 10, ref: "work:1" } })).status).toBe(200);
+    expect((await tourOf(t, first.tour.id)).left.calls).toBe(85); // 100 - 10 by the key - 5 by its helper
+    // the key runs out and nothing has swept it yet: it still holds its share, but nothing more was used
+    await dbQuery("UPDATE grants SET exp = $3 WHERE id IN ($1, $2)", [first.key.id, helper.json.id, now() - 5]);
+    const idle = await tourOf(t, first.tour.id);
+    expect(idle.status).toBe("key_run_out");
+    expect(idle.left.calls).toBe(85);
+    // the owner reissues: the next key gets exactly that
+    const fresh = await req("POST", `/api/tours/${first.tour.id}/reissue`, { token: t.token, body: {} });
+    expect(fresh.status).toBe(201);
+    expect(fresh.json.key.budget.calls).toBe(85);
+    expect(fresh.json.tour.left.calls).toBe(85);
+  });
+
+  test("extending (a furlough) adds days, never money, and stops at each limit", async () => {
+    const t = await newTenant("tour-extend", "studio");
+    const first = (await open(t, { days: 2 })).json;
+    const hold = first.receipt.holding_grant;
+    const more = await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 3 } });
+    expect(more.status).toBe(200);
+    expect(more.json.tour.until).toBe(first.tour.until + 3 * DAY);
+    expect(more.json.tour.budget).toEqual(first.tour.budget);
+    expect(more.json.tour.left.calls).toBe(100);
+    expect(more.json.receipt.limited_by).toBe("asked");
+    expect(Number((await dbQuery("SELECT exp FROM grants WHERE id = $1", [hold])).rows[0].exp)).toBe(more.json.tour.until); // the record and the grant moved together
+    // the next key reaches into the added days; the current key was not made longer
+    await rested(first.tour.id);
+    expect((await renew(first.key.token)).json.key.exp).toBeLessThanOrEqual(now() + DAY);
+    // one signature never reaches more than 7 days ahead
+    const capped = await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 7 } });
+    expect(capped.status).toBe(200);
+    expect(capped.json.receipt.limited_by).toBe("one_signature");
+    expect(capped.json.tour.until).toBeLessThanOrEqual(now() + 7 * DAY);
+    // at the limit already: the seconds that have passed since are not an extension, and leave no receipt
+    const lines = async () => (await req("GET", "/api/ledger", { token: t.token })).json.ledger.filter((l) => l.kind === "tour-extend").length;
+    const had = await lines();
+    await dbQuery("UPDATE tours SET until = until - 600 WHERE id = $1", [first.tour.id]); // even ten minutes short of it
+    const atLimit = await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 1 } });
+    expect(atLimit.status).toBe(409);
+    expect(atLimit.json.error).toBe("tour_at_limit");
+    expect(atLimit.json.detail.limits.one_signature).toBeGreaterThan(0);
+    expect(await lines()).toBe(had);
+    // 30 days in all: a tour opened 29 days ago can only be taken to its 30th day
+    await dbQuery("UPDATE tours SET opened_at = opened_at - $2, until = $3 WHERE id = $1", [first.tour.id, 29 * DAY, now() + 3600]);
+    await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [hold, now() + 3600]);
+    const last = await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 5 } });
+    expect(last.status).toBe(200);
+    expect(last.json.receipt.limited_by).toBe("whole_tour");
+    expect(last.json.tour.until).toBeLessThanOrEqual(now() + DAY + 60);
+    for (const days of [0, 8, 2.5, "2", null]) expect((await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days } })).json.error).toBe("tour_days_invalid");
+    const helper = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:helper", caps: ["grant.issue", "grant.read"], ttlSec: 600 } });
+    expect((await req("POST", `/api/tours/${first.tour.id}/extend`, { token: helper.json.token, body: { days: 1 } })).status).toBe(403);
+    const other = await newTenant("tour-extend-other", "studio");
+    expect((await req("POST", `/api/tours/${first.tour.id}/extend`, { token: other.token, body: { days: 1 } })).status).toBe(404); // another tenant cannot even see it
+  });
+
+  test("ending a tour stops the agent at once and gives back what it had not spent", async () => {
+    const t = await newTenant("tour-end", "studio");
+    const before = await reservedOf(t.grantId);
+    const first = (await open(t)).json;
+    expect((await req("POST", "/api/grants/settle", { token: first.key.token, body: { calls: 25, ref: "work:1" } })).status).toBe(200);
+    const helper = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:helper", caps: ["grant.issue", "grant.read"], ttlSec: 600 } });
+    expect((await req("POST", `/api/tours/${first.tour.id}/end`, { token: helper.json.token, body: {} })).status).toBe(403);
+    expect((await req("POST", `/api/tours/${first.tour.id}/end`, { token: first.key.token, body: {} })).status).toBe(403); // not even the tour's own key
+    const end = await req("POST", `/api/tours/${first.tour.id}/end`, { token: t.token, body: {} });
+    expect(end.status).toBe(200);
+    expect(end.json.tour.status).toBe("ended");
+    expect(end.json.tour.ended_reason).toContain("owner");
+    expect(end.json.receipt.cancelled_keys).toBe(2); // the holding grant and its one key
+    expect(await works(first.key.token)).toBe(401);
+    expect((await renew(first.key.token)).status).toBe(401);
+    expect((await reservedOf(t.grantId)).calls).toBe(before.calls + 25); // only what was really spent stays counted
+    expect((await req("POST", `/api/tours/${first.tour.id}/end`, { token: t.token, body: {} })).json.error).toBe("tour_ended");
+    expect((await req("POST", `/api/tours/${first.tour.id}/extend`, { token: t.token, body: { days: 1 } })).json.error).toBe("tour_ended");
+    expect((await req("POST", "/api/tours/tr_nope/end", { token: t.token, body: {} })).status).toBe(404);
+  });
+
+  test("the owner sees every tour; a tour's key sees its own and no other", async () => {
+    const t = await newTenant("tour-list", "studio");
+    const a = (await open(t, { agent: "agent.a" })).json;
+    const b = (await open(t, { agent: "agent.b" })).json;
+    const all = (await req("GET", "/api/tours", { token: t.token })).json.tours;
+    expect(all.map((x) => x.agent).sort()).toEqual(["agent.a", "agent.b"]);
+    const mine = (await req("GET", "/api/tours", { token: a.key.token })).json.tours;
+    expect(mine.length).toBe(1);
+    expect(mine[0].id).toBe(a.tour.id);
+    expect(JSON.stringify(mine)).not.toContain(b.tour.id);
+    const other = await newTenant("tour-list-other", "studio");
+    expect((await req("GET", "/api/tours", { token: other.token })).json.tours).toEqual([]);
+    // a tour's key cannot open a tour of its own, whatever it holds
+    const withIssue = (await open(t, { agent: "agent.c", caps: [...SPEC.caps, "grant.issue"] })).json;
+    expect((await req("POST", "/api/tours", { token: withIssue.key.token, body: { ...SPEC, agent: "agent.d" } })).json.error).toBe("owner_required");
+    // what it hands to a helper is an ordinary agent-issued key: a day at most, and gone at the next renewal
+    const helper = await req("POST", "/api/grants", { token: withIssue.key.token, body: { sub: "agent:helper", caps: ["grant.read"], ttlSec: 7 * DAY, budget: { usd_cents: 0, calls: 5, deploys: 0 } } });
+    expect(helper.status).toBe(201);
+    expect(helper.json.exp).toBeLessThanOrEqual(now() + DAY);
+  });
+
+  // ---- review round 2: turns, races, and every failure path --------------------------------------------------
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const reissue = (t, id) => req("POST", `/api/tours/${id}/reissue`, { token: t.token, body: {} });
+  const genOf = async (id) => Number((await dbQuery("SELECT gen FROM tours WHERE id = $1", [id])).rows[0].gen);
+  // a tour that froze because a replaced key was used again: its first key (replaced, the one that was reused) and its second (cancelled by the freeze)
+  const frozenTour = async (t, over = {}) => {
+    const first = (await open(t, over)).json;
+    await rested(first.tour.id);
+    const second = (await renew(first.key.token)).json;
+    await longAgo(first.key.id);
+    await works(first.key.token);
+    return { id: first.tour.id, hold: first.receipt.holding_grant, first: first.key, second: second.key };
+  };
+  // A cancel MISSES one grant: the first `times` attempts to cancel it do nothing; the next one works.
+  // (This is how a key "written at the very moment its parent was being cancelled" used to be shown. Since
+  // 2026-10-09 the cancel finds such a key itself: revokeGrantTree goes at a key from its list and once more in its
+  // second look, after it has taken the key above. So a key that gets past the CANCEL is one that gets past both
+  // of those, and what is tested below is that the tour's own looks still find it then.)
+  const missed = async (name, grantId, times, fn) => {
+    await dbQuery("DELETE FROM settings WHERE key = $1", [name]);
+    await dbQuery("INSERT INTO settings (key, value) VALUES ($1, $2)", [name, String(times)]);
+    try {
+      return await during(name, "grants", "BEFORE UPDATE", `OLD.id = '${grantId}' AND OLD.status = 'active' AND NEW.status = 'revoked'`,
+        `IF (SELECT value::int FROM settings WHERE key = '${name}') > 0 THEN UPDATE settings SET value = (value::int - 1)::text WHERE key = '${name}'; RETURN NULL; END IF; RETURN NEW;`, fn);
+    } finally {
+      await dbQuery("DELETE FROM settings WHERE key = $1", [name]);
+    }
+  };
+  const missedByTheCancel = (name, grantId, fn) => missed(name, grantId, 2, fn);
+
+  test("turns: something that saw the tour one turn ago never touches the key of the turn after", async () => {
+    const t = await newTenant("tour-turns", "studio");
+    const f = await frozenTour(t);
+    const fresh = await reissue(t, f.id);
+    expect(fresh.status).toBe(201);
+    const g = await genOf(f.id);
+    // The sweep read this tour while it was still frozen, one turn ago, and only now comes to cancel what is under it.
+    // (Its old view of the row is made real here: frozen, at the turn before the reissue.)
+    await dbQuery("UPDATE tours SET status = 'frozen', gen = $2 WHERE id = $1", [f.id, g - 1]);
+    expect((await admin("POST", "/api/admin/grants/reap")).status).toBe(200);
+    expect(await works(fresh.json.key.token)).toBe(200);
+    // The alarm likewise: an old key that still carries a renewal's mark is tried again at that moment.
+    await dbQuery("UPDATE grants SET revoke_reason = 'tour: renewed', revoked_at = now() - interval '10 minutes' WHERE id = $1", [f.first.id]);
+    expect(await works(f.first.token)).toBe(401);
+    expect(await works(fresh.json.key.token)).toBe(200);
+    expect(await liveUnder(f.hold)).toBe(1);
+    // With the row as it really is (active, at the reissue's own turn) the same old key IS the alarm, and the
+    // current turn's key does stop: the rule is "up to the turn it saw", not "never".
+    await dbQuery("UPDATE tours SET status = 'active', gen = $2 WHERE id = $1", [f.id, g]);
+    expect(await works(f.first.token)).toBe(401);
+    expect((await tourOf(t, f.id)).status).toBe("frozen");
+    expect(await works(fresh.json.key.token)).toBe(401);
+  });
+
+  test("reissue: a turn taken by somebody else in the middle means nothing is issued, or what was issued is taken back", async () => {
+    const t = await newTenant("tour-reissue-turn", "studio");
+    const first = (await open(t)).json;
+    const hold = first.receipt.holding_grant;
+    await rested(first.tour.id);
+    const second = (await renew(first.key.token)).json; // so that one replaced key exists for the reissue to clear
+    // between the reissue reading the tour and taking its turn, another turn is taken: it must stop before issuing anything
+    let before = (await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [hold])).rows[0].n;
+    let r = await during("tr_turn_before_claim", "grants", "AFTER UPDATE", `OLD.parent = '${hold}' AND NEW.revoke_reason LIKE 'tour: renewed (before%' AND OLD.revoke_reason = 'tour: renewed'`,
+      `UPDATE tours SET gen = gen + 1 WHERE id = '${first.tour.id}'; RETURN NULL;`, () => reissue(t, first.tour.id));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_changed");
+    expect(r.text).not.toContain("cog1.");
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [hold])).rows[0].n).toBe(before); // no key was even written
+    expect(await works(second.key.token)).toBe(200); // and the agent's key was not touched
+    // after its key is written but before it is noted, another turn is taken: the key is taken back, not handed out
+    r = await during("tr_turn_after_issue", "grants", "AFTER INSERT", `NEW.parent = '${hold}'`, `UPDATE tours SET gen = gen + 1 WHERE id = '${first.tour.id}'; RETURN NULL;`, () => reissue(t, first.tour.id));
+    expect(r.status).toBe(409);
+    expect(r.text).not.toContain("cog1.");
+    expect(await liveUnder(hold)).toBe(0);
+    // its key is cancelled at the very moment it is being noted (an end or a freeze landing there): no dead key is answered
+    r = await during("tr_dead_at_note", "tours", "BEFORE UPDATE", `OLD.id = '${first.tour.id}' AND OLD.current_key IS NULL AND NEW.current_key IS NOT NULL`,
+      // (cancelled the way a real cancel does it: the key stops, and what it held goes back to the holding grant)
+      `UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'test: cancelled as it was noted' WHERE id = NEW.current_key;
+       UPDATE grants SET reserved = '{"usd_cents":0,"calls":0,"deploys":0}'::jsonb WHERE id = '${hold}'; RETURN NEW;`, () => reissue(t, first.tour.id));
+    expect(r.status).toBe(409);
+    expect(r.text).not.toContain("cog1.");
+    // and left alone, it simply works
+    r = await reissue(t, first.tour.id);
+    expect(r.status).toBe(201);
+    expect(await works(r.json.key.token)).toBe(200);
+    expect(r.json.key.budget.calls).toBe(100);
+    expect(await liveUnder(hold)).toBe(1);
+  });
+
+  test("an old key tried at the very moment the owner reissues does not freeze the tour again", async () => {
+    const t = await newTenant("tour-alarm-vs-reissue", "studio");
+    const first = (await open(t)).json;
+    const hold = first.receipt.holding_grant;
+    await rested(first.tour.id);
+    const second = (await renew(first.key.token)).json;
+    await longAgo(first.key.id);
+    // The alarm has read the tour (active) and is cancelling its key when the owner's reissue takes its turn: the
+    // reissue first clears the old keys of the alarm, then makes the tour active at a new turn with no key noted.
+    await during("tr_reissue_mid_alarm", "grants", "AFTER UPDATE", `OLD.id = '${second.key.id}' AND OLD.status = 'active' AND NEW.status = 'revoked'`,
+      `UPDATE grants SET revoke_reason = 'tour: renewed (before an owner reissue)' WHERE parent = '${hold}' AND revoke_reason = 'tour: renewed';
+       UPDATE tours SET gen = gen + 1, status = 'active', frozen_reason = NULL, current_key = NULL WHERE id = '${first.tour.id}'; RETURN NULL;`,
+      async () => expect(await works(first.key.token)).toBe(401));
+    // the owner's turn stands: the alarm looked again, found the tour at a new turn and the old key cleared, and did nothing more
+    expect((await dbQuery("SELECT status FROM tours WHERE id = $1", [first.tour.id])).rows[0].status).toBe("active");
+    expect((await req("GET", "/api/ledger", { token: t.token })).json.ledger.map((l) => l.kind)).not.toContain("tour-freeze");
+    const fresh = await reissue(t, first.tour.id);
+    expect(fresh.status).toBe(201);
+    expect(await works(fresh.json.key.token)).toBe(200);
+  });
+
+  test("reissue at the same moment as the sweep, as an old key being tried, as another reissue, or as a renewal: a key that is answered works", async () => {
+    // These four are races, run several times each with the timing moved a little every time.
+    // 1. a frozen tour is reissued while the owner's list (which sweeps) and the reaper's sweep run
+    for (let i = 0; i < 8; i++) {
+      const t = await newTenant(`tour-race-sweep-${i}`, "studio");
+      const f = await frozenTour(t);
+      const [fresh] = await Promise.all([reissue(t, f.id), sleep(i % 5).then(() => req("GET", "/api/tours", { token: t.token })), sleep((i * 3) % 7).then(() => admin("POST", "/api/admin/grants/reap"))]);
+      expect(fresh.status).toBe(201);
+      expect(await works(fresh.json.key.token)).toBe(200);
+    }
+    // 2. ...while the old key that froze it is tried again and again
+    for (let i = 0; i < 8; i++) {
+      const t = await newTenant(`tour-race-hammer-${i}`, "studio");
+      const f = await frozenTour(t);
+      const [fresh] = await Promise.all([reissue(t, f.id), ...Array.from({ length: 8 }, (_, j) => sleep(j * (1 + (i % 3))).then(() => works(f.first.token)))]);
+      expect(fresh.status).toBe(201);
+      expect(await works(fresh.json.key.token)).toBe(200);
+      expect((await tourOf(t, f.id)).status).toBe("active"); // and it did not freeze the tour a second time
+      expect(await works(f.first.token)).toBe(401);
+      expect((await tourOf(t, f.id)).status).toBe("active");
+    }
+    // 3. two reissues at once: every answer is honest, and exactly one key works at the end
+    for (let i = 0; i < 6; i++) {
+      const t = await newTenant(`tour-race-twice-${i}`, "studio");
+      const first = (await open(t)).json;
+      const both = await Promise.all([reissue(t, first.tour.id), sleep(i % 4).then(() => reissue(t, first.tour.id))]);
+      expect(both.every((r) => r.status === 201 || r.status === 409)).toBe(true);
+      expect(both.some((r) => r.status === 201)).toBe(true);
+      const tour = await tourOf(t, first.tour.id);
+      expect(tour.status).toBe("active");
+      expect(tour.live_keys).toBe(1);
+      const winner = both.filter((r) => r.status === 201).find((r) => r.json.key.id === tour.key.id);
+      expect(winner).toBeTruthy(); // the key the tour points at is one that was answered
+      expect(await works(winner.json.key.token)).toBe(200);
+      expect(winner.json.key.budget.calls).toBe(100);
+      for (const r of both.filter((x) => x.status === 409)) expect(r.text).not.toContain("cog1.");
+    }
+    // 4. the agent renews while the owner reissues
+    for (let i = 0; i < 8; i++) {
+      const t = await newTenant(`tour-race-renew-${i}`, "studio");
+      const first = (await open(t)).json;
+      await rested(first.tour.id);
+      const [a, b] = await Promise.all([sleep(i % 4).then(() => renew(first.key.token)), sleep((i * 2) % 5).then(() => reissue(t, first.tour.id))]);
+      expect([201, 401, 404, 409].includes(a.status) && [201, 409].includes(b.status)).toBe(true);
+      expect([a, b].some((r) => r.status === 201)).toBe(true); // one of them always gets through
+      const tour = await tourOf(t, first.tour.id);
+      expect(tour.status).toBe("active"); // never frozen (nobody used a replaced key), and never left without a key
+      expect(tour.live_keys).toBe(tour.key ? 1 : 0); // no key works that the tour does not point at
+      expect(await works(first.key.token)).toBe(401); // the key they both started from is gone either way
+      const winner = [a, b].find((r) => r.status === 201 && r.json.key.id === tour.key.id);
+      expect(winner).toBeTruthy(); // the key the tour points at is one that was answered
+      expect(await works(winner.json.key.token)).toBe(200);
+      expect(winner.json.key.budget.calls).toBe(100); // the loser's key did not keep any of the budget
+      for (const r of [a, b].filter((x) => x.status !== 201)) expect(r.text).not.toContain("cog1.");
+      expect(tour.left.calls).toBe(100);
+      // whatever happened, the owner can always put it right
+      const again = await reissue(t, first.tour.id);
+      expect(again.status).toBe(201);
+      expect(await works(again.json.key.token)).toBe(200);
+    }
+  }, 60000);
+
+  test("a helper's key that a cancel missed is found at the next look, at any depth: on renewal, on a freeze, on the end", async () => {
+    const t = await newTenant("tour-deep", "studio");
+    const withHelpers = { caps: [...SPEC.caps, "grant.issue"] };
+    const hire = (token) => req("POST", "/api/grants", { token, body: { sub: "agent:helper", caps: ["grant.read"], ttlSec: 600, budget: { usd_cents: 0, calls: 5, deploys: 0 } } });
+    // renewal: the old key's helper is missed by the cancel and is left, not cancelled, under a cancelled key
+    const first = (await open(t, { ...withHelpers, agent: "deep.a" })).json;
+    let helper = (await hire(first.key.token)).json;
+    await rested(first.tour.id);
+    const second = (await missedByTheCancel("tr_miss_renew", helper.id, () => renew(first.key.token))).json;
+    expect(await works(first.key.token)).toBe(401);
+    // the look before the next key is issued goes under every key the tour ever had, not only the ones still working.
+    // (Its STATUS is what shows that: a key under a cancelled key answers 401 whether it was found or not.)
+    expect(await statusOf(helper.id)).toBe("revoked");
+    expect(await works(helper.token)).toBe(401);
+    expect(await works(second.key.token)).toBe(200);
+    await rested(first.tour.id);
+    const third = await renew(second.key.token);
+    expect(third.status).toBe(201);
+    // a freeze: the helper of the CURRENT key is missed by the alarm's first cancel
+    helper = (await hire(third.json.key.token)).json;
+    await longAgo(second.key.id);
+    await missedByTheCancel("tr_miss_freeze", helper.id, async () => expect(await works(second.key.token)).toBe(401));
+    expect((await tourOf(t, first.tour.id)).status).toBe("frozen");
+    expect(await works(third.json.key.token)).toBe(401);
+    expect(await statusOf(helper.id)).toBe("revoked");
+    expect(await works(helper.token)).toBe(401);
+    // the end: missed by the cancel AND by the first look after it, found by the look after that (it looks until a look finds nothing)
+    const b = (await open(t, { ...withHelpers, agent: "deep.b" })).json;
+    helper = (await hire(b.key.token)).json;
+    const end = await missed("tr_miss_end", helper.id, 3, () => req("POST", `/api/tours/${b.tour.id}/end`, { token: t.token, body: {} }));
+    expect(end.status).toBe(200);
+    expect(await statusOf(helper.id)).toBe("revoked");
+    expect(await works(helper.token)).toBe(401);
+    expect(end.json.tour.status).toBe("ended");
+    // and if it truly cannot be cancelled, the tour does NOT claim to be ended; the sweep finishes it when it can
+    const c = (await open(t, { ...withHelpers, agent: "deep.c" })).json;
+    helper = (await hire(c.key.token)).json;
+    const stuck = await during("tr_never_cancel", "grants", "BEFORE UPDATE", `OLD.id = '${helper.id}' AND NEW.status = 'revoked'`, "RETURN NULL;", async () => {
+      const r = await req("POST", `/api/tours/${c.tour.id}/end`, { token: t.token, body: {} });
+      // it could not be cancelled, so it is still there; it no longer WORKS, because the key above it has ended
+      // (grants.js, endedAbove; before 2026-10-09 it answered 200 here)
+      expect(await statusOf(helper.id)).toBe("active");
+      expect(await works(helper.token)).toBe(401);
+      expect((await dbQuery("SELECT status FROM tours WHERE id = $1", [c.tour.id])).rows[0].status).not.toBe("ended");
+      return r;
+    });
+    expect(stuck.status).toBe(500);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.tours_ended).toContain(c.tour.id);
+    expect(await statusOf(helper.id)).toBe("revoked");
+    expect((await tourOf(t, c.tour.id)).status).toBe("ended");
+  }, 60000);
+
+  test("a renewal that cannot issue the next key, or cannot record it, leaves no key working and says so; the old key is then just a dead key", async () => {
+    const t = await newTenant("tour-renew-paths", "studio");
+    // 1. the next key cannot be issued: the tour is frozen with that reason, and only the owner can put it right
+    const a = (await open(t, { agent: "paths.a" })).json;
+    await rested(a.tour.id);
+    let r = await during("tr_no_next_key", "grants", "BEFORE INSERT", `NEW.parent = '${a.receipt.holding_grant}'`, "RAISE EXCEPTION 'test: no key can be written';", () => renew(a.key.token));
+    expect(r.status).toBe(500);
+    expect(r.text).not.toContain("cog1.");
+    expect(await works(a.key.token)).toBe(401);
+    expect(await liveUnder(a.receipt.holding_grant)).toBe(0);
+    let tour = await tourOf(t, a.tour.id);
+    expect(tour.status).toBe("frozen");
+    expect(tour.frozen_reason).toContain("could not issue");
+    expect((await req("GET", "/api/ledger", { token: t.token })).json.ledger.some((l) => l.kind === "tour-freeze" && l.note.includes("renewal failed"))).toBe(true);
+    const fresh = await reissue(t, a.tour.id);
+    expect(fresh.status).toBe(201);
+    expect(fresh.json.key.budget.calls).toBe(100);
+    // 2. the key is issued but the tour's record cannot be written: the key is taken back, never handed out
+    const b = (await open(t, { agent: "paths.b" })).json;
+    await rested(b.tour.id);
+    r = await during("tr_no_record", "tours", "BEFORE UPDATE", `OLD.id = '${b.tour.id}' AND NEW.renewals > OLD.renewals`, "RAISE EXCEPTION 'test: the renewal cannot be recorded';", () => renew(b.key.token));
+    expect(r.status).toBe(500);
+    expect(r.text).not.toContain("cog1.");
+    expect(await liveUnder(b.receipt.holding_grant)).toBe(0);
+    tour = await tourOf(t, b.tour.id);
+    expect(tour.status).toBe("key_run_out");
+    expect(tour.renewals).toBe(0);
+    expect((await reissue(t, b.tour.id)).status).toBe(201);
+    // 3. the renewal loses its turn after cancelling its old key (as when the owner reissues at that moment): it answers
+    //    409 with no key, and its old key, tried again later, is NOT the alarm: nobody was handed a next key by it.
+    const c = (await open(t, { agent: "paths.c" })).json;
+    await rested(c.tour.id);
+    r = await during("tr_lost_turn", "grants", "AFTER INSERT", `NEW.parent = '${c.receipt.holding_grant}'`, `UPDATE tours SET gen = gen + 1, current_key = NULL WHERE id = '${c.tour.id}'; RETURN NULL;`, () => renew(c.key.token));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_changed");
+    expect(r.text).not.toContain("cog1.");
+    expect(await liveUnder(c.receipt.holding_grant)).toBe(0);
+    await longAgo(c.key.id);
+    expect(await works(c.key.token)).toBe(401);
+    expect((await tourOf(t, c.tour.id)).status).toBe("key_run_out"); // not frozen
+    // 4. ...or loses it sooner: the owner's reissue takes its turn just as the renewal cancels its old key. The
+    //    renewal stops there: it issues nothing at all, and again its old key is no alarm.
+    const d = (await open(t, { agent: "paths.d" })).json;
+    await rested(d.tour.id);
+    const keysBefore = (await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [d.receipt.holding_grant])).rows[0].n;
+    r = await during("tr_reissue_at_cancel", "grants", "AFTER UPDATE", `OLD.id = '${d.key.id}' AND OLD.status = 'active' AND NEW.status = 'revoked'`,
+      `UPDATE tours SET gen = gen + 1, current_key = NULL WHERE id = '${d.tour.id}'; RETURN NULL;`, () => renew(d.key.token));
+    expect(r.status).toBe(409);
+    expect(r.text).not.toContain("cog1.");
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [d.receipt.holding_grant])).rows[0].n).toBe(keysBefore); // no key was even written
+    await longAgo(d.key.id);
+    expect(await works(d.key.token)).toBe(401);
+    expect((await tourOf(t, d.tour.id)).status).toBe("key_run_out");
+    // 5. The owner cancels the agent's key in the instant after the renewal was let in (here: as its use is counted,
+    //    the last thing done before a request is let in). The kill stands: no next key.
+    const e = (await open(t, { agent: "paths.e" })).json;
+    await rested(e.tour.id);
+    r = await during("tr_killed_at_the_door", "rate_limits", "AFTER INSERT OR UPDATE", `NEW.grant_id = '${e.key.id}'`,
+      `UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'test: cancelled by the owner at that moment' WHERE id = '${e.key.id}' AND status = 'active';
+       UPDATE grants SET reserved = '{"usd_cents":0,"calls":0,"deploys":0}'::jsonb WHERE id = '${e.receipt.holding_grant}'; RETURN NULL;`, () => renew(e.key.token));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_key_cancelled");
+    expect(r.text).not.toContain("cog1.");
+    expect(await liveUnder(e.receipt.holding_grant)).toBe(0);
+    expect((await tourOf(t, e.tour.id)).status).toBe("key_run_out");
+    expect((await req("GET", "/api/ledger", { token: t.token })).json.ledger.filter((l) => l.kind === "tour-freeze").length).toBe(1); // only the one from part 1
+  });
+
+  test("opening a tour whose first key cannot be issued leaves nothing behind, and an extension that cannot be recorded moves nothing", async () => {
+    const t = await newTenant("tour-open-paths", "studio");
+    const before = await reservedOf(t.grantId);
+    const r = await during("tr_no_first_key", "grants", "BEFORE INSERT", `NEW.tenant = '${t.id}' AND NEW.sub = 'agent:first.fail'`, "RAISE EXCEPTION 'test: no first key';", () => open(t, { agent: "first.fail" }));
+    expect(r.status).toBe(500);
+    expect(r.text).not.toContain("cog1.");
+    expect(await reservedOf(t.grantId)).toEqual(before); // nothing is held
+    const left = (await req("GET", "/api/tours", { token: t.token })).json.tours;
+    expect(left.length).toBe(1);
+    expect(left[0].status).toBe("ended");
+    expect(left[0].ended_reason).toContain("first key");
+    const again = await open(t, { agent: "first.fail" }); // the name is free
+    expect(again.status).toBe(201);
+    // extending: the holding grant's end and the tour's record move together or not at all
+    const hold = again.json.receipt.holding_grant;
+    const expOf = async () => Number((await dbQuery("SELECT exp FROM grants WHERE id = $1", [hold])).rows[0].exp);
+    const was = await expOf();
+    const x = await during("tr_no_extend_record", "tours", "BEFORE UPDATE", `OLD.id = '${again.json.tour.id}' AND NEW.until <> OLD.until`, "RAISE EXCEPTION 'test: the extension cannot be recorded';",
+      () => req("POST", `/api/tours/${again.json.tour.id}/extend`, { token: t.token, body: { days: 2 } }));
+    expect(x.status).toBe(500);
+    expect(await expOf()).toBe(was);
+    expect((await tourOf(t, again.json.tour.id)).until).toBe(was);
+    expect((await req("GET", "/api/ledger", { token: t.token })).json.ledger.some((l) => l.kind === "tour-extend")).toBe(false);
+  });
+
+  test("the sweep looks at a tour again before ending it, and a frozen tour is never ended for being idle", async () => {
+    const t = await newTenant("tour-sweep-again", "studio");
+    const a = (await open(t, { agent: "sweep.a" })).json;
+    const b = (await open(t, { agent: "sweep.b" })).json;
+    // both have gone 49 hours without a renewal, so both are on the sweep's list
+    await dbQuery("UPDATE tours SET last_renewed_at = last_renewed_at - $2 WHERE tenant = $1", [t.id, 49 * 3600]);
+    // ...but at the moment the sweep takes the first of them, the OTHER is renewed (its clock starts again)
+    const swept = await during("tr_renewed_meanwhile", "tours", "AFTER UPDATE",
+      `NEW.tenant = '${t.id}' AND NEW.gen = OLD.gen + 1 AND NEW.status = OLD.status AND NEW.last_renewed_at = OLD.last_renewed_at`,
+      `UPDATE tours SET last_renewed_at = extract(epoch from now())::bigint WHERE tenant = '${t.id}' AND id <> NEW.id AND status = 'active'; RETURN NULL;`,
+      () => admin("POST", "/api/admin/grants/reap"));
+    const ended = swept.json.tours_ended.filter((id) => id === a.tour.id || id === b.tour.id);
+    expect(ended.length).toBe(1); // the one it took; the other was no longer idle when its turn came
+    const [kept, gone] = ended[0] === a.tour.id ? [b, a] : [a, b];
+    expect((await tourOf(t, kept.tour.id)).status).toBe("active");
+    expect(await works(kept.key.token)).toBe(200);
+    expect((await tourOf(t, gone.tour.id)).status).toBe("ended");
+    // a frozen tour waits for the owner, however long nobody renews it
+    const u = await newTenant("tour-frozen-idle", "studio");
+    const f = await frozenTour(u);
+    await dbQuery("UPDATE tours SET last_renewed_at = last_renewed_at - $2 WHERE id = $1", [f.id, 72 * 3600]);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.tours_ended).not.toContain(f.id);
+    expect((await tourOf(u, f.id)).status).toBe("frozen");
+    expect((await reissue(u, f.id)).status).toBe(201);
+  });
+
+  test("any mix of renewals, reissues, old-key reuse, lists and sweeps at the same moment leaves the tour in one piece", async () => {
+    // A random mix each time (set TOURS_STRESS_RUNS for more). What must hold afterwards is checked in the tables.
+    const RUNS = Number(process.env.TOURS_STRESS_RUNS || 40), rnd = (n) => Math.floor(Math.random() * n), bad = [];
+    for (let i = 0; i < RUNS; i++) {
+      const t = await newTenant(`tour-stress-${i}`, "studio");
+      const first = (await open(t)).json, id = first.tour.id, hold = first.receipt.holding_grant;
+      await rested(id);
+      const second = (await renew(first.key.token)).json;
+      await longAgo(first.key.id);
+      const frozen = i % 3 === 0;
+      if (frozen) await works(first.key.token); // the alarm: start this run from a frozen tour
+      await rested(id);
+      const again = () => reissue(t, id), next = () => renew(second.key.token), reuse = () => works(first.key.token);
+      const look = () => req("GET", "/api/tours", { token: t.token }), sweep = () => admin("POST", "/api/admin/grants/reap");
+      const menu = frozen ? [again, again, reuse, reuse, look, sweep] : [again, next, next, reuse, look, sweep, again];
+      const picks = Array.from({ length: 2 + rnd(4) }, () => menu[rnd(menu.length)]);
+      const answers = await Promise.all(picks.map((fn) => sleep(rnd(6)).then(fn)));
+      const row = (await dbQuery("SELECT status, current_key FROM tours WHERE id = $1", [id])).rows[0];
+      const live = (await dbQuery("SELECT id, budget->>'calls' AS calls FROM grants WHERE parent = $1 AND status = 'active'", [hold])).rows;
+      const held = Number((await dbQuery("SELECT reserved->>'calls' AS calls FROM grants WHERE id = $1", [hold])).rows[0].calls);
+      const say = (what) => bad.push(`run ${i} (${frozen ? "frozen" : "active"}: ${picks.map((p) => p.name).join(", ")}): ${what}`);
+      if (live.length > 1) say("more than one key works");
+      if (row.status === "frozen" && live.length) say("it reads frozen while a key works");
+      if (live.length === 1 && row.current_key !== live[0].id) say("a key works that the tour does not point at");
+      if (live.length === 1 && live[0].calls !== "100") say("the working key was not given everything the tour has left");
+      if (held !== (live.length ? Number(live[0].calls) : 0)) say("the holding grant holds something no working key accounts for");
+      const handed = answers.filter((a) => a && a.status === 201 && a.json && a.json.key);
+      for (const a of handed) if (a.json.key.id === row.current_key && (await works(a.json.key.token)) !== 200) say("the key the tour points at was answered but does not work");
+      if (row.status === "active" && row.current_key && row.current_key !== second.key.id && !handed.some((a) => a.json.key.id === row.current_key)) say("the tour points at a key nobody was handed");
+      if (!frozen && row.status === "frozen" && !picks.includes(reuse)) say("it froze though nobody used a replaced key");
+      if (!frozen && picks.every((p) => p === next) && (handed.length !== 1 || live.length !== 1)) say("only renewals ran, and not exactly one of them got its key");
+      const fix = await again(); // and the owner can always put it right
+      if (fix.status !== 201 || (await works(fix.json.key.token)) !== 200 || fix.json.key.budget.calls !== 100) say(`a reissue afterwards answered ${fix.status} ${fix.json?.error || ""}`);
+    }
+    expect(bad).toEqual([]);
+  }, 120000);
+
+  // ---- review round 3 (the follow-ups listed on pull request 37), each FORCED -------------------------------------------
+  // The chosen statement fails ONCE with `message`, then works. A sequence counts the attempts: it is the one thing in
+  // Postgres that a rolled-back statement does not roll back, so the failure's own rollback cannot reset the count.
+  const raisesOnce = async (name, table, timing, when, message, fn) => {
+    await dbQuery(`CREATE SEQUENCE IF NOT EXISTS ${name}_seq`);
+    try {
+      return await during(name, table, timing, when, `IF nextval('${name}_seq') = 1 THEN RAISE EXCEPTION '${message}'; END IF; RETURN NEW;`, fn);
+    } finally {
+      await dbQuery(`DROP SEQUENCE IF EXISTS ${name}_seq`);
+    }
+  };
+  const reasonOf = async (grantId) => (await dbQuery("SELECT revoke_reason FROM grants WHERE id = $1", [grantId])).rows[0]?.revoke_reason;
+  const freezeLines = async (tenantId) => (await dbQuery("SELECT count(*)::int AS n FROM ledger WHERE tenant = $1 AND kind = 'tour-freeze'", [tenantId])).rows[0].n;
+  const freezeLinesOf = async (holdId) => (await dbQuery("SELECT count(*)::int AS n FROM ledger WHERE grant_id = $1 AND kind = 'tour-freeze'", [holdId])).rows[0].n;
+  // what a reissue's relabel of the replaced keys looks like from a trigger on `grants`
+  const relabelOf = (hold) => `OLD.parent = '${hold}' AND NEW.revoke_reason LIKE 'tour: renewed (before%' AND OLD.revoke_reason = 'tour: renewed'`;
+
+  test("a reissue that loses its turn, or fails in the middle, leaves the alarm exactly as it found it: the clearing is rolled back with it", async () => {
+    // The turn is lost as a rival's statement would make it lose it: the reissue's own turn matches no row (a trigger
+    // skips it). The rival itself is not needed; what matters is what the loser leaves behind. The clearing of the
+    // replaced keys and the turn are ONE transaction, so nothing of the loser stays: putting the reason back
+    // afterwards cannot tell a renewal that won from a renewal that bumped and a second reissue about to win.
+    const turnOf = (tourId) => `OLD.id = '${tourId}' AND NEW.gen = OLD.gen + 1 AND NEW.status = 'active'`;
+    // 1. an active tour whose first key a renewal replaced
+    const t = await newTenant("tour-lost-turn", "studio");
+    const first = (await open(t)).json;
+    await rested(first.tour.id);
+    const second = (await renew(first.key.token)).json;
+    expect(await reasonOf(first.key.id)).toBe("tour: renewed");
+    let r = await during("tr_turn_skipped_active", "tours", "BEFORE UPDATE", turnOf(first.tour.id), "RETURN NULL;", () => reissue(t, first.tour.id));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_changed");
+    expect(r.text).not.toContain("cog1.");
+    expect(await reasonOf(first.key.id)).toBe("tour: renewed"); // armed, as before
+    expect(await works(second.key.token)).toBe(200); // nothing else was touched either
+    await longAgo(first.key.id);
+    expect(await works(first.key.token)).toBe(401);
+    expect((await tourOf(t, first.tour.id)).status).toBe("frozen"); // the alarm still goes off, as if no reissue had been tried
+    expect(await works(second.key.token)).toBe(401);
+    // 2. a frozen tour: the same, and a reissue that is NOT lost then clears them for good
+    const w = await newTenant("tour-lost-turn-frozen", "studio");
+    const f = await frozenTour(w);
+    expect(await reasonOf(f.first.id)).toBe("tour: renewed");
+    r = await during("tr_turn_skipped_frozen", "tours", "BEFORE UPDATE", turnOf(f.id), "RETURN NULL;", () => reissue(w, f.id));
+    expect(r.status).toBe(409);
+    expect(await reasonOf(f.first.id)).toBe("tour: renewed");
+    expect((await dbQuery("SELECT status FROM tours WHERE id = $1", [f.id])).rows[0].status).toBe("frozen"); // as it was
+    expect((await reissue(w, f.id)).status).toBe(201);
+    expect(await reasonOf(f.first.id)).toBe("tour: renewed (before an owner reissue)");
+    await longAgo(f.first.id);
+    expect(await works(f.first.token)).toBe(401);
+    expect((await tourOf(w, f.id)).status).toBe("active"); // the owner has looked: this key is not the alarm any more
+    // 3. an error in the middle (the turn's statement fails) rolls the clearing back as well
+    const u = await newTenant("tour-turn-errors", "studio");
+    const a = (await open(u)).json;
+    await rested(a.tour.id);
+    await renew(a.key.token);
+    r = await during("tr_turn_errors", "tours", "BEFORE UPDATE", turnOf(a.tour.id), "RAISE EXCEPTION 'test: the turn cannot be taken';", () => reissue(u, a.tour.id));
+    expect(r.status).toBe(500);
+    expect(r.text).not.toContain("cog1.");
+    expect(await reasonOf(a.key.id)).toBe("tour: renewed");
+  });
+
+  test("inside its transaction a reissue clears the replaced keys of the alarm first, then takes its turn (pins the order within the transaction)", async () => {
+    const t = await newTenant("tour-reissue-order", "studio");
+    const f = await frozenTour(t); // its first key still carries "tour: renewed"
+    // At the moment the reissue takes its turn: how many keys under the tour still carry the alarm's reason? With the
+    // right order none, so an old key tried at that moment (the alarm reads the tour, then the key) finds nothing to do.
+    await dbQuery("DELETE FROM settings WHERE key = 'tr_armed_at_turn'");
+    const fresh = await during("tr_armed_at_turn", "tours", "AFTER UPDATE", `NEW.id = '${f.id}' AND NEW.gen = OLD.gen + 1 AND OLD.status = 'frozen' AND NEW.status = 'active'`,
+      `INSERT INTO settings (key, value) VALUES ('tr_armed_at_turn', (SELECT count(*) FROM grants WHERE parent = '${f.hold}' AND revoke_reason = 'tour: renewed')::text)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value; RETURN NULL;`, () => reissue(t, f.id));
+    expect(fresh.status).toBe(201);
+    expect((await dbQuery("SELECT value FROM settings WHERE key = 'tr_armed_at_turn'")).rows[0].value).toBe("0");
+    await dbQuery("DELETE FROM settings WHERE key = 'tr_armed_at_turn'");
+  });
+
+  test("the alarm reads the tour before the key: a reissue that lands between the two is not undone by it", async () => {
+    const t = await newTenant("tour-alarm-order", "studio");
+    const f = await frozenTour(t);
+    const g = await genOf(f.id);
+    // Between the alarm's two reads (its count of the use sits there) the owner's reissue lands whole: the replaced keys
+    // cleared, the turn taken, the new key written at that turn and noted. (A reissue's own statements, made by hand.)
+    await during("tr_reissue_between_reads", "rate_limits", "AFTER INSERT OR UPDATE", `NEW.grant_id = 'tour-alarm:${f.first.id}'`,
+      `UPDATE grants SET revoke_reason = 'tour: renewed (before an owner reissue)' WHERE parent = '${f.hold}' AND revoke_reason = 'tour: renewed';
+       UPDATE tours SET gen = gen + 1, status = 'active', frozen_reason = NULL, current_key = NULL, last_renewed_at = extract(epoch from now())::bigint WHERE id = '${f.id}';
+       INSERT INTO grants (id, tenant, parent, depth, sub, status, caps, scope, budget, constraints, payload, iat, exp)
+       SELECT 'gr_reissued_between', tenant, parent, depth, sub, 'active', caps, jsonb_set(scope, '{tour,gen}', to_jsonb(${g + 1})), '{"usd_cents":0,"calls":0,"deploys":0}'::jsonb, constraints, payload, iat, exp FROM grants WHERE id = '${f.second.id}';
+       UPDATE tours SET current_key = 'gr_reissued_between' WHERE id = '${f.id}'; RETURN NULL;`,
+      async () => expect(await works(f.first.token)).toBe(401));
+    // the alarm read the tour as it was (frozen, one turn ago) and the key's reason as it is now (cleared): nothing to do
+    expect(await statusOf("gr_reissued_between")).toBe("active");
+    expect((await dbQuery("SELECT status FROM tours WHERE id = $1", [f.id])).rows[0].status).toBe("active");
+    expect(await genOf(f.id)).toBe(g + 1);
+    expect(await freezeLines(t.id)).toBe(1); // the one that froze it in the first place
+  });
+
+  test("a renewal whose line on the record cannot be written still answers with the key it has handed over", async () => {
+    const t = await newTenant("tour-renew-record", "studio");
+    const a = (await open(t, { agent: "record.a" })).json;
+    await rested(a.tour.id);
+    let r = await during("tr_no_renew_line", "ledger", "BEFORE INSERT", `NEW.kind = 'tour-renew' AND NEW.grant_id = '${a.receipt.holding_grant}'`, "RAISE EXCEPTION 'test: the line cannot be written';", () => renew(a.key.token));
+    expect(r.status).toBe(201);
+    expect(await works(r.json.key.token)).toBe(200);
+    expect(await works(a.key.token)).toBe(401);
+    expect(r.json.tour.key.id).toBe(r.json.key.id);
+    expect((await req("GET", "/api/ledger", { token: t.token })).json.ledger.some((l) => l.kind === "tour-renew" && l.ref === r.json.key.id)).toBe(false); // the line is really missing
+    const b = (await open(t, { agent: "record.b" })).json;
+    await rested(b.tour.id);
+    r = await during("tr_no_renew_event", "events", "BEFORE INSERT", `NEW.type = 'tour.renewed' AND NEW.tenant = '${t.id}'`, "RAISE EXCEPTION 'test: the event cannot be written';", () => renew(b.key.token));
+    expect(r.status).toBe(201);
+    expect(await works(r.json.key.token)).toBe(200);
+    expect(await works(b.key.token)).toBe(401);
+    expect(r.json.tour.renewals).toBe(1);
+  });
+
+  test("a renewal whose issue fails after the key was written cancels that key before it marks the tour", async () => {
+    const t = await newTenant("tour-renew-late-fail", "studio");
+    const a = (await open(t)).json;
+    const hold = a.receipt.holding_grant;
+    await rested(a.tour.id);
+    // the key's row is committed; the step after it (the issue's own event) throws
+    const r = await during("tr_issued_then_throws", "events", "BEFORE INSERT", `NEW.type = 'grant.issued' AND NEW.tenant = '${t.id}'`, "RAISE EXCEPTION 'test: thrown after the key was written';", () => renew(a.key.token));
+    expect(r.status).toBe(500);
+    expect(r.text).not.toContain("cog1.");
+    expect(await liveUnder(hold)).toBe(0); // the key that was written is cancelled, by parent
+    expect((await reservedOf(hold)).calls).toBe(0); // and what it held is back on the tour
+    const tour = await tourOf(t, a.tour.id);
+    expect(tour.status).toBe("frozen");
+    expect(tour.left.calls).toBe(100);
+    const fresh = await reissue(t, a.tour.id);
+    expect(fresh.status).toBe(201);
+    expect(fresh.json.key.budget.calls).toBe(100);
+  });
+
+  test("the next key is asked for again when the amount it was given is refused (the refusal is forced; the key that would cause it is not)", async () => {
+    const t = await newTenant("tour-budget-retry", "studio");
+    const a = (await open(t)).json;
+    const hold = a.receipt.holding_grant;
+    await rested(a.tour.id);
+    // the issue's own hold on the budget (the holding grant's reserved going UP) is refused once, as it is when a key
+    // written after the look still holds part of it; the next attempt looks again and goes through
+    const r = await raisesOnce("tr_budget_once", "grants", "BEFORE UPDATE", `NEW.id = '${hold}' AND (NEW.reserved->>'calls')::int > (OLD.reserved->>'calls')::int`, "budget_exceeds_parent_remaining", () => renew(a.key.token));
+    expect(r.status).toBe(201);
+    expect(r.json.key.budget.calls).toBe(100);
+    expect(await works(r.json.key.token)).toBe(200);
+    expect(await liveUnder(hold)).toBe(1);
+    expect((await reservedOf(hold)).calls).toBe(100);
+  });
+
+  test("the owner ends the tour in the middle of a renewal or a reissue: 409 tour_ended, and nothing frozen on the record", async () => {
+    // 1. the holding grant is cancelled (as the owner's end does first) just as the renewal takes its turn
+    const t = await newTenant("tour-end-mid", "studio");
+    const a = (await open(t)).json;
+    await rested(a.tour.id);
+    let r = await during("tr_end_at_turn", "tours", "AFTER UPDATE", `NEW.id = '${a.tour.id}' AND NEW.gen = OLD.gen + 1 AND NEW.current_key = '${a.key.id}'`,
+      `UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'tour: ended by the owner' WHERE id = '${a.receipt.holding_grant}' AND status = 'active'; RETURN NULL;`, () => renew(a.key.token));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_ended");
+    expect(r.text).not.toContain("cog1.");
+    expect(await freezeLines(t.id)).toBe(0);
+    expect(await liveUnder(a.receipt.holding_grant)).toBe(0);
+    expect((await dbQuery("SELECT status FROM tours WHERE id = $1", [a.tour.id])).rows[0].status).toBe("active"); // the end's own mark is still to come
+    expect((await req("POST", `/api/tours/${a.tour.id}/end`, { token: t.token, body: {} })).status).toBe(200);
+    expect((await tourOf(t, a.tour.id)).status).toBe("ended");
+    expect(await freezeLines(t.id)).toBe(0);
+    // 2. the owner's own key ends at that moment (a grant above the tour): the issue is refused as parent_not_active,
+    //    which is the same thing said another way
+    const u = await newTenant("tour-end-mid-root", "studio");
+    const b = (await open(u)).json;
+    await rested(b.tour.id);
+    r = await during("tr_root_ends_at_turn", "tours", "AFTER UPDATE", `NEW.id = '${b.tour.id}' AND NEW.gen = OLD.gen + 1 AND NEW.current_key = '${b.key.id}'`,
+      `UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'test: the owner key ended' WHERE id = '${u.grantId}' AND status = 'active'; RETURN NULL;`, () => renew(b.key.token));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_ended");
+    expect(r.text).not.toContain("cog1.");
+    expect(await freezeLines(u.id)).toBe(0);
+    expect(await liveUnder(b.receipt.holding_grant)).toBe(0);
+    // 3. a reissue: the holding grant is cancelled as the reissue clears the replaced keys (the owner's end landing on
+    //    the owner's own reissue). 409 tour_ended, not the issue's own error
+    const w = await newTenant("tour-end-mid-reissue", "studio");
+    const f = await frozenTour(w);
+    r = await during("tr_end_at_relabel", "grants", "AFTER UPDATE", relabelOf(f.hold),
+      `UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = 'tour: ended by the owner' WHERE id = '${f.hold}' AND status = 'active'; RETURN NULL;`, () => reissue(w, f.id));
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe("tour_ended");
+    expect(r.text).not.toContain("cog1.");
+    expect(await liveUnder(f.hold)).toBe(0);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.tours_ended).toContain(f.id);
+  });
+
+  test("the alarm is rate limited per key: a dead key hammered makes no more than TOUR_ALARM_MAX_PER_MIN looks a minute", async () => {
+    const t = await newTenant("tour-alarm-rate", "studio");
+    const MAX = 10; // TOUR_ALARM_MAX_PER_MIN (policy.js)
+    await inOneWindow(async (attempt) => {
+      const f = await frozenTour(t, { agent: `hammer${attempt}` }); // one use of the dead key, counted
+      for (let i = 1; i < MAX; i++) expect(await works(f.first.token)).toBe(401); // MAX uses in all: the meter is full
+      expect((await dbQuery("SELECT sum(count)::int AS n FROM rate_limits WHERE grant_id = $1", [`tour-alarm:${f.first.id}`])).rows[0].n).toBe(MAX);
+      // the owner reissues, and the dead key is then armed again BY HAND (as in \"turns\" above), so that its next use
+      // WOULD be the alarm if it were looked into
+      const fresh = await reissue(t, f.id);
+      expect(fresh.status).toBe(201);
+      await dbQuery("UPDATE grants SET revoke_reason = 'tour: renewed', revoked_at = now() - interval '10 minutes' WHERE id = $1", [f.first.id]);
+      expect(await works(f.first.token)).toBe(401); // use MAX + 1 this minute: counted, and nothing more
+      expect((await tourOf(t, f.id)).status).toBe("active");
+      expect(await works(fresh.json.key.token)).toBe(200);
+      expect(await freezeLinesOf(f.hold)).toBe(1); // this tour's own: the freeze that made it, none since (per tour: the tenant is shared by a rerun)
+    });
+  });
+
+  test("the list shows live tours first, so an older open tour is never pushed out by newer finished ones", async () => {
+    const t = await newTenant("tour-list-order", "studio");
+    const live = (await open(t, { agent: "old.live" })).json;
+    const frozen = await frozenTour(t, { agent: "old.frozen" });
+    // a hundred tours ended since, every one newer than the two live ones
+    await dbQuery(`INSERT INTO tours (id, tenant, grant_id, agent, status, opened_at, until, last_renewed_at, ended_reason)
+      SELECT 'tr_done_' || i, tenant, grant_id, 'done.' || i, 'ended', opened_at + 10 + i, until, last_renewed_at, 'test: ended' FROM tours, generate_series(1, 100) AS i WHERE id = $1`, [live.tour.id]);
+    const list = (await req("GET", "/api/tours", { token: t.token })).json.tours;
+    expect(list.length).toBe(100);
+    expect(list.slice(0, 2).map((x) => x.id).sort()).toEqual([live.tour.id, frozen.id].sort());
+    expect(list[0].opened_at).toBeGreaterThanOrEqual(list[1].opened_at); // live first; among themselves newest first
+    expect(list.slice(2).every((x) => x.status === "ended")).toBe(true);
+    expect(list[2].opened_at).toBeGreaterThan(list[99].opened_at);
+  });
+});
+
 describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("child grant attenuation: widening refused, subtree revoke", async () => {
     const t = await newTenant("grant-tenant");
@@ -655,6 +2682,62 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
     expect(p.json.proposal.planner).toBe("deterministic");
     const g = mod.gatehouseEvaluate({ id: t.id, status: "active", tier: "starter", allowed_targets: {} }, null, p.json.proposal);
     expect(g).toEqual({ ok: true, reasons: [] });
+  });
+
+  // The Z-13's Ollama is a physical box that sleeps and reboots. A planner with no
+  // deadline hung with it; it must fall back to the deterministic plan and say why.
+  describe("cog plan when Ollama is slow, dead or answering", () => {
+    const OLLAMA = "http://z13-ollama.test:11435";
+    const seen = [];
+    let answer;   // (signal, body) => Promise<Response>
+    const outer = globalThis.fetch;
+    const withOllama = async (fn) => {
+      process.env.OLLAMA_URL = OLLAMA;
+      process.env.COG_LLM_TIMEOUT_MS = "300";
+      globalThis.fetch = async (input, init) => {
+        const url = typeof input === "string" ? input : input.url ?? String(input);
+        if (!url.startsWith(OLLAMA)) return outer(input, init);
+        seen.push(JSON.parse(init.body));
+        return answer(init.signal);
+      };
+      try { return await fn(); } finally {
+        globalThis.fetch = outer;
+        delete process.env.OLLAMA_URL;
+        delete process.env.COG_LLM_TIMEOUT_MS;
+      }
+    };
+    const plan = (t) => req("POST", "/api/cog/plan", { token: t.token, body: { intent: "send tip alerts to discord" } });
+
+    test("a hung Ollama: the deterministic plan answers within the deadline and says timeout", async () => {
+      const t = await newTenant("cog-hung");
+      answer = (signal) => new Promise((_, no) => signal.addEventListener("abort", () => no(signal.reason)));
+      const t0 = Date.now();
+      const p = await withOllama(() => plan(t));
+      expect(p.status).toBe(200);
+      expect(Date.now() - t0).toBeLessThan(5000);
+      expect(p.json.proposal.planner).toBe("deterministic");
+      expect(p.json.proposal.template).toBe("tip-alert-bot");
+      expect(p.json.proposal.warnings).toContain("planner_fallback:timeout");
+    });
+
+    test("a refused connection: deterministic plan, says error", async () => {
+      const t = await newTenant("cog-dead");
+      answer = async () => { throw new TypeError("fetch failed"); };
+      const p = await withOllama(() => plan(t));
+      expect(p.json.proposal.planner).toBe("deterministic");
+      expect(p.json.proposal.warnings).toContain("planner_fallback:error");
+    });
+
+    test("a live Ollama: the model's choice is used, keep_alive pins it, no fallback warning", async () => {
+      const t = await newTenant("cog-live");
+      seen.length = 0;
+      answer = async () => new Response(JSON.stringify({ message: { content: '{"template":"tip-alert-bot","env":{},"why":"tips"}' } }));
+      const p = await withOllama(() => plan(t));
+      expect(p.json.proposal.planner).toBe("llm+deterministic");
+      expect(p.json.proposal.warnings.some((w) => w.startsWith("planner_fallback"))).toBe(false);
+      expect(seen[0].keep_alive).toBe("30m");
+    });
+
   });
 
   test("docs: admin PUT, public GET, underscore docs hidden", async () => {
@@ -1130,6 +3213,17 @@ describe("12. creator-worker deploy guard", () => {
 });
 
 describe("12. guest-welcome (Phase 1)", () => {
+  test("GUEST_DOOR=closed refuses new guests on both doors; reopening works", async () => {
+    process.env.GUEST_DOOR = "closed";
+    try {
+      const r = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.77.1" }, body: { agent_name: "Locked" } });
+      expect(r.status).toBe(403);
+      expect(JSON.stringify(r.json)).toContain("guest_door_closed");
+    } finally { delete process.env.GUEST_DOOR; }
+    const open = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.77.2" }, body: { agent_name: "Open" } });
+    expect(open.status).toBe(201);
+  });
+
   test("POST /api/guest issues a working grant + welcome package in one keyless call", async () => {
     const r = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.9.1.1" }, body: { agent_name: "Wanderer" } });
     expect(r.status).toBe(201);
@@ -1191,7 +3285,8 @@ describe("12. guest-welcome (Phase 1)", () => {
     const ga = all.find((g) => g.id === va.json.id), gb = all.find((g) => g.id === vb.json.id);
     expect(ga.parent).toBeTruthy();
     expect(ga.parent).toBe(gb.parent); // both descend from the SAME pool root
-    const parent = all.find((g) => g.id === ga.parent);
+    // (the parent is read from the table: the admin list shows only the newest 200 grants, and the pool is older than that by now)
+    const parent = (await dbQuery("SELECT depth, tenant FROM grants WHERE id = $1", [ga.parent])).rows[0];
     expect(parent.depth).toBe(0);
     expect(parent.tenant).toBe("guest-pool");
   });
@@ -1370,19 +3465,22 @@ describe("13. guest sybil defence (per-fingerprint, keyed on X-Real-IP)", () => 
   });
 
   test("rate limit: GUEST_MAX_PER_HOUR (3) mints per window per fingerprint, then 429", async () => {
-    const ip = "10.13.2.1";
-    const m1 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
-    expect(m1.status).toBe(201);
-    const fp = await fpOf(m1.json.grant);
-    // clear the active-lock between mints so the RATE cap (not one-active) is what governs
-    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
-    expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 2
-    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
-    expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 3
-    await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
-    const m4 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
-    expect(m4.status).toBe(429);
-    expect(m4.json.error).toBe("guest_rate_limited");
+    // the mint count starts again every wall-clock HOUR (GUEST_FP_WINDOW_SEC): all four mints in one
+    await inOneWindow(async (attempt) => {
+      const ip = `10.13.2.${attempt}`;
+      const m1 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+      expect(m1.status).toBe(201);
+      const fp = await fpOf(m1.json.grant);
+      // clear the active-lock between mints so the RATE cap (not one-active) is what governs
+      await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+      expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 2
+      await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+      expect((await req("POST", "/api/guest", { headers: { "x-real-ip": ip } })).status).toBe(201); // count 3
+      await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
+      const m4 = await req("POST", "/api/guest", { headers: { "x-real-ip": ip } });
+      expect(m4.status).toBe(429);
+      expect(m4.json.error).toBe("guest_rate_limited");
+    }, 3600000);
   });
 
   test("privacy: no raw IP is ever stored — only the salted HMAC fingerprint", async () => {
@@ -1459,14 +3557,17 @@ describe("15. guest memory-write cap + brain-sync quarantine", () => {
   };
 
   test("guest writes are rate-capped tighter than the generic limit (10/min, own meter)", async () => {
-    const { token, base } = await freshGuest("10.15.1.1");
-    for (let i = 0; i < 10; i++) {
-      const w = await req("POST", "/api/memory", { token, body: { partition: base, key: "k" + i, content: "x" } });
-      expect(w.status).toBe(201);
-    }
-    const over = await req("POST", "/api/memory", { token, body: { partition: base, key: "k10", content: "x" } });
-    expect(over.status).toBe(429);
-    expect(over.json.error).toBe("memory_write_rate_limited"); // dedicated meter, not the generic 'rate_limited'
+    // the write meter starts again every wall-clock minute (the 11th write was 201 across a turn, seen 2026-10-09)
+    await inOneWindow(async (attempt) => {
+      const { token, base } = await freshGuest(`10.15.1.${attempt}`);
+      for (let i = 0; i < 10; i++) {
+        const w = await req("POST", "/api/memory", { token, body: { partition: base, key: "k" + i, content: "x" } });
+        expect(w.status).toBe(201);
+      }
+      const over = await req("POST", "/api/memory", { token, body: { partition: base, key: "k10", content: "x" } });
+      expect(over.status).toBe(429);
+      expect(over.json.error).toBe("memory_write_rate_limited"); // dedicated meter, not the generic 'rate_limited'
+    });
   });
 
   test("per-guest row cap, with updates to an existing key exempt", async () => {
@@ -1534,7 +3635,8 @@ describe("16. guest pool circuit breaker", () => {
     // materialize the pool, then find its depth-0 root
     const g0 = await req("POST", "/api/guest", { headers: { "x-real-ip": "10.16.1.1" } });
     expect(g0.status).toBe(201);
-    const pool = (await admin("GET", "/api/admin/grants")).json.grants.find((x) => x.tenant === "guest-pool" && x.depth === 0);
+    // read from the table, not from the admin list: that list shows only the newest 200 grants
+    const pool = (await dbQuery("SELECT id, budget, reserved FROM grants WHERE tenant = 'guest-pool' AND depth = 0")).rows[0];
     expect(pool).toBeTruthy();
     const budget = typeof pool.budget === "string" ? JSON.parse(pool.budget) : pool.budget;
     const origReserved = typeof pool.reserved === "string" ? pool.reserved : JSON.stringify(pool.reserved);
@@ -1632,7 +3734,8 @@ describe("18. step-4 double-loop fixes (regression controls)", () => {
     const fp = (await dbQuery("SELECT fp FROM guest_fingerprints WHERE grant_id = $1", [gid])).rows[0].fp;
     await dbQuery("UPDATE guest_fingerprints SET grant_exp = 0 WHERE fp = $1", [fp]);
     // drain the pool so the NEXT mint fails AFTER the fingerprint claim (breaker 503)
-    const pool = (await admin("GET", "/api/admin/grants")).json.grants.find((x) => x.tenant === "guest-pool" && x.depth === 0);
+    // read from the table, not from the admin list: that list shows only the newest 200 grants
+    const pool = (await dbQuery("SELECT id, budget, reserved FROM grants WHERE tenant = 'guest-pool' AND depth = 0")).rows[0];
     const budget = typeof pool.budget === "string" ? JSON.parse(pool.budget) : pool.budget;
     const orig = typeof pool.reserved === "string" ? pool.reserved : JSON.stringify(pool.reserved);
     try {
@@ -1774,6 +3877,1021 @@ describe("reservation reaper (runtime-wide)", () => {
   });
 });
 
+// What a key's helper spends counts against every grant above it, all the way up to the owner. Before
+// 2026-10-09 it counted one level up only: when the grant in between ended, the grant above got its
+// whole budget back and the spend was forgotten.
+describe("18b. spend counts all the way up the chain", () => {
+  const past = Math.floor(Date.now() / 1000) - 60;
+  const left = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining.calls;
+  const issue = (token, sub, calls, caps = ["grant.issue", "grant.read"]) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget: { usd_cents: 0, calls, deploys: 0 } } });
+  const spend = (token, calls) => req("POST", "/api/grants/settle", { token, body: { calls, ref: "work:test" } });
+
+  test("a helper's helper spends 4: when the grant between them is cancelled, the owner still has 4 less", async () => {
+    const root = await newTenant("chain-revoke", "pro");
+    const before = await left(root.token);
+    const mid = await issue(root.token, "agent:mid", 10);
+    const leaf = await issue(mid.json.token, "agent:leaf", 6, ["grant.read"]);
+    expect(leaf.status).toBe(201);
+    expect((await spend(leaf.json.token, 4)).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 10); // while they live, the whole 10 is held
+    expect((await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: { reason: "test" } })).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 4); // the 6 nobody used came back; the 4 that were used did not
+    // and it can be handed out again only up to what is really left
+    expect((await issue(root.token, "agent:again", before - 4)).status).toBe(201);
+    expect((await issue(root.token, "agent:over", 1)).status).toBeGreaterThanOrEqual(400);
+  });
+
+  test("the same when they simply run out (the sweep), in either order, and never twice", async () => {
+    const root = await newTenant("chain-expire", "pro");
+    const before = await left(root.token);
+    const mid = await issue(root.token, "agent:mid", 10);
+    const leaf = await issue(mid.json.token, "agent:leaf", 6, ["grant.read"]);
+    expect((await spend(leaf.json.token, 4)).status).toBe(200);
+    expect((await spend(mid.json.token, 1)).status).toBe(200); // the middle one uses 1 itself
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = ANY($2)", [past, [mid.json.id, leaf.json.id]]);
+    expect((await admin("POST", "/api/admin/grants/reap")).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 5); // 4 by the helper's helper, 1 by the helper
+    await admin("POST", "/api/admin/grants/reap");
+    await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: { reason: "again" } });
+    expect(await left(root.token)).toBe(before - 5); // a second sweep and a late cancel change nothing
+    // A grant WAITS for the keys under it: while one of them is still live, what is held on it is not yet "what
+    // they used", so the sweep leaves it alone rather than guess. (Only a test can put a parent's end before its
+    // child's; a real child never outlives its parent.)
+    const mid2 = await issue(root.token, "agent:mid2", 10);
+    const leaf2 = await issue(mid2.json.token, "agent:leaf2", 6, ["grant.read"]);
+    expect((await spend(leaf2.json.token, 2)).status).toBe(200);
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, mid2.json.id]);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).not.toContain(mid2.json.id);
+    expect(await left(root.token)).toBe(before - 5 - 10); // still holding all 10: nothing was let go early
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, leaf2.json.id]);
+    const swept = (await admin("POST", "/api/admin/grants/reap")).json.reaped;
+    expect(swept).toContain(leaf2.json.id);
+    expect(swept).toContain(mid2.json.id); // one pass, the lower one first
+    expect(await left(root.token)).toBe(before - 5 - 2);
+    await admin("POST", "/api/admin/grants/reap");
+    expect(await left(root.token)).toBe(before - 5 - 2);
+  });
+
+  test("whatever order things end in, the owner is left holding exactly what was used", async () => {
+    const root = await newTenant("chain-orders", "pro");
+    const before = await left(root.token);
+    // 1. the lower key is cancelled first, then the one above it runs out
+    let mid = await issue(root.token, "agent:m1", 10), leaf = await issue(mid.json.token, "agent:l1", 6, ["grant.read"]);
+    expect((await spend(leaf.json.token, 3)).status).toBe(200);
+    expect((await req("POST", `/api/grants/${leaf.json.id}/revoke`, { token: mid.json.token, body: {} })).status).toBe(200);
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, mid.json.id]);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).toContain(mid.json.id);
+    expect(await left(root.token)).toBe(before - 3);
+    // 2. the lower key has run out but the sweep has not reached it yet, and the one above is cancelled
+    mid = await issue(root.token, "agent:m2", 10); leaf = await issue(mid.json.token, "agent:l2", 6, ["grant.read"]);
+    expect((await spend(leaf.json.token, 2)).status).toBe(200);
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, leaf.json.id]);
+    expect((await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: {} })).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 3 - 2);
+    // 3. the sweep took the lower key earlier; cancelling the one above later must not let it go a second time
+    mid = await issue(root.token, "agent:m3", 10); leaf = await issue(mid.json.token, "agent:l3", 6, ["grant.read"]);
+    expect((await spend(leaf.json.token, 1)).status).toBe(200);
+    await dbQuery("UPDATE grants SET exp = $1 WHERE id = $2", [past, leaf.json.id]);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).toContain(leaf.json.id);
+    expect((await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: {} })).json.revoked).toEqual([mid.json.id]);
+    expect(await left(root.token)).toBe(before - 3 - 2 - 1);
+    // 4. cancelling something that has already ended gives nothing back and takes nothing
+    expect((await req("POST", `/api/grants/${mid.json.id}/revoke`, { token: root.token, body: {} })).json.revoked).toEqual([]);
+    await admin("POST", "/api/admin/grants/reap");
+    expect(await left(root.token)).toBe(before - 6);
+  });
+
+  test("three levels down, and one level down still works as it always did", async () => {
+    const root = await newTenant("chain-deep", "studio");
+    const before = await left(root.token);
+    const a = await issue(root.token, "agent:a", 20);
+    const b = await issue(a.json.token, "agent:b", 12);
+    const c = await issue(b.json.token, "agent:c", 8, ["grant.read"]);
+    expect(c.status).toBe(201);
+    expect((await spend(c.json.token, 3)).status).toBe(200);
+    expect((await spend(b.json.token, 2)).status).toBe(200);
+    // cancel the lowest first, then the top: the answer must not depend on the order things end in
+    expect((await req("POST", `/api/grants/${c.json.id}/revoke`, { token: b.json.token, body: {} })).status).toBe(200);
+    expect(await left(b.json.token)).toBe(12 - 2 - 3);
+    expect((await req("POST", `/api/grants/${a.json.id}/revoke`, { token: root.token, body: {} })).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 5);
+    const direct = await issue(root.token, "agent:direct", 10, ["grant.read"]);
+    expect((await spend(direct.json.token, 7)).status).toBe(200);
+    expect((await req("POST", `/api/grants/${direct.json.id}/revoke`, { token: root.token, body: {} })).status).toBe(200);
+    expect(await left(root.token)).toBe(before - 5 - 7);
+  });
+});
+
+// Two older faults in cancelling, both closed on 2026-10-09 (src/grants.js, revokeGrantTree).
+//
+// 1. A key issued under a grant AT THE MOMENT that grant was being cancelled was missed: it stayed live under a
+//    cancelled parent, and its whole budget stayed held on the grant above for good.
+// 2. A cancel that lost a lock wait (Postgres aborts one of two transactions that each hold what the other wants)
+//    simply failed, and a sweep pass that lost one skipped every candidate after it.
+//
+// WHAT THESE TESTS CAN AND CANNOT SHOW. The suite's database is ONE connection, so two transactions never really
+// run side by side here. Instead a database trigger makes the other party's work appear at one chosen statement,
+// which is where the other transaction would have finished, or makes that statement fail with the very error
+// Postgres gives the side it aborts (SQLSTATE 40P01). So these tests pin what the code DOES once it meets that
+// state or that error. That the state and the error arise the way the notes in grants.js say, and that no other
+// interleaving exists, rests on reading the lock sequences, not on a test.
+describe("18c. a cancel leaves nothing working under it, and losing a lock wait does not fail it", () => {
+  const past = Math.floor(Date.now() / 1000) - 60;
+  const works = async (token) => (await req("GET", "/api/grants/verify", { token })).status;
+  const left = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining.calls;
+  const issue = (token, sub, calls, caps = ["grant.issue", "grant.read"]) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget: { usd_cents: 0, calls, deploys: 0 } } });
+  const spend = (token, calls) => req("POST", "/api/grants/settle", { token, body: { calls, ref: "work:test" } });
+  const cancel = (token, id) => req("POST", `/api/grants/${id}/revoke`, { token, body: { reason: "test" } });
+  const statusOf = async (id) => (await dbQuery("SELECT status FROM grants WHERE id = $1", [id])).rows[0]?.status;
+  const rowOf = async (id) => JSON.parse(JSON.stringify((await dbQuery("SELECT status, reserved, settled FROM grants WHERE id = $1", [id])).rows[0]));
+  // what each grant gave back to the one above it, one number per time it let go (never more than one)
+  const gaveBack = async (id) => (await dbQuery("SELECT calls FROM ledger WHERE kind = 'release' AND grant_id = $1 ORDER BY id", [id])).rows.map((r) => r.calls);
+  // Something happens at ONE chosen statement, for the length of `fn`: a trigger that exists only inside one test.
+  const at = async (name, table, timing, when, body, fn) => {
+    await dbQuery(`CREATE OR REPLACE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN ${body} END $f$`);
+    await dbQuery(`CREATE TRIGGER ${name} ${timing} ON ${table} FOR EACH ROW WHEN (${when}) EXECUTE FUNCTION ${name}()`);
+    try {
+      return await fn();
+    } finally {
+      await dbQuery(`DROP TRIGGER IF EXISTS ${name} ON ${table}`);
+      await dbQuery(`DROP FUNCTION IF EXISTS ${name}()`);
+    }
+  };
+  const beingCancelled = (id) => `OLD.id = '${id}' AND OLD.status = 'active' AND NEW.status = 'revoked'`;
+  // Keys that were "issued while the grant above them was being cancelled". They are issued for real first, so
+  // their tokens are real, then taken out from under their parent again (nothing held for them there), so the
+  // cancel's list cannot see them: as if they had not been issued yet. They are put back, in the order given, at
+  // the very statement that takes the parent, with their budget held on the parent, which is exactly what
+  // issueChildGrant leaves when it finishes just before.
+  const issuedDuringCancel = async (name, parentId, childIds, held, fn) => {
+    await dbQuery("UPDATE grants SET parent = NULL WHERE id = ANY($1)", [childIds]);
+    await dbQuery(`UPDATE grants SET reserved = '{"usd_cents":0,"calls":0,"deploys":0}'::jsonb WHERE id = $1`, [parentId]);
+    return at(name, "grants", "BEFORE UPDATE", beingCancelled(parentId),
+      `${childIds.map((id) => `UPDATE grants SET parent = '${parentId}' WHERE id = '${id}';`).join(" ")} NEW.reserved := '{"usd_cents":0,"calls":${held},"deploys":0}'::jsonb; RETURN NEW;`, fn);
+  };
+  // The statement that takes `id` fails the first `times` times with the error Postgres gives the side it aborts
+  // in a lock cycle. The count is a sequence because a sequence is not undone when the transaction is.
+  const losesTheWait = async (name, id, to, times, fn, error = "RAISE EXCEPTION 'deadlock detected' USING ERRCODE = '40P01';") => {
+    await dbQuery(`DROP SEQUENCE IF EXISTS ${name}_n`);
+    await dbQuery(`CREATE SEQUENCE ${name}_n`);
+    try {
+      const r = await at(name, "grants", "BEFORE UPDATE", `OLD.id = '${id}' AND OLD.status = 'active' AND NEW.status = '${to}'`, `IF nextval('${name}_n') <= ${times} THEN ${error} END IF; RETURN NEW;`, fn);
+      const n = (await dbQuery(`SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS n FROM ${name}_n`)).rows[0].n;
+      return { r, tries: Number(n) };
+    } finally {
+      await dbQuery(`DROP SEQUENCE IF EXISTS ${name}_n`);
+    }
+  };
+
+  test("a helper issued while the key above it is being cancelled is cancelled with it, and the owner gets back all that nobody used", async () => {
+    const root = await newTenant("cancel-race", "studio");
+    const before = await left(root.token);
+    // 1. the sequence as it was found: one key is cancelled, and a helper is issued under it at that moment
+    let mid = await issue(root.token, "agent:mid", 10),
+      late = await issue(mid.json.token, "agent:late", 6, ["grant.read"]);
+    expect(late.status).toBe(201);
+    expect((await spend(late.json.token, 2)).status).toBe(200);
+    let r = await issuedDuringCancel("t18c_late_one", mid.json.id, [late.json.id], 6, () => cancel(root.token, mid.json.id));
+    expect(r.status).toBe(200);
+    expect(r.json.revoked).toEqual([late.json.id, mid.json.id]); // the lower one first
+    expect(await statusOf(late.json.id)).toBe("revoked");
+    expect(await works(late.json.token)).toBe(401);
+    expect(await gaveBack(late.json.id)).toEqual([4]); // 6 less the 2 it used
+    expect(await gaveBack(mid.json.id)).toEqual([8]); // 10 less the 2 used under it: read AFTER the helper let go
+    expect(await left(root.token)).toBe(before - 2);
+    // 2. the same from higher up, and the helper has a helper of its own: the whole of what was issued late goes
+    const top = await issue(root.token, "agent:top", 20);
+    mid = await issue(top.json.token, "agent:mid", 10);
+    late = await issue(mid.json.token, "agent:late", 6);
+    const under = await issue(late.json.token, "agent:under", 3, ["grant.read"]);
+    expect(under.status).toBe(201);
+    expect((await spend(late.json.token, 2)).status).toBe(200);
+    expect((await spend(under.json.token, 1)).status).toBe(200);
+    r = await issuedDuringCancel("t18c_late_tree", mid.json.id, [late.json.id], 6, () => cancel(root.token, top.json.id));
+    expect(r.status).toBe(200);
+    expect(r.json.revoked).toEqual([under.json.id, late.json.id, mid.json.id, top.json.id]);
+    for (const g of [under, late, mid, top]) expect(await statusOf(g.json.id)).toBe("revoked");
+    expect(await works(late.json.token)).toBe(401);
+    expect(await works(under.json.token)).toBe(401);
+    expect(await gaveBack(under.json.id)).toEqual([2]); // 3 less the 1 it used
+    expect(await gaveBack(late.json.id)).toEqual([3]); // 6 less its own 2, less the 1 used under it
+    expect(await gaveBack(mid.json.id)).toEqual([7]); // 10 less the 3 used under it
+    expect(await gaveBack(top.json.id)).toEqual([17]); // 20 less those 3
+    // The owner is left holding exactly what was used (2, then 2 + 1), and can hand out the rest and no more.
+    expect(await left(root.token)).toBe(before - 5);
+    expect((await issue(root.token, "agent:again", before - 5)).status).toBe(201);
+    expect((await issue(root.token, "agent:over", 1)).status).toBeGreaterThanOrEqual(400);
+  });
+
+  test("a key issued under a grant that somebody else ended while the cancel ran is cancelled too", async () => {
+    // A cancel does not move a grant it finds already ended. Whoever ended it means to leave nothing active
+    // under it (the sweep and a capture wait until nothing is; another cancel looks), but the cancel does not
+    // take that on trust: it looks under such a grant as well. Here: `mid` is in the cancel's list; before the
+    // cancel reaches it (at the statement that takes the key under it, which comes first) it is ended by somebody
+    // else, written here as `captured`, with a key issued under it that was not there when the list was read.
+    const root = await newTenant("cancel-race-ended", "studio");
+    const before = await left(root.token);
+    const mid = await issue(root.token, "agent:mid", 10);
+    const first = await issue(mid.json.token, "agent:first", 2, ["grant.read"]);
+    const late = await issue(mid.json.token, "agent:late", 3, ["grant.read"]);
+    expect(late.status).toBe(201);
+    await dbQuery("UPDATE grants SET parent = NULL WHERE id = $1", [late.json.id]);
+    await dbQuery(`UPDATE grants SET reserved = '{"usd_cents":0,"calls":2,"deploys":0}'::jsonb WHERE id = $1`, [mid.json.id]);
+    const r = await at("t18c_ended_meanwhile", "grants", "BEFORE UPDATE", beingCancelled(first.json.id),
+      `UPDATE grants SET status = 'captured', reserved = '{"usd_cents":0,"calls":5,"deploys":0}'::jsonb WHERE id = '${mid.json.id}'; UPDATE grants SET parent = '${mid.json.id}' WHERE id = '${late.json.id}'; RETURN NEW;`,
+      () => cancel(root.token, mid.json.id));
+    expect(r.status).toBe(200);
+    expect(r.json.revoked).toEqual([first.json.id, late.json.id]); // not `mid`: this cancel did not end it
+    expect(await statusOf(mid.json.id)).toBe("captured");
+    expect(await statusOf(late.json.id)).toBe("revoked");
+    expect(await works(late.json.token)).toBe(401);
+    expect(await gaveBack(late.json.id)).toEqual([3]);
+    expect(await gaveBack(mid.json.id)).toEqual([]); // and it let go of nothing for a grant it did not end
+    expect((await rowOf(mid.json.id)).reserved.calls).toBe(0); // both keys under it gave back all they held
+    expect(await left(root.token)).toBe(before - 10); // what `mid` held is whoever ended it's to settle, not the cancel's
+  });
+
+  test("a key under a grant that has ended does not work: it is refused at the door, and cannot settle or issue even past the door", async () => {
+    const root = await newTenant("cancel-orphan", "studio");
+    const top = await issue(root.token, "agent:top", 30);
+    const mid = await issue(top.json.token, "agent:mid", 20);
+    const leaf = await issue(mid.json.token, "agent:leaf", 10);
+    const deep = await issue(leaf.json.token, "agent:deep", 2, ["grant.read"]);
+    expect(deep.status).toBe(201);
+    const end = (id, status) => dbQuery("UPDATE grants SET status = $2 WHERE id = $1", [id, status]);
+    // The state the old fault left behind, written by hand: a grant ended, the keys under it not. Whatever way it
+    // ended, and whether it is the grant just above or one further up, every key under it is refused.
+    for (const [which, status] of [[mid, "revoked"], [mid, "expired"], [mid, "captured"], [top, "revoked"]]) {
+      expect(await works(leaf.json.token)).toBe(200); // control: with everything above it active, it works
+      expect(await works(deep.json.token)).toBe(200);
+      await end(which.json.id, status);
+      const refused = await req("GET", "/api/grants/verify", { token: leaf.json.token });
+      expect(refused.status).toBe(401);
+      expect(refused.json.error).toBe("grant_revoked");
+      expect(await works(deep.json.token)).toBe(401); // two below the one that ended
+      expect((await spend(leaf.json.token, 1)).status).toBe(401);
+      expect((await issue(leaf.json.token, "agent:no", 1)).status).toBe(401);
+      expect(await works(which === mid ? top.json.token : root.token)).toBe(200); // the grant above the ended one is untouched
+      await end(which.json.id, "active");
+    }
+    // PAST THE DOOR. The door (verifyGrant) reads once, when the request comes in. If the grant above ends after
+    // that read, the write itself must still refuse. Made to happen here at the door's last statement (its
+    // rate-limit count), which is after its read of the grant and before the write.
+    const afterTheDoor = (name, which, status, fn) => at(name, "rate_limits", "BEFORE INSERT", `NEW.grant_id = '${leaf.json.id}'`, `UPDATE grants SET status = '${status}' WHERE id = '${which.json.id}'; RETURN NEW;`, fn);
+    const was = await rowOf(leaf.json.id);
+    // the grant just above, and the one above that; cancelled, run out, captured
+    for (const [n, which, status] of [[1, mid, "revoked"], [2, top, "expired"], [3, top, "captured"]]) {
+      const settle = await afterTheDoor(`t18c_ends_before_settle_${n}`, which, status, () => spend(leaf.json.token, 1));
+      expect(settle.status).toBe(401);
+      expect(settle.json.error).toBe("grant_not_active"); // the settle's own refusal, not the door's
+      await end(which.json.id, "active");
+      const hire = await afterTheDoor(`t18c_ends_before_issue_${n}`, which, status, () => issue(leaf.json.token, "agent:no", 1));
+      expect(hire.status).toBe(403);
+      expect(hire.json.error).toBe("parent_not_active"); // the issue's own refusal
+      await end(which.json.id, "active");
+    }
+    expect(await rowOf(leaf.json.id)).toEqual(was); // nothing was settled on it and nothing is held on it for a new key
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [leaf.json.id])).rows[0].n).toBe(1);
+    // with the grant above active again, both go through: it was only ever the ended grant that stopped them
+    expect((await spend(leaf.json.token, 1)).status).toBe(200);
+    expect((await issue(leaf.json.token, "agent:yes", 1, ["grant.read"])).status).toBe(201);
+    // and a key under an ended grant can still be CANCELLED, through the ordinary route
+    await end(mid.json.id, "revoked");
+    expect((await cancel(root.token, leaf.json.id)).json.revoked).toContain(leaf.json.id);
+    expect(await statusOf(deep.json.id)).toBe("revoked");
+  });
+
+  test("the owner's approval does not run a request filed by a key whose grant above has since ended", async () => {
+    // An approval is run under the grant that asked, without coming through the door. So it looks above that grant
+    // itself, before anything is done (a deploy is created first and charged after).
+    const root = await newTenant("cancel-orphan-approval", "pro");
+    const grant = (token, sub, caps, constraints) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, ...(constraints ? { constraints } : {}) } });
+    const mid = await grant(root.token, "agent:mid", ["grant.issue", "grant.read", "escrow.hold"]);
+    const asker = await grant(mid.json.token, "agent:asker", ["escrow.hold", "grant.read"], { autonomy: "ask" });
+    expect(asker.status).toBe(201);
+    const ask = () => req("POST", "/api/escrow", { token: asker.json.token, body: { amount: 100, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" } } });
+    const decide = (id) => req("POST", `/api/approvals/${id}`, { token: root.token, body: { decision: "approve" } });
+    const filed = await ask();
+    expect(filed.status).toBe(202);
+    await dbQuery("UPDATE grants SET status = 'revoked' WHERE id = $1", [mid.json.id]);
+    const refused = await decide(filed.json.approval.id);
+    expect(refused.status).toBe(409);
+    expect(refused.json.error).toBe("requesting_grant_not_active");
+    const row = (await dbQuery("SELECT status, result FROM approvals WHERE id = $1", [filed.json.approval.id])).rows[0];
+    expect(row.status).toBe("failed");
+    expect((await rowOf(asker.json.id)).reserved.usd_cents).toBe(0); // nothing was held
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [asker.json.id])).rows[0].n).toBe(0);
+    // control: with the grant above it active, the same request is approved and the hold opens
+    await dbQuery("UPDATE grants SET status = 'active' WHERE id = $1", [mid.json.id]);
+    const again = await ask();
+    expect(again.status).toBe(202);
+    expect((await decide(again.json.approval.id)).status).toBe(200);
+    expect((await rowOf(asker.json.id)).reserved.usd_cents).toBe(100);
+  });
+
+  test("nobody hands out a fresh token for a key whose grant above has ended: not the admin, not the OAuth refresh", async () => {
+    const root = await newTenant("cancel-orphan-tokens", "pro");
+    const mid = await issue(root.token, "agent:mid", 10);
+    const leaf = await issue(mid.json.token, "agent:leaf", 4, ["grant.read"]);
+    const resign = (id) => admin("POST", `/api/admin/grants/${id}/token`);
+    expect((await resign(leaf.json.id)).status).toBe(200); // control
+    await dbQuery("UPDATE grants SET status = 'revoked' WHERE id = $1", [mid.json.id]);
+    const no = await resign(leaf.json.id);
+    expect(no.status).toBe(404);
+    expect(no.json.error).toBe("grant_not_active");
+    expect(no.text).not.toContain("cog1.");
+    // OAuth. A refresh signs the SAME grant again while it has more than an hour left. If the grant above it has
+    // ended, that token would answer 401 at the door for as long as the client kept refreshing; the client is told
+    // to approve again instead.
+    const redirect = "https://devdesk.meshtool.ai/runtime/callback";
+    const client = (await req("POST", "/oauth/register", { body: { client_name: "orphan", redirect_uris: [redirect] } })).json.client_id;
+    const verifier = "orphan-verifier-" + "z".repeat(40);
+    const ap = await admin("POST", "/oauth/approve", { body: { client_id: client, redirect_uri: redirect, code_challenge: s256(verifier), state: "o", tenant: root.id } });
+    const tok = await req("POST", "/oauth/token", { body: { grant_type: "authorization_code", code: new URL(ap.json.redirect).searchParams.get("code"), client_id: client, redirect_uri: redirect, code_verifier: verifier } });
+    expect(tok.status).toBe(200);
+    const refresh = (t) => req("POST", "/oauth/token", { body: { grant_type: "refresh_token", refresh_token: t, client_id: client } });
+    const first = await refresh(tok.json.refresh_token);
+    expect(first.status).toBe(200); // control: everything above it active, the same grant is signed again
+    const me = await req("GET", "/api/grants/verify", { token: first.json.access_token });
+    expect(me.status).toBe(200);
+    // the grant above it ends (written by hand: a real cancel would take the OAuth grant with it)
+    await dbQuery("UPDATE grants SET status = 'revoked' WHERE id = (SELECT parent FROM grants WHERE id = $1)", [me.json.id]);
+    expect(await statusOf(me.json.id)).toBe("active");
+    const second = await refresh(first.json.refresh_token);
+    expect(second.status).toBe(400);
+    expect(second.json.error).toBe("invalid_grant");
+    expect(second.text).not.toContain("cog1.");
+  });
+
+  test("a cancel that loses a lock wait starts again and lets go exactly once; it gives up after three tries with nothing changed; any other failure is not tried again", async () => {
+    const root = await newTenant("cancel-retry", "studio");
+    const before = await left(root.token);
+    const tree = async (n) => {
+      const mid = await issue(root.token, `agent:mid${n}`, 10);
+      const leaf = await issue(mid.json.token, `agent:leaf${n}`, 6, ["grant.read"]);
+      expect((await spend(leaf.json.token, 2)).status).toBe(200);
+      return { mid: mid.json.id, leaf: leaf.json.id };
+    };
+    // The failure comes when `mid` is taken, which is AFTER the leaf under it was cancelled and had let go in the
+    // same transaction. So a try that fails must leave nothing of that behind, or the next try would let go twice.
+    // 1. lost once, then twice: it finishes. A lost wait is known by its code (40P01) whatever its words are, and by
+    //    its words if a driver does not pass the code on.
+    const shapes = { 1: "RAISE EXCEPTION 'Verklemmung entdeckt' USING ERRCODE = '40P01';", 2: "RAISE EXCEPTION 'deadlock detected';" };
+    for (const lost of [1, 2]) {
+      const g = await tree(lost);
+      const { r, tries } = await losesTheWait(`t18c_lost_${lost}`, g.mid, "revoked", lost, () => cancel(root.token, g.mid), shapes[lost]);
+      expect(r.status).toBe(200);
+      expect(tries).toBe(lost + 1);
+      expect(r.json.revoked).toEqual([g.leaf, g.mid]); // the answer is the try that worked, not a list from each try
+      expect(await gaveBack(g.leaf)).toEqual([4]);
+      expect(await gaveBack(g.mid)).toEqual([8]);
+      expect(await left(root.token)).toBe(before - 2 * lost);
+    }
+    // 2. lost every time: three tries, then the failure is the caller's to see, and NOTHING has changed
+    const g = await tree(3);
+    const stuck = await losesTheWait("t18c_lost_always", g.mid, "revoked", 1000, () => cancel(root.token, g.mid));
+    expect(stuck.r.status).toBe(500);
+    expect(stuck.tries).toBe(3);
+    expect(await statusOf(g.leaf)).toBe("active");
+    expect(await statusOf(g.mid)).toBe("active");
+    expect(await gaveBack(g.leaf)).toEqual([]);
+    expect(await left(root.token)).toBe(before - 4 - 10);
+    // 3. a failure that is not a lost wait is not tried again
+    const other = await losesTheWait("t18c_other_error", g.mid, "revoked", 1000, () => cancel(root.token, g.mid), "RAISE EXCEPTION 'test: this key cannot be cancelled right now';");
+    expect(other.r.status).toBe(500);
+    expect(other.tries).toBe(1);
+    expect(await statusOf(g.leaf)).toBe("active");
+    // and with nothing in the way it is cancelled as usual
+    expect((await cancel(root.token, g.mid)).json.revoked).toEqual([g.leaf, g.mid]);
+    expect(await left(root.token)).toBe(before - 6);
+  });
+
+  test("the sweep: one grant that cannot be released does not stop the pass, the pass says which one, and the next pass takes it", async () => {
+    const a = await newTenant("sweep-a", "studio");
+    const b = await newTenant("sweep-b", "studio");
+    const before = await left(a.token);
+    // a lost lock wait, and then any other failure: neither ends the pass, neither is hidden
+    const kinds = [["deadlock detected", "RAISE EXCEPTION 'deadlock detected' USING ERRCODE = '40P01';"], ["test: this grant cannot be released", "RAISE EXCEPTION 'test: this grant cannot be released';"]];
+    for (const [n, [words, error]] of kinds.entries()) {
+      const mid = await issue(a.token, `agent:mid${n}`, 10);
+      const leaf = await issue(mid.json.token, `agent:leaf${n}`, 6, ["grant.read"]);
+      const other = await issue(b.token, `agent:other${n}`, 5, ["grant.read"]);
+      expect((await spend(leaf.json.token, 2)).status).toBe(200);
+      await dbQuery("UPDATE grants SET exp = $1 WHERE id = ANY($2)", [past, [mid.json.id, leaf.json.id, other.json.id]]);
+      // The leaf is the deepest, so the pass comes to it first. It fails, every time, for the length of this pass.
+      const { r, tries } = await losesTheWait(`t18c_sweep_${n}`, leaf.json.id, "expired", 1000, () => admin("POST", "/api/admin/grants/reap"), error);
+      expect(r.status).toBe(200); // the pass did not fail
+      expect(tries).toBe(1); // the sweep does not try a candidate twice in one pass
+      expect(r.json.reaped).toContain(other.json.id); // a candidate AFTER the one that failed was still released
+      expect(r.json.reaped).not.toContain(leaf.json.id);
+      expect(r.json.reaped).not.toContain(mid.json.id); // the grant above it waited for it
+      expect(r.json.failed.map((f) => f.id)).toEqual([leaf.json.id]); // and the pass says what it left, and why
+      expect(r.json.failed[0].error).toContain(words);
+      expect(await statusOf(leaf.json.id)).toBe("active");
+      expect(await statusOf(mid.json.id)).toBe("active");
+      expect((await rowOf(b.grantId)).reserved.calls).toBe(0); // b got its 5 back in that same pass
+      // the next pass takes both, the lower one first, and the owner is left holding exactly what was used
+      const next = (await admin("POST", "/api/admin/grants/reap")).json;
+      expect(next.failed).toEqual([]);
+      expect(next.reaped).toContain(leaf.json.id);
+      expect(next.reaped).toContain(mid.json.id);
+      expect(await gaveBack(leaf.json.id)).toEqual([4]);
+      expect(await gaveBack(mid.json.id)).toEqual([8]);
+      expect(await left(a.token)).toBe(before - 2 * (n + 1));
+    }
+  });
+
+  test("a cancel takes the grants in one fixed order: the lower ones first, and within one level by id; keys found by its second look by id too", async () => {
+    // The order grants are TAKEN in is the order their rows are locked in, which is what decides whether two
+    // transactions can end up waiting on each other. So it is written down here as it happens, by a trigger.
+    const root = await newTenant("cancel-order", "studio");
+    const under = async (parentId) => (await dbQuery("SELECT id FROM grants WHERE parent = $1 ORDER BY id", [parentId])).rows.map((x) => x.id);
+    const takenDuring = async (name, fn) => {
+      await dbQuery("CREATE TABLE IF NOT EXISTS t18c_taken (n BIGSERIAL PRIMARY KEY, id TEXT NOT NULL)");
+      await dbQuery("DELETE FROM t18c_taken");
+      const r = await at(name, "grants", "BEFORE UPDATE", `OLD.tenant = '${root.id}' AND OLD.status = 'active' AND NEW.status = 'revoked'`, "INSERT INTO t18c_taken (id) VALUES (OLD.id); RETURN NEW;", fn);
+      return { r, taken: (await dbQuery("SELECT id FROM t18c_taken ORDER BY n")).rows.map((x) => x.id) };
+    };
+    // 1. the list. Ids are random, so a tree is built again until (a) the order its keys were made in is NOT their
+    //    order by id, and (b) one of them sorts AFTER the grant they hang from. Then neither "whatever order the
+    //    database lists them in" nor "by id alone" could pass by luck. About six tries in seven do at once; forty
+    //    tries cannot all miss. (Which id sorts after which is asked of the database, whose order it is.)
+    const sortsAfter = async (parentId) => (await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1 AND id > $1", [parentId])).rows[0].n > 0;
+    let mid, made;
+    for (let tries = 0; tries < 40; tries++) {
+      mid = await issue(root.token, `agent:mid${tries}`, 40);
+      made = [];
+      for (let n = 0; n < 6; n++) {
+        const k = await issue(mid.json.token, `agent:k${n}`, 2);
+        expect(k.status).toBe(201);
+        made.push(k.json.id);
+        if (n === 0) for (const m of [1, 2]) expect((await issue(k.json.token, `agent:kk${m}`, 1, ["grant.read"])).status).toBe(201); // and a level further down
+      }
+      if (String(made) !== String(await under(mid.json.id)) && (await sortsAfter(mid.json.id))) break;
+    }
+    expect(made).not.toEqual(await under(mid.json.id));
+    expect(await sortsAfter(mid.json.id)).toBe(true);
+    const expected = [...(await under(made[0])), ...(await under(mid.json.id)), mid.json.id];
+    const one = await takenDuring("t18c_taken_list", () => cancel(root.token, mid.json.id));
+    expect(one.r.status).toBe(200);
+    expect(one.taken).toEqual(expected);
+    expect(one.r.json.revoked).toEqual(expected);
+    // 2. the second look. Three keys are issued while their parent is being cancelled, written in the OPPOSITE of
+    //    their order by id; they are taken by id all the same.
+    const top = await issue(root.token, "agent:top", 10);
+    const late = [];
+    for (const n of [1, 2, 3]) late.push((await issue(top.json.token, `agent:late${n}`, 1, ["grant.read"])).json.id);
+    const byId = await under(top.json.id);
+    const two = await takenDuring("t18c_taken_late", () => issuedDuringCancel("t18c_late_order", top.json.id, [...byId].reverse(), 3, () => cancel(root.token, top.json.id)));
+    expect(two.r.status).toBe(200);
+    expect(two.taken).toEqual([top.json.id, ...byId]); // the parent first (they were not there yet), then by id
+    expect(two.r.json.revoked).toEqual([...byId, top.json.id]);
+  });
+});
+
+// GET /api/admin/grants/orphans: the admin's count of what the cancel used to leave behind. Two lists. Keys that are
+// still active under a grant that has ended (the door refuses them since 18c; this finds them all at once), and
+// budget still held above an ended grant for a key that let go only after it had. It reads; it changes nothing.
+// The database of this suite is shared, and earlier sections leave such keys behind, so every test looks at its
+// own tenant's part of the answer, or at the change in a count.
+describe("18d. the count of keys left under an ended grant, and of budget still held above one", () => {
+  const past = Math.floor(Date.now() / 1000) - 60;
+  const zero = { usd_cents: 0, calls: 0, deploys: 0 };
+  const calls = (n) => ({ ...zero, calls: n });
+  const count = async (query = "?limit=5000") => (await admin("GET", "/api/admin/grants/orphans" + query)).json;
+  const mine = (answer, root) => ({ orphans: answer.orphans.filter((o) => o.tenant === root.id), withheld: answer.withheld.filter((w) => w.tenant === root.id) });
+  const works = async (token) => (await req("GET", "/api/grants/verify", { token })).status;
+  const left = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining.calls;
+  const issue = (token, sub, n, caps = ["grant.issue", "grant.read"]) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget: calls(n) } });
+  const spend = (token, n) => req("POST", "/api/grants/settle", { token, body: { calls: n, ref: "work:test" } });
+  const cancel = (token, id) => req("POST", `/api/grants/${id}/revoke`, { token, body: { reason: "test" } });
+  const end = (id, status) => dbQuery("UPDATE grants SET status = $2 WHERE id = $1", [id, status]);
+  const hold = (id, n) => dbQuery("UPDATE grants SET reserved = $2::jsonb WHERE id = $1", [id, JSON.stringify(calls(n))]);
+  const gaveBack = async (id) => (await dbQuery("SELECT calls FROM ledger WHERE kind = 'release' AND grant_id = $1 ORDER BY id", [id])).rows.map((r) => r.calls);
+  // The same question answered the slow way, sharing nothing with the route: every grant read, and each active one
+  // walked UP by hand to the first grant above it that has ended.
+  const byHand = async () => {
+    const rows = (await dbQuery("SELECT id, parent, status FROM grants")).rows,
+      by = new Map(rows.map((g) => [g.id, g])),
+      out = [];
+    for (const g of rows) {
+      if (g.status !== "active") continue;
+      for (let p = by.get(g.parent); p; p = by.get(p.parent))
+        if (p.status !== "active") {
+          out.push(`${g.id} under ${p.id}`);
+          break;
+        }
+    }
+    return out.sort();
+  };
+  // The state the old cancel left, made with today's code. The key is taken out from under its parent while the
+  // cancel runs, so the cancel cannot see it (as if it were issued a moment later), and is put back after. What the
+  // cancelled grant gave back depends on the sum in use at the time. `sum: "now"` is the one in use since
+  // 2026-10-09 (unusedOf: the key's whole budget is still held on the grant, so it gives back that much less).
+  // `sum: "old"` is the one before (budget less settled, whatever is held): made here by having nothing held on
+  // the grant while it is cancelled, and putting back afterwards what was held for the missed key.
+  // ONLY for a grant whose one ACTIVE key is the missed one: another active key under it would let go into the
+  // grant during the cancel and putting the old figure back would undo it. (A key that has already ended lets
+  // nothing go.)
+  const cancelMissing = async (keyId, parentId, sum, doCancel) => {
+    const under = (await dbQuery("SELECT id FROM grants WHERE parent = $1 AND status = 'active'", [parentId])).rows.map((g) => g.id);
+    if (under.length !== 1 || under[0] !== keyId) throw new Error("cancelMissing: the missed key must be the only active key under the grant");
+    const was = (await dbQuery("SELECT reserved FROM grants WHERE id = $1", [parentId])).rows[0].reserved;
+    await dbQuery("UPDATE grants SET parent = NULL WHERE id = $1", [keyId]);
+    if (sum === "old") await hold(parentId, 0);
+    const r = await doCancel();
+    // under today's sum the cancel leaves what is held on the grant alone, so there is nothing to put back
+    if (sum === "old") await dbQuery("UPDATE grants SET reserved = $2::jsonb WHERE id = $1", [parentId, JSON.stringify(was)]);
+    await dbQuery("UPDATE grants SET parent = $2 WHERE id = $1", [keyId, parentId]);
+    return r;
+  };
+  // What a reconcile would do with one line of `withheld`, done here BY HAND (no code of the runtime does it): take
+  // `short` off what the grant above is holding, and write the 'release' row that says so.
+  const passOn = async (w) => {
+    await dbQuery(
+      `UPDATE grants SET reserved = jsonb_build_object('usd_cents', (reserved->>'usd_cents')::int - $2::int, 'calls', (reserved->>'calls')::int - $3::int, 'deploys', (reserved->>'deploys')::int - $4::int) WHERE id = $1`,
+      [w.to, w.short.usd_cents, w.short.calls, w.short.deploys],
+    );
+    await dbQuery("INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note) VALUES ($1, $2, $3, 'release', $4, $5, $6, $2, 'test: passed on by hand')", [w.tenant, w.id, w.to, w.short.usd_cents, w.short.calls, w.short.deploys]);
+  };
+
+  test("every key left under an ended grant is found, however far up the grant ended and whatever way it ended, and nothing else is", async () => {
+    const root = await newTenant("count-left", "studio");
+    const top = await issue(root.token, "agent:top", 30);
+    const mid = await issue(top.json.token, "agent:mid", 20);
+    const leaf = await issue(mid.json.token, "agent:leaf", 10);
+    const deep = await issue(leaf.json.token, "agent:deep", 2, ["grant.read"]);
+    const side = await issue(top.json.token, "agent:side", 5, ["grant.read"]); // beside `mid`, never under it
+    expect(deep.status).toBe(201);
+    expect(side.status).toBe(201);
+    const all = [top, mid, leaf, deep, side];
+    const tokenOf = new Map([[root.grantId, root.token], ...all.map((g) => [g.json.id, g.json.token])]);
+    const found = (answer) => Object.fromEntries(mine(answer, root).orphans.map((o) => [o.id, [o.ended_above, o.ended_status, o.active_above]]));
+    const before = await count();
+    expect(found(before)).toEqual({}); // control: with everything above them active, none of this tenant's is listed
+    // [the grants ended by hand, what the count must list: key -> the nearest ended grant above it, how that ended, the nearest active grant above it]
+    const cases = [
+      [[[mid, "revoked"]], { [leaf.json.id]: [mid.json.id, "revoked", top.json.id], [deep.json.id]: [mid.json.id, "revoked", leaf.json.id] }],
+      [[[mid, "expired"]], { [leaf.json.id]: [mid.json.id, "expired", top.json.id], [deep.json.id]: [mid.json.id, "expired", leaf.json.id] }],
+      [[[mid, "captured"]], { [leaf.json.id]: [mid.json.id, "captured", top.json.id], [deep.json.id]: [mid.json.id, "captured", leaf.json.id] }],
+      // further up: the keys two and three below it are found through the active keys in between
+      [[[top, "revoked"]], {
+        [mid.json.id]: [top.json.id, "revoked", root.grantId], [side.json.id]: [top.json.id, "revoked", root.grantId],
+        [leaf.json.id]: [top.json.id, "revoked", mid.json.id], [deep.json.id]: [top.json.id, "revoked", leaf.json.id],
+      }],
+      // two ended grants above one key: the NEAREST is named. An ended grant is never listed itself (`leaf`).
+      [[[top, "revoked"], [leaf, "expired"]], {
+        [mid.json.id]: [top.json.id, "revoked", root.grantId], [side.json.id]: [top.json.id, "revoked", root.grantId],
+        [deep.json.id]: [leaf.json.id, "expired", mid.json.id],
+      }],
+    ];
+    for (const [ended, expected] of cases) {
+      for (const [g, status] of ended) await end(g.json.id, status);
+      const answer = await count();
+      expect(found(answer)).toEqual(expected);
+      expect(answer.counts.live).toBe(before.counts.live + Object.keys(expected).length); // nothing else in the table changed
+      expect(answer.counts.past_exp).toBe(before.counts.past_exp);
+      // The count and the door agree, key by key: what is listed is refused, what is not listed (and has not ended
+      // itself) works.
+      for (const [id, token] of tokenOf) {
+        if (ended.some(([g]) => g.json.id === id)) continue;
+        expect([id, await works(token)]).toEqual([id, id in expected ? 401 : 200]);
+      }
+      // and the whole answer, every tenant's, is what walking each grant up by hand gives
+      expect(answer.orphans.map((o) => `${o.id} under ${o.ended_above}`).sort()).toEqual(await byHand());
+      for (const [g] of ended) await end(g.json.id, "active");
+    }
+    // the owner's own key ended: everything under it is listed, and the key just under it has no active grant above
+    await end(root.grantId, "revoked");
+    const answer = await count();
+    expect(Object.keys(found(answer)).sort()).toEqual(all.map((g) => g.json.id).sort());
+    expect(found(answer)[top.json.id]).toEqual([root.grantId, "revoked", null]);
+    expect(found(answer)[deep.json.id]).toEqual([root.grantId, "revoked", leaf.json.id]);
+    await end(root.grantId, "active");
+    expect(found(await count())).toEqual({});
+  });
+
+  test("a left key is listed with what it was given, what it used and what is held on it; one past its end is counted apart; a payment hold is marked", async () => {
+    const root = await newTenant("count-left-rows", "studio");
+    const mid = await req("POST", "/api/grants", { token: root.token, body: { sub: "agent:mid", caps: ["grant.issue", "grant.read", "escrow.hold"], ttlSec: 3600, budget: { usd_cents: 5, calls: 20, deploys: 0 } } });
+    const leaf = await issue(mid.json.token, "agent:leaf", 10);
+    const deep = await issue(leaf.json.token, "agent:deep", 3, ["grant.read"]);
+    const gone = await issue(mid.json.token, "agent:gone", 2, ["grant.read"]); // beside `leaf`, and so ABOVE `deep`
+    expect((await spend(leaf.json.token, 4)).status).toBe(200);
+    const held = await req("POST", "/api/escrow", { token: mid.json.token, body: { amount: 1, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" } } });
+    expect(held.status).toBe(201);
+    const before = await count();
+    await end(mid.json.id, "revoked");
+    await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [gone.json.id, past]);
+    const answer = await count(),
+      rows = mine(answer, root).orphans;
+    // The live ones first, the higher of them before the lower (two at one height in either order: how the
+    // database sorts ids is not this test's business). The one past its end comes LAST although it is higher up
+    // than `deep`.
+    const shown = rows.map((o) => [o.id, o.live, o.hold]);
+    expect(shown.slice(0, 2).sort()).toEqual([[leaf.json.id, true, false], [held.json.escrow.grant_id, true, true]].sort());
+    expect(shown.slice(2)).toEqual([[deep.json.id, true, false], [gone.json.id, false, false]]);
+    const row = rows.find((o) => o.id === leaf.json.id);
+    expect(row).toEqual({
+      id: leaf.json.id, tenant: root.id, parent: mid.json.id, depth: 2, sub: "agent:leaf", exp: row.exp, live: true, hold: false, holds_under: 0,
+      ended_above: mid.json.id, ended_status: "revoked", active_above: root.grantId, budget: calls(10), settled: calls(4), reserved: calls(3),
+    });
+    expect(row.exp).toBeGreaterThan(answer.now);
+    expect(answer.counts.live).toBe(before.counts.live + 3);
+    expect(answer.counts.past_exp).toBe(before.counts.past_exp + 1);
+    // the sweep takes the one past its end; it is then no longer a key left active, and the count says so
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).toContain(gone.json.id);
+    const after = await count();
+    expect(mine(after, root).orphans.map((o) => o.id).sort()).toEqual([leaf.json.id, deep.json.id, held.json.escrow.grant_id].sort());
+    expect(after.counts.past_exp).toBe(before.counts.past_exp);
+  });
+
+  test("the whole table is read, not the newest 200 grants; `limit` cuts the lists and never the counts", async () => {
+    const root = await newTenant("count-whole-table", "studio");
+    const mid = await issue(root.token, "agent:mid", 10);
+    const one = await issue(mid.json.token, "agent:one", 1, ["grant.read"]);
+    const two = await issue(mid.json.token, "agent:two", 1, ["grant.read"]);
+    expect(two.status).toBe(201);
+    await end(mid.json.id, "revoked");
+    // 205 grants written after them, so that the two keys are no longer among the newest 200
+    await dbQuery(
+      `INSERT INTO grants (id, tenant, parent, depth, sub, status, caps, scope, budget, constraints, payload, iat, exp)
+       SELECT 'gr_filler_18d_' || n, tenant, NULL, 0, 'filler', 'revoked', caps, scope, budget, constraints, payload, iat, exp FROM grants, generate_series(1, 205) n WHERE id = $1`,
+      [root.grantId],
+    );
+    try {
+      const newest = (await admin("GET", "/api/admin/grants")).json.grants.map((g) => g.id);
+      expect(newest.length).toBe(200);
+      expect(newest).not.toContain(one.json.id); // control: this is why the list of grants could not answer the question
+      const whole = await count();
+      expect(mine(whole, root).orphans.map((o) => o.id).sort()).toEqual([one.json.id, two.json.id].sort());
+      expect(whole.truncated.orphans).toBe(false);
+      expect(whole.limit).toBe(5000);
+      const cut = await count("?limit=1");
+      expect(cut.orphans.length).toBe(1);
+      expect(cut.truncated.orphans).toBe(true);
+      expect(cut.counts.live).toBe(whole.counts.live); // the count is of the whole table whatever the limit
+      expect(cut.counts.live).toBeGreaterThanOrEqual(2);
+      // a limit that is no number, or out of range, is put in range; it never fails the request
+      for (const [asked, used] of [["", 500], ["?limit=", 500], ["?limit=abc", 500], ["?limit=0", 1], ["?limit=-5", 1], ["?limit=2.9", 2], ["?limit=99999", 5000]]) {
+        const r = await admin("GET", "/api/admin/grants/orphans" + asked);
+        expect([asked, r.status, r.json.limit]).toEqual([asked, 200, used]);
+      }
+    } finally {
+      await dbQuery("DELETE FROM grants WHERE id LIKE 'gr_filler_18d_%'");
+    }
+  });
+
+  test("what a missed key gives back after the grant above it has let go is shown as still held, to the unit, and the sum shown is the one that puts it right", async () => {
+    const root = await newTenant("count-withheld", "studio");
+    const top = await issue(root.token, "agent:top", 20);
+    const mid = await issue(top.json.token, "agent:mid", 10);
+    const late = await issue(mid.json.token, "agent:late", 6, ["grant.read"]);
+    expect(late.status).toBe(201);
+    expect((await spend(late.json.token, 2)).status).toBe(200);
+    expect(await left(top.json.token)).toBe(10); // 20 less the 10 held for `mid`
+    // `mid` is cancelled and the cancel misses `late`, whose whole 6 is still held on `mid`
+    expect((await cancelMissing(late.json.id, mid.json.id, "now", () => cancel(root.token, mid.json.id))).json.revoked).toEqual([mid.json.id]);
+    expect(await gaveBack(mid.json.id)).toEqual([4]); // 10 less the 6 held on it: as if `late` had used all 6
+    expect(await left(top.json.token)).toBe(14); // 20 less those 6. Right would be 18: only 2 were used.
+    let answer = mine(await count(), root);
+    expect(answer.orphans.map((o) => [o.id, o.ended_above, o.active_above, o.budget, o.settled, o.reserved])).toEqual([[late.json.id, mid.json.id, top.json.id, calls(6), calls(2), zero]]);
+    expect(answer.withheld).toEqual([]); // nothing has let go late yet: `mid` gave back exactly what its row says
+    // the key ends (it runs out and the sweep takes it); what it gives back lands on `mid`, which has already let go
+    await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [late.json.id, past]);
+    expect((await admin("POST", "/api/admin/grants/reap")).json.reaped).toContain(late.json.id);
+    expect(await gaveBack(late.json.id)).toEqual([4]); // 6 less the 2 it used
+    expect(await left(top.json.token)).toBe(14); // and nothing passed it on: this is the budget nothing gives back
+    answer = mine(await count(), root);
+    expect(answer.orphans).toEqual([]); // no key is left active, so the first list no longer shows anything
+    expect(answer.withheld).toEqual([
+      // would_give_back_now is unusedOf on the row as it is now: 10 given, 0 settled, 2 still held (what `late` used)
+      // never_used is its budget less all that was really used at or under it: 10 less the 2 `late` settled
+      { id: mid.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "active", gave_back: calls(4), releases: 1, would_give_back_now: calls(8), never_used: calls(8), short: calls(4) },
+    ]);
+    // THE SUM PUTS IT RIGHT. `short` off what `to` holds: the grant above then has exactly what nobody used, and
+    // the count has nothing more to show for it (so doing it twice is not possible by this list).
+    await passOn(answer.withheld[0]);
+    expect(await left(top.json.token)).toBe(18);
+    expect(mine(await count(), root).withheld).toEqual([]);
+    // the same key cancelled through the ordinary route instead of running out: the same line
+    const mid2 = await issue(top.json.token, "agent:mid2", 10);
+    const late2 = await issue(mid2.json.token, "agent:late2", 6, ["grant.read"]);
+    expect((await spend(late2.json.token, 1)).status).toBe(200);
+    await cancelMissing(late2.json.id, mid2.json.id, "now", () => cancel(root.token, mid2.json.id));
+    expect((await cancel(root.token, late2.json.id)).json.revoked).toEqual([late2.json.id]);
+    expect(mine(await count(), root).withheld).toEqual([
+      { id: mid2.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "active", gave_back: calls(4), releases: 1, would_give_back_now: calls(9), never_used: calls(9), short: calls(5) },
+    ]);
+  });
+
+  test("held two grants up: the lowest ended grant is shown first, and the one above it once that one is put right", async () => {
+    const root = await newTenant("count-withheld-chain", "studio");
+    const before = await left(root.token);
+    const top = await issue(root.token, "agent:top", 20);
+    const mid = await issue(top.json.token, "agent:mid", 10);
+    const late = await issue(mid.json.token, "agent:late", 6, ["grant.read"]);
+    expect((await spend(late.json.token, 2)).status).toBe(200);
+    // `top` is cancelled; `mid` goes with it, and the cancel misses `late` under `mid`
+    expect((await cancelMissing(late.json.id, mid.json.id, "now", () => cancel(root.token, top.json.id))).json.revoked).toEqual([mid.json.id, top.json.id]);
+    expect(await gaveBack(mid.json.id)).toEqual([4]);
+    expect(await gaveBack(top.json.id)).toEqual([14]); // 20 less the 6 still held on it for `mid`
+    expect(await left(root.token)).toBe(before - 6);
+    expect((await cancel(root.token, late.json.id)).json.revoked).toEqual([late.json.id]);
+    expect(await left(root.token)).toBe(before - 6); // still: what `late` gave back stopped at `mid`
+    let answer = mine(await count(), root);
+    // only `mid`: nothing has been let go into `top` since `top` itself let go
+    expect(answer.withheld).toEqual([{ id: mid.json.id, tenant: root.id, status: "revoked", to: top.json.id, to_status: "revoked", gave_back: calls(4), releases: 1, would_give_back_now: calls(8), never_used: calls(8), short: calls(4) }]);
+    // `top` is not read at all yet, whatever its row says: with 2 fewer held on it (written by hand, as nothing in
+    // the runtime does) its row would give back 16 where it gave 14, and 18 were never used under it. But nothing
+    // has let go into it since it let go itself, so there is nothing to explain those 2 and they are not offered.
+    await hold(top.json.id, 4);
+    expect(mine(await count(), root).withheld.map((w) => w.id)).toEqual([mid.json.id]);
+    await hold(top.json.id, 6);
+    await passOn(answer.withheld[0]);
+    answer = mine(await count(), root);
+    // now `top` is the one that gave back less than its row says, and what it owes goes to a grant that is active
+    expect(answer.withheld).toEqual([{ id: top.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", gave_back: calls(14), releases: 1, would_give_back_now: calls(18), never_used: calls(18), short: calls(4) }]);
+    await passOn(answer.withheld[0]);
+    expect(mine(await count(), root).withheld).toEqual([]);
+    expect(await left(root.token)).toBe(before - 2); // the owner is left holding exactly what was used
+  });
+
+  test("the sum is done on every grant before the list is cut: the lowest grant comes first, and the limit hides no count and no part of the total", async () => {
+    const root = await newTenant("count-withheld-limit", "studio");
+    const top = await issue(root.token, "agent:top", 40);
+    // three grants, each with one key the cancel missed: `a` one below the owner, `b` two below, and `c` three
+    // below, which ended under the OLD sum and so owes nothing although it is the lowest of the three
+    const a = await issue(root.token, "agent:a", 10);
+    const lateA = await issue(a.json.token, "agent:late-a", 6, ["grant.read"]);
+    const b = await issue(top.json.token, "agent:b", 8);
+    const lateB = await issue(b.json.token, "agent:late-b", 3, ["grant.read"]);
+    const c0 = await issue(top.json.token, "agent:c0", 12);
+    const c = await issue(c0.json.token, "agent:c", 3);
+    const lateC = await issue(c.json.token, "agent:late-c", 2, ["grant.read"]);
+    expect(lateA.status).toBe(201);
+    expect(lateB.status).toBe(201);
+    expect(lateC.status).toBe(201);
+    await cancelMissing(lateA.json.id, a.json.id, "now", () => cancel(root.token, a.json.id));
+    await cancelMissing(lateB.json.id, b.json.id, "now", () => cancel(root.token, b.json.id));
+    await cancelMissing(lateC.json.id, c.json.id, "old", () => cancel(root.token, c.json.id));
+    for (const k of [lateA, lateB, lateC]) expect((await cancel(root.token, k.json.id)).json.revoked).toEqual([k.json.id]);
+    const whole = await count();
+    expect(whole.truncated.withheld).toBe(false);
+    expect(whole.counts.withheld).toBe(whole.withheld.length);
+    expect(mine(whole, root).withheld.map((w) => [w.id, w.short])).toEqual([[b.json.id, calls(3)], [a.json.id, calls(6)]]); // the lower one first; `c` owes nothing
+    const sum = (list) => list.reduce((n, w) => n + w.short.calls, 0);
+    expect(whole.withheld_total.calls).toBe(sum(whole.withheld));
+    expect(whole.counts.withheld).toBeGreaterThanOrEqual(2);
+    // cut to one line: the line shown is the first of the whole list, and it is a grant that owes (never an empty
+    // list because a lower grant that owes nothing took the one place)
+    const cut = await count("?limit=1");
+    expect(cut.withheld).toEqual([whole.withheld[0]]);
+    expect(cut.truncated.withheld).toBe(true);
+    expect(cut.counts.withheld).toBe(whole.counts.withheld);
+    expect(cut.withheld_total).toEqual(whole.withheld_total);
+    expect(sum(cut.withheld)).toBeLessThan(cut.withheld_total.calls); // the total is of all of them, not of the line shown
+  });
+
+  test("in usd_cents and deploys too: what a hold paid out stays held above, what a refunded hold and unused deploys give back late is shown, each to the unit", async () => {
+    const meshReceipt = (obj) => { const m = JSON.stringify(obj); return req("POST", "/webhooks/mesh", { raw: m, headers: { "x-mesh-signature": hmacHex(MESH_SECRET, m) } }); };
+    const setting = (k, v) => dbQuery("INSERT INTO settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()", [k, v]);
+    const remaining = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
+    const root = await newTenant("count-withheld-money", "studio");
+    const before = await remaining(root.token);
+    const give = (token, sub, budget, caps) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget } });
+    const mid = await give(root.token, "agent:mid", { usd_cents: 1000, calls: 10, deploys: 5 }, ["grant.issue", "grant.read", "escrow.hold"]);
+    const late = await give(mid.json.token, "agent:late", { usd_cents: 700, calls: 4, deploys: 3 }, ["grant.issue", "grant.read", "escrow.hold"]);
+    expect(late.status).toBe(201);
+    const open = (amount) => req("POST", "/api/escrow", { token: late.json.token, body: { amount, payee_tenant: "t_payee", condition: { kind: "receipt:mesh" } } });
+    const paid = await open(200);
+    const open2 = await open(150);
+    expect(paid.status).toBe(201);
+    expect(open2.status).toBe(201);
+    await setting("escrow_capture", "on");
+    try {
+      expect((await meshReceipt({ receipt_id: "rc-18d-1", escrow_id: paid.json.escrow.id })).json.escrow.captured).toBe(true);
+    } finally {
+      await setting("escrow_capture", "off");
+    }
+    // `mid` is cancelled and the cancel misses `late`, whose whole budget is still held on `mid`
+    await cancelMissing(late.json.id, mid.json.id, "now", () => cancel(root.token, mid.json.id));
+    expect(await remaining(root.token)).toEqual({ usd_cents: before.usd_cents - 700, calls: before.calls - 4, deploys: before.deploys - 3 });
+    let answer = mine(await count(), root);
+    // the key that was left, and the hold still open under it: a cancel of the key would refund that hold
+    expect(answer.orphans.map((o) => [o.id, o.hold, o.holds_under]).sort()).toEqual([[late.json.id, false, 1], [open2.json.escrow.grant_id, true, 0]].sort());
+    expect(answer.withheld).toEqual([]);
+    // the key is cancelled through the ordinary route; the open hold goes with it (refunded), the paid one stays paid
+    expect((await cancel(root.token, late.json.id)).json.revoked).toEqual([open2.json.escrow.grant_id, late.json.id]);
+    answer = mine(await count(), root);
+    expect(answer.orphans).toEqual([]);
+    expect(answer.withheld).toEqual([{
+      id: mid.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", releases: 1,
+      gave_back: { usd_cents: 300, calls: 6, deploys: 2 }, // 1000 - 700, 10 - 4, 5 - 3
+      would_give_back_now: { usd_cents: 800, calls: 10, deploys: 5 }, // 200 are still held on it: what the paid hold took
+      never_used: { usd_cents: 800, calls: 10, deploys: 5 },
+      short: { usd_cents: 500, calls: 4, deploys: 3 },
+    }]);
+    const whole = await count();
+    for (const k of ["usd_cents", "calls", "deploys"]) expect([k, whole.withheld_total[k]]).toEqual([k, whole.withheld.reduce((n, w) => n + w.short[k], 0)]);
+    expect(whole.withheld_total.usd_cents).toBeGreaterThanOrEqual(500);
+    expect(whole.withheld_total.deploys).toBeGreaterThanOrEqual(3);
+    await passOn(answer.withheld[0]);
+    expect(await remaining(root.token)).toEqual({ usd_cents: before.usd_cents - 200, calls: before.calls, deploys: before.deploys }); // all but what was paid
+    expect(mine(await count(), root).withheld).toEqual([]);
+  });
+
+  test("a hold that is still open is counted under every key above it, also through a grant that has ended; one that is no longer open is not", async () => {
+    // A cancel of a key cancels, and so refunds, every open hold under it, whatever lies in between. The list
+    // shows only grants that are active, so a hold reached through an ended grant could not be found by going
+    // from row to row: each row says for itself how many open holds are under it.
+    const root = await newTenant("count-holds-under", "studio");
+    const give = (token, sub, usd, caps = ["grant.issue", "grant.read", "escrow.hold"]) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget: { usd_cents: usd, calls: usd, deploys: 0 } } });
+    const x = await give(root.token, "agent:x", 100);
+    const k = await give(x.json.token, "agent:k", 50);
+    const plain = await give(x.json.token, "agent:plain", 10, ["grant.read"]); // beside `k`: nothing under it
+    const m = await give(k.json.token, "agent:m", 20);
+    const side = await give(k.json.token, "agent:side", 5, ["grant.read"]); // under `k` too, active, and no hold
+    expect(side.status).toBe(201);
+    expect(plain.status).toBe(201);
+    expect(m.status).toBe(201);
+    const open = await req("POST", "/api/escrow", { token: m.json.token, body: { amount: 5, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" } } });
+    expect(open.status).toBe(201);
+    const holdId = open.json.escrow.grant_id;
+    await end(x.json.id, "revoked");
+    await end(m.json.id, "expired"); // between the key and the hold, and not in the list
+    const rows = async () => Object.fromEntries(mine(await count(), root).orphans.map((o) => [o.id, [o.hold, o.holds_under]]));
+    expect(await rows()).toEqual({ [k.json.id]: [false, 1], [plain.json.id]: [false, 0], [side.json.id]: [false, 0], [holdId]: [true, 0] });
+    // a hold that is no longer open is not counted
+    await end(holdId, "captured");
+    expect(await rows()).toEqual({ [k.json.id]: [false, 0], [plain.json.id]: [false, 0], [side.json.id]: [false, 0] });
+    await end(holdId, "active");
+    expect((await rows())[k.json.id]).toEqual([false, 1]);
+  });
+
+  test("never more than was really unused: a key that let go under the old sum gave back what was USED under it too, and the row above then says more than is true", async () => {
+    // owner -> x (50) -> c (20) -> j (8) and k (6) -> k2 (2). j used 5 and has ended; k used 1 and is active, with
+    // a key of its own under it.
+    const root = await newTenant("count-withheld-old-under-new", "studio");
+    const before = await left(root.token);
+    const x = await issue(root.token, "agent:x", 50);
+    const c = await issue(x.json.token, "agent:c", 20);
+    const j = await issue(c.json.token, "agent:j", 8, ["grant.read"]);
+    const k = await issue(c.json.token, "agent:k", 6);
+    const k2 = await issue(k.json.token, "agent:k2", 2, ["grant.read"]);
+    expect(k2.status).toBe(201);
+    expect((await spend(j.json.token, 5)).status).toBe(200);
+    expect((await spend(k.json.token, 1)).status).toBe(200);
+    expect((await cancel(root.token, j.json.id)).json.revoked).toEqual([j.json.id]); // held on c: j's 5 used, and k's 6
+    // x is cancelled under today's sum and the cancel misses c: c's whole 20 stay held on x
+    await cancelMissing(c.json.id, x.json.id, "now", () => cancel(root.token, x.json.id));
+    expect(await gaveBack(x.json.id)).toEqual([30]);
+    expect(await left(root.token)).toBe(before - 20);
+    // then c lets go under the OLD sum (as the older service did), missing k: it gives back all 20, the 5 that j
+    // used and the 6 still out with k included. Nothing is held on x any more.
+    await cancelMissing(k.json.id, c.json.id, "old", () => cancel(root.token, c.json.id));
+    expect(await gaveBack(c.json.id)).toEqual([20]);
+    let answer = mine(await count(), root);
+    expect(answer.orphans.map((o) => o.id).sort()).toEqual([k.json.id, k2.json.id].sort());
+    expect(answer.withheld).toEqual([
+      // By its row x would give back all 50. Really used under it: 5 (j); and k's whole 6 are still out (the 2 with
+      // k2 are part of those 6, not 2 more). So 39 at most.
+      { id: x.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", gave_back: calls(30), releases: 1, would_give_back_now: calls(50), never_used: calls(39), short: calls(9) },
+    ]);
+    await passOn(answer.withheld[0]);
+    expect(await left(root.token)).toBe(before - 11);
+    expect(mine(await count(), root).withheld).toEqual([]);
+    // k is cancelled, and k2 with it; k used 1, so 5 more were never used. c gave everything back long ago and
+    // owes nothing; the 5 show on x, and after them the owner holds exactly the 6 that were used (5 by j, 1 by k).
+    expect((await cancel(root.token, k.json.id)).json.revoked).toEqual([k2.json.id, k.json.id]);
+    answer = mine(await count(), root);
+    expect(answer.withheld).toEqual([
+      { id: x.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", gave_back: calls(39), releases: 2, would_give_back_now: calls(50), never_used: calls(44), short: calls(5) },
+    ]);
+    await passOn(answer.withheld[0]);
+    expect(await left(root.token)).toBe(before - 6);
+    expect(mine(await count(), root).withheld).toEqual([]);
+  });
+
+  test("the same bound in usd_cents and deploys, with what the grant used itself and a key still active below", async () => {
+    // owner -> x -> c -> j (ended) and k (active). c lets go under the old sum after x let go under today's.
+    // Self-settle meters calls only, so what was used in usd_cents and deploys is written on the rows by hand,
+    // as a paid hold or a charged deploy would have left it.
+    const remaining = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
+    const give = (token, sub, budget, caps = ["grant.issue", "grant.read"]) => req("POST", "/api/grants", { token, body: { sub, caps, ttlSec: 3600, budget } });
+    const used = (id, u) => dbQuery("UPDATE grants SET settled = $2::jsonb WHERE id = $1", [id, JSON.stringify(u)]);
+    const root = await newTenant("count-withheld-bound-money", "studio");
+    const before = await remaining(root.token);
+    const x = await give(root.token, "agent:x", { usd_cents: 1000, calls: 50, deploys: 10 });
+    const c = await give(x.json.token, "agent:c", { usd_cents: 600, calls: 20, deploys: 6 });
+    const j = await give(c.json.token, "agent:j", { usd_cents: 200, calls: 8, deploys: 3 }, ["grant.read"]);
+    const k = await give(c.json.token, "agent:k", { usd_cents: 150, calls: 6, deploys: 1 }, ["grant.read"]);
+    expect(k.status).toBe(201);
+    await used(x.json.id, { usd_cents: 50, calls: 3, deploys: 1 });
+    await used(j.json.id, { usd_cents: 100, calls: 5, deploys: 2 });
+    expect((await cancel(root.token, j.json.id)).json.revoked).toEqual([j.json.id]);
+    // x under today's sum, missing c: it gives back 1000 - 50 - 600, 50 - 3 - 20, 10 - 1 - 6
+    await cancelMissing(c.json.id, x.json.id, "now", () => cancel(root.token, x.json.id));
+    // c under the old sum, missing k: it gives back all it was given (it settled nothing itself)
+    await cancelMissing(k.json.id, c.json.id, "old", () => cancel(root.token, c.json.id));
+    const answer = mine(await count(), root);
+    expect(answer.withheld).toEqual([{
+      id: x.json.id, tenant: root.id, status: "revoked", to: root.grantId, to_status: "active", releases: 1,
+      gave_back: { usd_cents: 350, calls: 27, deploys: 3 },
+      would_give_back_now: { usd_cents: 950, calls: 47, deploys: 9 }, // its row: nothing is held on it any more
+      // really used at or under it: 50/3/1 by x itself, 100/5/2 by j, and k's whole 150/6/1 are still out
+      never_used: { usd_cents: 700, calls: 36, deploys: 6 },
+      short: { usd_cents: 350, calls: 9, deploys: 3 },
+    }]);
+    await passOn(answer.withheld[0]);
+    // the owner is left holding exactly what was used and what is still out: 300 / 14 / 4
+    expect(await remaining(root.token)).toEqual({ usd_cents: before.usd_cents - 300, calls: before.calls - 14, deploys: before.deploys - 4 });
+    expect(mine(await count(), root).withheld).toEqual([]);
+  });
+
+  test("a grant that ended under the sum used before 2026-10-09 is never shown as holding anything back", async () => {
+    // That sum gave back budget less settled, whatever was held on the grant: the missed key's whole budget went
+    // back up with it, although the key could go on spending. So nothing is held above for such a key, and the
+    // count must not say there is: a reconcile that believed it would give the same budget back a second time.
+    const root = await newTenant("count-withheld-old-sum", "studio");
+    const top = await issue(root.token, "agent:top", 20);
+    const mid = await issue(top.json.token, "agent:mid", 10);
+    const late = await issue(mid.json.token, "agent:late", 6, ["grant.read"]);
+    expect((await spend(late.json.token, 2)).status).toBe(200);
+    await cancelMissing(late.json.id, mid.json.id, "old", () => cancel(root.token, mid.json.id));
+    expect(await gaveBack(mid.json.id)).toEqual([10]); // everything, the 6 of the missed key included
+    expect(await left(top.json.token)).toBe(20);
+    expect(mine(await count(), root).orphans.map((o) => o.id)).toEqual([late.json.id]); // the key is still a key left active
+    expect((await cancel(root.token, late.json.id)).json.revoked).toEqual([late.json.id]);
+    expect(await gaveBack(late.json.id)).toEqual([4]);
+    const answer = mine(await count(), root);
+    expect(answer.orphans).toEqual([]);
+    expect(answer.withheld).toEqual([]); // unusedOf on mid's row now is 8; it gave back 10: nothing is owed
+    expect(await left(top.json.token)).toBe(20);
+  });
+
+  test("only a late release is ever shown: a grant with nothing let go into it after it had, or one that is active again, is not listed whatever its row says", async () => {
+    const root = await newTenant("count-withheld-only-late", "studio");
+    const top = await issue(root.token, "agent:top", 30);
+    const mid = await issue(top.json.token, "agent:mid", 10);
+    const kid = await issue(mid.json.token, "agent:kid", 6, ["grant.read"]);
+    expect((await spend(kid.json.token, 2)).status).toBe(200);
+    // an ordinary cancel: the key under it lets go first, then the grant
+    expect((await cancel(root.token, mid.json.id)).json.revoked).toEqual([kid.json.id, mid.json.id]);
+    expect(await gaveBack(mid.json.id)).toEqual([8]);
+    expect(mine(await count(), root).withheld).toEqual([]);
+    // its row changed by hand, as nothing in the runtime does: by unusedOf it would now give back 10, and it gave
+    // back 8. Nothing let go into it after it had, so nothing explains the 2 and the list does not offer them.
+    await hold(mid.json.id, 0);
+    expect(mine(await count(), root).withheld).toEqual([]);
+    // a real late release, for comparison, is listed; the same grant written back to active is not (an active
+    // grant has not let go for good), and is again once it is ended
+    const mid2 = await issue(top.json.token, "agent:mid2", 10);
+    const late = await issue(mid2.json.token, "agent:late", 6, ["grant.read"]);
+    await cancelMissing(late.json.id, mid2.json.id, "now", () => cancel(root.token, mid2.json.id));
+    expect((await cancel(root.token, late.json.id)).json.revoked).toEqual([late.json.id]);
+    const listed = async () => mine(await count(), root).withheld.map((w) => [w.id, w.short]);
+    expect(await listed()).toEqual([[mid2.json.id, calls(6)]]);
+    // and the lesser of the two figures is taken whichever of them is the smaller: with 3 held on it (written by
+    // hand; nothing was used under it) its row would give back 7, less the 4 it gave: 3, although 6 were never used
+    await hold(mid2.json.id, 3);
+    expect(await listed()).toEqual([[mid2.json.id, calls(3)]]);
+    await hold(mid2.json.id, 0);
+    await end(mid2.json.id, "active");
+    expect(await listed()).toEqual([]);
+    await end(mid2.json.id, "expired");
+    expect(await listed()).toEqual([[mid2.json.id, calls(6)]]);
+  });
+
+  test("only the admin may ask, and asking changes nothing", async () => {
+    const root = await newTenant("count-read-only", "studio");
+    const mid = await issue(root.token, "agent:mid", 10);
+    const late = await issue(mid.json.token, "agent:late", 6, ["grant.read"]);
+    await cancelMissing(late.json.id, mid.json.id, "now", () => cancel(root.token, mid.json.id));
+    for (const opts of [{}, { token: root.token }, { token: "not-the-admin-key" }, { headers: { "x-admin-key": ADMIN_KEY } }]) {
+      const r = await req("GET", "/api/admin/grants/orphans", opts);
+      expect(r.status).toBe(401);
+      expect(r.json.error).toBe("admin_required");
+      expect(r.text).not.toContain(late.json.id);
+    }
+    const state = async () =>
+      JSON.stringify([
+        (await dbQuery("SELECT md5(coalesce(string_agg(g::text, '|' ORDER BY g.id), '')) AS h, count(*)::int AS n FROM grants g")).rows[0],
+        (await dbQuery("SELECT md5(coalesce(string_agg(l::text, '|' ORDER BY l.id), '')) AS h, count(*)::int AS n FROM ledger l")).rows[0],
+        (await dbQuery("SELECT count(*)::int AS n FROM events")).rows[0],
+        (await dbQuery("SELECT count(*)::int AS n FROM outbox")).rows[0],
+      ]);
+    const was = await state();
+    const first = await count();
+    expect(mine(first, root).orphans.map((o) => o.id)).toEqual([late.json.id]); // it did answer
+    for (const q of ["", "?limit=1", "?limit=5000"]) expect((await admin("GET", "/api/admin/grants/orphans" + q)).status).toBe(200);
+    expect(await state()).toBe(was);
+    // and the key it listed is as it was: still active, still refused at the door
+    expect((await dbQuery("SELECT status FROM grants WHERE id = $1", [late.json.id])).rows[0].status).toBe("active");
+    expect(await works(late.json.token)).toBe(401);
+  });
+});
+
 describe("19. escrow keystone (stage 1: open + read)", () => {
   const remainingOf = async (token) => (await req("GET", "/api/grants/verify", { token })).json.remaining;
   const openBody = (over = {}) => ({ amount: 500, payee_tenant: "t_payee", payee_ref: "agent:q", condition: { kind: "attestation:self-settle" }, ...over });
@@ -1850,6 +4968,62 @@ describe("19. escrow keystone (stage 1: open + read)", () => {
     expect(child.status).toBe(201);
     const r = await req("POST", "/api/escrow", { token: child.json.token, body: openBody({ amount: 100 }) });
     expect(r.status).toBe(403);
+  });
+
+  // POST /api/escrow hands the custodian's token back to the payer. The custodian's one capability
+  // is escrow.hold (a marker), which is also the capability this route asks for, so that token used
+  // to open a SECOND hold out of the held value. Captured, the two paid out twice what was paid in.
+  test("CONTROL: a hold cannot pay for another hold — the custodian's own token opens nothing", async () => {
+    const root = await newTenant("escrow-nest", "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const outer = await req("POST", "/api/escrow", { token: root.token, body: openBody({ amount: 100 }) });
+    expect(outer.status).toBe(201);
+    expect((await req("GET", "/api/grants/verify", { token: outer.json.token })).json.caps).toEqual(["escrow.hold"]);
+    // Refused whatever the request says, good or bad: who is asking is checked first.
+    for (const over of [{}, { amount: 1 }, { condition: { kind: "receipt:mesh" } }, { payee_tenant: "t_other" }, { amount: 0 }, { deadline: "soon" }]) {
+      const inner = await req("POST", "/api/escrow", { token: outer.json.token, body: openBody({ amount: 100, ...over }) });
+      expect([JSON.stringify(over), inner.status, inner.json.error]).toEqual([JSON.stringify(over), 403, "escrow_custodian_cannot_pay"]);
+    }
+    // Nothing was pledged out of the hold, and the payer is out exactly the one hold.
+    expect((await remainingOf(outer.json.token)).usd_cents).toBe(100);
+    expect((await remainingOf(root.token)).usd_cents).toBe(before - 100);
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [outer.json.escrow.grant_id])).rows[0].n).toBe(0);
+    // The payer's own key still opens holds as before.
+    expect((await req("POST", "/api/escrow", { token: root.token, body: openBody({ amount: 100 }) })).status).toBe(201);
+  });
+
+  test("CONTROL: a hold opened on the owner's approval cannot pay for another hold either, and nothing is filed", async () => {
+    const root = await newTenant("escrow-nest-ask", "pro");
+    const asker = await req("POST", "/api/grants", {
+      token: root.token,
+      body: { sub: "agent:asker", caps: ["escrow.hold", "grant.read"], ttlSec: 3600, budget: { usd_cents: 500, calls: 5, deploys: 0 }, constraints: { autonomy: "ask" } },
+    });
+    expect(asker.status).toBe(201);
+    const filed = await req("POST", "/api/escrow", { token: asker.json.token, body: openBody({ amount: 100 }) });
+    expect(filed.status).toBe(202);
+    const ok = await req("POST", `/api/approvals/${filed.json.approval.id}`, { token: root.token, body: { decision: "approve" } });
+    expect(ok.json.status).toBe("executed");
+    // The hold's token inherits the "ask" dial. It must be refused BEFORE anything is filed for the owner.
+    const inner = await req("POST", "/api/escrow", { token: ok.json.result.token, body: openBody({ amount: 100 }) });
+    expect([inner.status, inner.json.error]).toEqual([403, "escrow_custodian_cannot_pay"]);
+    expect((await req("GET", "/api/approvals", { token: root.token })).json.approvals.length).toBe(1); // only the one that ran
+    expect((await remainingOf(asker.json.token)).usd_cents).toBe(400);
+  });
+
+  // A request a hold's own token filed BEFORE this rule existed, approved after it: the approval
+  // runs the same check (it is in buildEscrow, not only on the route), fails, and opens nothing.
+  test("CONTROL: an approval that a hold's token filed earlier opens nothing when the owner approves it", async () => {
+    const root = await newTenant("escrow-nest-old-ask", "pro");
+    const outer = await req("POST", "/api/escrow", { token: root.token, body: openBody({ amount: 100 }) });
+    expect(outer.status).toBe(201);
+    await dbQuery("INSERT INTO approvals (id, tenant, grant_id, action, intent, autonomy, requested_by) VALUES ($1, $2, $3, 'escrow.open', $4::jsonb, 1, 'escrow:agent:q')",
+      ["ap_old_hold_ask", root.id, outer.json.escrow.grant_id, JSON.stringify(openBody({ amount: 100 }))]);
+    const ok = await req("POST", "/api/approvals/ap_old_hold_ask", { token: root.token, body: { decision: "approve" } });
+    expect([ok.status, ok.json.error]).toEqual([403, "escrow_custodian_cannot_pay"]);
+    const row = (await req("GET", "/api/approvals", { token: root.token })).json.approvals.find((a) => a.id === "ap_old_hold_ask");
+    expect(row.status).toBe("failed");
+    expect((await dbQuery("SELECT count(*)::int AS n FROM grants WHERE parent = $1", [outer.json.escrow.grant_id])).rows[0].n).toBe(0);
+    expect((await remainingOf(outer.json.token)).usd_cents).toBe(100);
   });
 
   test("CONTROL: a plain grant is not an escrow; an unknown id is not found", async () => {
@@ -2056,6 +5230,225 @@ describe("21. escrow capture (stage 2: receipt:mesh -> payee credit)", () => {
     expect(await creditRows("t_payeeRT", esId)).toEqual({ n: 1, cents: 500 });
   });
 
+  // A hold under a hold cannot be opened any more (section 19), so these tests build the rows an
+  // older one would have left: two holds opened side by side, then the second moved under the
+  // first. What capture, refund and the sweep read is then as the first hold's own token would
+  // have left it: parent, depth, and the second hold's reservation held on the first, not on
+  // the payer. (Fields none of them reads are left as they were: issued_by, the stored token,
+  // the note of the payer inside the hold's own mark, the reserve row in the ledger.)
+  const nested = async (name, outerAmount, innerAmount) => {
+    const root = await newTenant(name, "pro");
+    const before = (await remainingOf(root.token)).usd_cents;
+    const outer = await openEscrow(root.token, { amount: outerAmount, payee_tenant: "t_outer_" + name });
+    const inner = await openEscrow(root.token, { amount: innerAmount, payee_tenant: "t_inner_" + name });
+    expect([outer.status, inner.status]).toEqual([201, 201]);
+    const held = async (id) => { const v = (await dbQuery("SELECT reserved FROM grants WHERE id = $1", [id])).rows[0].reserved; return typeof v === "string" ? JSON.parse(v) : v || {}; };
+    const setHeld = (id, r) => dbQuery("UPDATE grants SET reserved = $2::jsonb WHERE id = $1", [id, JSON.stringify({ usd_cents: r.usd_cents || 0, calls: r.calls || 0, deploys: r.deploys || 0 })]);
+    const p = await held(root.grantId), o = await held(outer.json.escrow.grant_id);
+    await setHeld(root.grantId, { ...p, usd_cents: p.usd_cents - innerAmount });
+    await setHeld(outer.json.escrow.grant_id, { ...o, usd_cents: (o.usd_cents || 0) + innerAmount });
+    await dbQuery("UPDATE grants SET parent = $2, depth = depth + 1 WHERE id = $1", [inner.json.escrow.grant_id, outer.json.escrow.grant_id]);
+    // It reads as nested: the payer is out the outer amount only, and the outer hold has pledged the inner amount on.
+    expect((await remainingOf(root.token)).usd_cents).toBe(before - outerAmount);
+    expect((await remainingOf(outer.json.token)).usd_cents).toBe(outerAmount - innerAmount);
+    const credited = async (payee) => (await dbQuery("SELECT coalesce(sum(usd_cents),0)::int AS cents FROM ledger WHERE tenant=$1 AND kind='mesh-credit'", [payee])).rows[0].cents;
+    return {
+      root, before, outer: outer.json.escrow, inner: inner.json.escrow,
+      paid: async () => before - (await remainingOf(root.token)).usd_cents,
+      // how the payer's own row books it: what it settled itself, and what is still held on it
+      books: async () => {
+        const row = (await dbQuery("SELECT reserved, settled FROM grants WHERE id = $1", [root.grantId])).rows[0];
+        const cents = (v) => (typeof v === "string" ? JSON.parse(v) : v || {}).usd_cents || 0;
+        return { settled: cents(row.settled), held: cents(row.reserved) };
+      },
+      credits: async () => ({ outer: await credited("t_outer_" + name), inner: await credited("t_inner_" + name) }),
+      stateOf: async (e) => (await req("GET", "/api/escrow/" + e.grant_id, { token: root.token })).json.escrow.state,
+    };
+  };
+  let rc = 0;
+  const receiptFor = (escrow) => meshReceipt({ receipt_id: "rc-nest-" + ++rc, escrow_id: escrow.id });
+
+  // This is the bug as it was found: outer hold 100, inner hold 100 opened with the outer hold's
+  // token, both captured. Payees were credited 200 for a payer who paid 100.
+  test("CONTROL: two captures never credit more than the payer paid — a hold fully pledged to a hold below pays nothing itself", async () => {
+    const n = await nested("nest-full", 100, 100);
+    const first = await receiptFor(n.outer); // the outer hold's delivery arrives first
+    expect(first.json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" });
+    expect(await n.stateOf(n.outer)).toBe("open"); // it waits; it did not end as a capture of nothing
+    expect((await receiptFor(n.inner)).json.escrow).toMatchObject({ captured: true, amount: 100 });
+    const again = await receiptFor(n.outer); // and now its value has been paid out below
+    expect(again.json.escrow).toMatchObject({ captured: false, reason: "nothing_left_to_capture" });
+    expect(await n.stateOf(n.outer)).toBe("open"); // still open: it did not end as a capture of nothing
+    expect(await n.credits()).toEqual({ outer: 0, inner: 100 });
+    expect(await n.paid()).toBe(100);
+  });
+
+  test("CONTROL: a hold partly pledged below pays only the rest, in either order of delivery", async () => {
+    // inner delivered first, then outer
+    const a = await nested("nest-part-a", 100, 40);
+    expect((await receiptFor(a.inner)).json.escrow).toMatchObject({ captured: true, amount: 40 });
+    expect((await receiptFor(a.outer)).json.escrow).toMatchObject({ captured: true, amount: 60 });
+    expect(await a.credits()).toEqual({ outer: 60, inner: 40 });
+    expect(await a.paid()).toBe(100);
+    // The payer's own row settles only the 60 its hold captured. The 40 paid out under that hold
+    // stays held on the payer, which is how spend below a grant is counted everywhere else.
+    expect(await a.books()).toEqual({ settled: 60, held: 40 });
+    // and the payer's spend row in the ledger says 60, what was captured, not the hold's whole 100
+    expect((await dbQuery("SELECT usd_cents FROM ledger WHERE grant_id = $1 AND kind = 'escrow-capture'", [a.outer.grant_id])).rows.map((r) => r.usd_cents)).toEqual([60]);
+    // outer delivered first: it waits while part of it is still pledged, then pays the rest
+    const b = await nested("nest-part-b", 100, 40);
+    expect((await receiptFor(b.outer)).json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" });
+    expect(await b.credits()).toEqual({ outer: 0, inner: 0 });
+    expect((await receiptFor(b.inner)).json.escrow).toMatchObject({ captured: true, amount: 40 });
+    expect((await receiptFor(b.outer)).json.escrow).toMatchObject({ captured: true, amount: 60 });
+    expect(await b.credits()).toEqual({ outer: 60, inner: 40 });
+    expect(await b.paid()).toBe(100);
+  });
+
+  test("CONTROL: when the hold below is refunded instead, the hold above pays in full, once", async () => {
+    const n = await nested("nest-refund", 100, 40);
+    const rev = await req("POST", "/api/grants/" + n.inner.grant_id + "/revoke", { token: n.root.token, body: { reason: "inner not delivered" } });
+    expect(rev.json.revoked).toContain(n.inner.grant_id);
+    expect((await receiptFor(n.outer)).json.escrow).toMatchObject({ captured: true, amount: 100 });
+    expect((await receiptFor(n.inner)).json.escrow.captured).toBe(false); // refunded: it can never capture
+    expect(await n.credits()).toEqual({ outer: 100, inner: 0 });
+    expect(await n.paid()).toBe(100);
+  });
+
+  // Any shape of holds under holds, built the same way: each hold in `plan` is { amount, under }
+  // where `under` is the index of an earlier hold in the plan, or null for the payer itself.
+  const tree = async (name, plan) => {
+    const root = await newTenant(name, "pro");
+    // Read straight from the payer's row, and refund with the admin key, so a long random run
+    // never meets the payer key's own rate limit.
+    const left = async () => { const r = (await dbQuery("SELECT budget, reserved, settled FROM grants WHERE id = $1", [root.grantId])).rows[0]; const c = (v) => (typeof v === "string" ? JSON.parse(v) : v || {}).usd_cents || 0; return c(r.budget) - c(r.reserved) - c(r.settled); };
+    const before = await left();
+    const usage = async (id, col) => { const v = (await dbQuery(`SELECT ${col} FROM grants WHERE id = $1`, [id])).rows[0][col]; return typeof v === "string" ? JSON.parse(v) : v || {}; };
+    const addHeld = async (id, by) => { const r = await usage(id, "reserved"); await dbQuery("UPDATE grants SET reserved = $2::jsonb WHERE id = $1", [id, JSON.stringify({ usd_cents: (r.usd_cents || 0) + by, calls: r.calls || 0, deploys: r.deploys || 0 })]); };
+    const holds = [];
+    for (const [i, h] of plan.entries()) {
+      const payee = `t_${name}_${i}`;
+      const o = await openEscrow(root.token, { amount: h.amount, payee_tenant: payee });
+      expect(o.status).toBe(201);
+      const hold = { ...o.json.escrow, payee, amount: h.amount, under: h.under };
+      if (h.under !== null) {
+        const parent = holds[h.under];
+        await addHeld(root.grantId, -h.amount);
+        await addHeld(parent.grant_id, h.amount);
+        await dbQuery("UPDATE grants SET parent = $2, depth = (SELECT depth + 1 FROM grants WHERE id = $2) WHERE id = $1", [hold.grant_id, parent.grant_id]);
+      }
+      holds.push(hold);
+    }
+    const credited = async (payee) => (await dbQuery("SELECT coalesce(sum(usd_cents),0)::int AS cents FROM ledger WHERE tenant=$1 AND kind='mesh-credit'", [payee])).rows[0].cents;
+    return {
+      root, holds,
+      paid: async () => before - (await left()),
+      credits: async () => { const out = []; for (const h of holds) out.push(await credited(h.payee)); return out; },
+      statusOf: async (h) => (await dbQuery("SELECT status FROM grants WHERE id = $1", [h.grant_id])).rows[0].status,
+      revoke: (h) => admin("POST", "/api/admin/grants/" + h.grant_id + "/revoke", { body: { reason: "test refund" } }),
+      // its deadline goes by and the sweep runs (the sweep leaves it alone while anything under it is open)
+      expire: async (h) => { await dbQuery("UPDATE grants SET exp = $2 WHERE id = $1", [h.grant_id, Math.floor(Date.now() / 1000) - 10]); return admin("POST", "/api/admin/grants/reap"); },
+    };
+  };
+
+  // A hold keeps what was spent further down HELD (that is how spend below a grant is counted),
+  // so "something is held on it" does not mean "something below is still open". With three
+  // levels, the top hold used to look pledged for ever and never paid its own share.
+  test("CONTROL: three levels deep, each hold pays exactly its own share, whichever delivery comes first", async () => {
+    const plan = [{ amount: 100, under: null }, { amount: 40, under: 0 }, { amount: 20, under: 1 }]; // A(100) > B(40) > C(20)
+    // bottom up: C 20, B its other 20, A its other 60
+    const up = await tree("deep-up", plan);
+    expect((await receiptFor(up.holds[2])).json.escrow).toMatchObject({ captured: true, amount: 20 });
+    expect((await receiptFor(up.holds[1])).json.escrow).toMatchObject({ captured: true, amount: 20 });
+    expect((await receiptFor(up.holds[0])).json.escrow).toMatchObject({ captured: true, amount: 60 });
+    expect(await up.credits()).toEqual([60, 20, 20]);
+    expect(await up.paid()).toBe(100);
+    // top down: each waits for what is still open under it, then pays the same shares
+    const down = await tree("deep-down", plan);
+    expect((await receiptFor(down.holds[0])).json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" });
+    expect((await receiptFor(down.holds[1])).json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" });
+    expect((await receiptFor(down.holds[2])).json.escrow).toMatchObject({ captured: true, amount: 20 });
+    expect((await receiptFor(down.holds[0])).json.escrow).toMatchObject({ captured: false, reason: "pledged_to_a_hold_below" }); // B is still open
+    expect((await receiptFor(down.holds[1])).json.escrow).toMatchObject({ captured: true, amount: 20 });
+    expect((await receiptFor(down.holds[0])).json.escrow).toMatchObject({ captured: true, amount: 60 });
+    expect(await down.credits()).toEqual([60, 20, 20]);
+    expect(await down.paid()).toBe(100);
+  });
+
+  // Every shape and every order at once. Random trees of holds under holds (a fixed seed, so a
+  // failure repeats), then deliveries, refunds and deadlines in random order until nothing is open.
+  // Two things must hold: payees are never credited more than the payer is out, at any moment;
+  // and when everything has ended the two are EQUAL (nothing made, nothing lost).
+  test("CONTROL: any tree of holds, any order of deliveries and refunds — credits never pass what the payer paid, and end equal to it", async () => {
+    // mulberry32: whole-number maths only (Math.imul), so every bit is used and a seed repeats exactly
+    let seed = 20261009;
+    const rnd = (n) => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let x = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x;
+      return ((x ^ (x >>> 14)) >>> 0) % n;
+    };
+    const shapes = { nested: 0, threeDeep: 0, waited: 0, deliveries: 0, refunds: 0, deadlines: 0 };
+    for (let round = 0; round < 24; round++) {
+      const plan = [], free = [];
+      const count = 2 + rnd(4); // 2 to 5 holds
+      for (let i = 0; i < count; i++) {
+        const parents = free.map((v, j) => (v >= 2 ? j : -1)).filter((j) => j >= 0);
+        const under = i > 0 && parents.length && rnd(4) > 0 ? parents[rnd(parents.length)] : null;
+        const amount = under === null ? 20 + rnd(81) : 1 + rnd(free[under] - 1);
+        if (under !== null) free[under] -= amount;
+        plan.push({ amount, under });
+        free.push(amount);
+      }
+      const depthOf = (i) => (plan[i].under === null ? 1 : 1 + depthOf(plan[i].under));
+      const deepest = Math.max(...plan.map((_, i) => depthOf(i)));
+      if (deepest >= 2) shapes.nested++;
+      if (deepest >= 3) shapes.threeDeep++;
+      const t = await tree("fuzz-" + round, plan);
+      const total = (xs) => xs.reduce((a, b) => a + b, 0);
+      for (let step = 0; step < 60; step++) {
+        const open = [];
+        for (const h of t.holds) if ((await t.statusOf(h)) === "active") open.push(h);
+        if (!open.length) break;
+        const h = open[rnd(open.length)];
+        const op = rnd(5);
+        if (op === 0) (shapes.refunds++, await t.revoke(h));
+        else if (op === 1) (shapes.deadlines++, await t.expire(h));
+        else {
+          const r = await receiptFor(h);
+          shapes.deliveries++;
+          if (r.json.escrow.reason === "pledged_to_a_hold_below") shapes.waited++;
+          // A delivery waits only while something directly under the hold is still open, never
+          // because of what was spent further down.
+          let openBelow = false;
+          for (const c of t.holds) if (c.under === t.holds.indexOf(h) && (await t.statusOf(c)) === "active") openBelow = true;
+          expect([round, step, r.json.escrow.reason === "pledged_to_a_hold_below"]).toEqual([round, step, openBelow]);
+        }
+        expect([round, step, total(await t.credits()) <= (await t.paid())]).toEqual([round, step, true]);
+      }
+      for (const h of t.holds) if ((await t.statusOf(h)) === "active") await t.revoke(h); // anything still waiting is refunded
+      const credits = await t.credits();
+      expect([round, JSON.stringify(plan), total(credits)]).toEqual([round, JSON.stringify(plan), await t.paid()]);
+      // and no hold ever paid more than its own amount
+      for (const [i, h] of t.holds.entries()) expect(credits[i]).toBeLessThanOrEqual(h.amount);
+    }
+    // The run really did build holds under holds, three deep, and really did make deliveries wait.
+    // (A random test that only ever drew flat shapes would pass whatever the code did.)
+    expect(shapes.nested).toBeGreaterThan(8);
+    expect(shapes.threeDeep).toBeGreaterThan(3);
+    expect(shapes.waited).toBeGreaterThan(3);
+    expect(shapes.deliveries).toBeGreaterThan(20);
+    expect(shapes.refunds).toBeGreaterThan(5);
+    expect(shapes.deadlines).toBeGreaterThan(5);
+  }, 30000); // about a second here; the default limit of five leaves too little room on a slow machine
+
+  // The same rule on the running build, where no request can make such rows: /selftest.
+  test("the runtime's own self-test carries the control: a hold cannot pay for a hold, a capture never pays out what was passed on", async () => {
+    const r = await req("GET", "/selftest");
+    const name = "payment hold cannot pay for another hold, and a capture never pays out what was passed on";
+    expect(r.json.results.find((c) => c.name === name)).toEqual({ name, pass: true });
+  });
+
   test("CONTROL (fix): a receipt naming a different payee does not settle to the escrow's payee", async () => {
     const root = await newTenant("cap-payee", "pro");
     const open = await openEscrow(root.token, { payee_tenant: "t_payeeP" });
@@ -2166,6 +5559,10 @@ describe("22. the autonomy dial (src/autonomy.js)", () => {
     const ok = await req("POST", `/api/approvals/${d.json.approval.id}`, { token: root.token, body: { decision: "approve" } });
     expect(ok.status).toBe(200);
     expect(ok.json.status).toBe("approved_not_run"); // Railway is unarmed under test
+    const receipt = (await dbQuery("SELECT * FROM tool_receipts WHERE id = $1", [ok.headers.get("x-runtime-receipt")])).rows[0];
+    expect(receipt.outcome).toBe("not_run");
+    const waiting = (await dbQuery("SELECT * FROM tool_receipts WHERE id = $1", [d.headers.get("x-runtime-receipt")])).rows[0];
+    expect(waiting.outcome).toBe("pending_approval");
   });
 
   test("CONTROL: `observe` refuses value actions outright, and the refusal is recorded", async () => {
@@ -2299,5 +5696,507 @@ describe("23. agent-host (docs/specs/agent-host.md)", () => {
     expect(rv.json.revoked.length).toBe(3); // the host and both hires
     for (const tok of [h.json.token, a.json.token, b.json.token]) expect((await req("GET", "/api/grants/verify", { token: tok })).status).toBe(401);
     expect((await verify(root.token)).remaining).toEqual(before);
+  });
+});
+
+describe("24. stored deploy secrets never leave the runtime (bridge prerequisite, 2026-10-09)", () => {
+  // A deploy's stored intent is the caller's request body; its env carries real
+  // values (other services' keys). GET /api/deploys/:id and GET /api/approvals
+  // must return the variable NAMES only, so the front door can bridge them.
+  const SECRET = "sk_live_must_not_leave_" + Date.now();
+  const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
+
+  test("GET /api/deploys/:id returns env names, never values", async () => {
+    const t = await newTenant("deploy-redact");
+    const name = (await verify(t.token)).scope.workers.namePrefix + "redact-1";
+    const d = await req("POST", "/api/deploys", { token: t.token, body: { name, template: "probe", env: { STRIPE_SECRET_KEY: SECRET, PORT: "8080" }, api_token: SECRET } });
+    expect(d.status).toBe(201);
+    const got = await req("GET", `/api/deploys/${d.json.id}`, { token: t.token });
+    expect(got.status).toBe(200);
+    expect(JSON.stringify(got.json)).not.toContain(SECRET);
+    expect(got.json.deploy.intent.env).toEqual({ STRIPE_SECRET_KEY: "[redacted]", PORT: "[redacted]" });
+    expect(got.json.deploy.intent.api_token).toBe("[redacted]");
+    expect(got.json.deploy.intent.template).toBe("probe"); // non-secret fields untouched
+    // ...and the stored row still holds the real value (an approved deploy must run with it).
+    const row = (await dbQuery("SELECT intent FROM deploys WHERE id = $1", [d.json.id])).rows[0];
+    expect(JSON.stringify(row.intent)).toContain(SECRET);
+  });
+
+  test("GET /api/approvals returns a pending deploy's env names, never values", async () => {
+    const root = await newTenant("approvals-redact", "pro");
+    const c = await req("POST", "/api/grants", {
+      token: root.token,
+      body: { sub: "agent:redact", caps: ["deploy.worker"], ttlSec: 3600, budget: { usd_cents: 2000, calls: 10, deploys: 2 }, constraints: { autonomy: "ask" } },
+    });
+    expect(c.status).toBe(201);
+    const name = (await verify(c.json.token)).scope.workers.namePrefix + "redact-2";
+    const d = await req("POST", "/api/deploys", { token: c.json.token, body: { name, template: "probe", confirm: true, env: { DB_PASSWORD: SECRET } } });
+    expect(d.json.status).toBe("awaiting_approval");
+    const list = await req("GET", "/api/approvals", { token: root.token });
+    expect(list.status).toBe(200);
+    expect(list.json.approvals.length).toBeGreaterThan(0);
+    expect(JSON.stringify(list.json)).not.toContain(SECRET);
+    expect(list.json.approvals[0].intent.env).toEqual({ DB_PASSWORD: "[redacted]" });
+  });
+});
+
+// ------------------------------------------------------------------------------------
+// GET /api/admin/grants (src/routes/admin.js). It used to answer every question with the newest 200 grants: it read
+// no filter and no offset, so a live key older than those 200 could not be seen at all.
+describe("25. the admin's list of grants: filters and pages (GET /api/admin/grants)", () => {
+  // the filler grants below are this section's own: they go when it is done, so a section after it starts clean.
+  // (starts_with, not LIKE: in LIKE an underscore matches any one character, and 'gr_25_%' would also match a real
+  // grant whose random id begins with "25".)
+  afterAll(() => dbQuery("DELETE FROM grants WHERE starts_with(id, 'gr_25_fill_') OR starts_with(id, 'gr_25_page_')"));
+  const list = (q = "") => admin("GET", `/api/admin/grants${q}`);
+  const ids = (r) => r.json.grants.map((g) => g.id);
+  const countWhere = async (where, params = []) => (await dbQuery(`SELECT count(*)::int AS n FROM grants WHERE ${where}`, params)).rows[0].n;
+  // `n` grants of `likeId`'s tenant, copies of it in `status`, written in ONE statement so that they share a created_at.
+  // Their ids rise in the order they are written, so a list that has no second sort key shows them oldest id first.
+  const fill = (likeId, prefix, n, status) =>
+    dbQuery(
+      `INSERT INTO grants (id, tenant, parent, depth, sub, status, caps, scope, budget, constraints, payload, iat, exp)
+       SELECT '${prefix}' || lpad(n::text, 4, '0'), tenant, NULL, 0, 'filler', '${status}', caps, scope, budget, constraints, payload, iat, exp
+       FROM grants, generate_series(1, ${n}) n WHERE id = $1`,
+      [likeId],
+    );
+
+  test("an old live key behind 205 newer grants: missing from the default list, found by status and by tenant", async () => {
+    const t = await newTenant("admin-list-old", "studio");
+    const kid = await req("POST", "/api/grants", { token: t.token, body: { sub: "agent:old", caps: ["grant.read"], ttlSec: 3600 } });
+    expect(kid.status).toBe(201);
+    const u = await newTenant("admin-list-filler", "studio");
+    await fill(u.grantId, "gr_25_fill_", 205, "revoked");
+    // asked with nothing: what it always was, the newest 200 of every tenant, in the same shape
+    const plain = await list();
+    expect(plain.status).toBe(200);
+    expect(plain.json.grants.length).toBe(200);
+    expect(Object.keys(plain.json.grants[0]).sort()).toEqual(["budget", "caps", "created_at", "depth", "exp", "id", "parent", "remaining", "reserved", "settled", "status", "sub", "tenant"]);
+    expect(ids(plain)).not.toContain(t.grantId); // control: this is the blind spot
+    expect(ids(plain)).not.toContain(kid.json.id);
+    expect(ids(await list("?limit=200&offset=0"))).toEqual(ids(plain));
+    expect(plain.json.total).toBe(await countWhere("TRUE"));
+    expect([plain.json.limit, plain.json.offset, plain.json.status, plain.json.tenant]).toEqual([200, 0, null, null]); // no filter applied, and it says so
+    // by status: only active grants, and the two old live keys are among them
+    const active = await list("?status=active");
+    expect(active.status).toBe(200);
+    expect(active.json.grants.every((g) => g.status === "active")).toBe(true);
+    expect(ids(active)).toEqual(expect.arrayContaining([t.grantId, kid.json.id]));
+    expect(active.json.total).toBe(await countWhere("status = 'active'"));
+    // by tenant: only that tenant's, all of them
+    const theirs = await list(`?tenant=${t.id}`);
+    expect(theirs.json.grants.every((g) => g.tenant === t.id)).toBe(true);
+    expect(ids(theirs).sort()).toEqual([t.grantId, kid.json.id].sort());
+    expect(theirs.json.total).toBe(2);
+    expect([theirs.json.tenant, theirs.json.status]).toEqual([t.id, null]);
+    expect([active.json.status, active.json.tenant]).toEqual(["active", null]);
+    // both at once
+    expect((await list(`?tenant=${u.id}&status=revoked`)).json.total).toBe(205);
+    expect(ids(await list(`?tenant=${u.id}&status=active`))).toEqual([u.grantId]);
+    expect((await list(`?tenant=${t.id}&status=revoked`)).json.grants).toEqual([]);
+    expect((await list("?tenant=t_nobodyatall")).json).toEqual({ grants: [], total: 0, limit: 200, offset: 0, status: null, tenant: "t_nobodyatall" });
+    // the other two states a grant can be in can be asked for as well
+    await dbQuery("UPDATE grants SET status = 'expired' WHERE id = 'gr_25_fill_0001'");
+    await dbQuery("UPDATE grants SET status = 'captured' WHERE id = 'gr_25_fill_0002'");
+    for (const [status, id] of [["expired", "gr_25_fill_0001"], ["captured", "gr_25_fill_0002"]]) {
+      const r = await list(`?status=${status}&tenant=${u.id}`);
+      expect(r.status).toBe(200);
+      expect(ids(r)).toEqual([id]);
+    }
+  });
+
+  test("pages: offset moves through the list, pages never overlap, and grants that share a moment are split the same way every time", async () => {
+    const u = await newTenant("admin-list-pages", "studio");
+    await fill(u.grantId, "gr_25_page_", 250, "revoked");
+    // the whole list, page by page, is the same as one long page
+    const p0 = await list("?limit=200&offset=0"),
+      p1 = await list("?limit=200&offset=200"),
+      both = await list("?limit=400");
+    expect(ids(p1)).not.toEqual(ids(p0));
+    expect(ids(p0).filter((id) => ids(p1).includes(id))).toEqual([]);
+    expect([...ids(p0), ...ids(p1)]).toEqual(ids(both));
+    expect([p1.json.limit, p1.json.offset]).toEqual([200, 200]);
+    expect((await list("?limit=1")).json.grants.length).toBe(1);
+    expect((await list("?limit=1000")).json.grants.length).toBe(Math.min(1000, await countWhere("TRUE")));
+    // 250 grants written in one statement share a created_at: within them the order is by id, newest id first, so
+    // pages cut through them never show one twice or leave one out
+    const q = `?tenant=${u.id}&status=revoked&limit=100`;
+    const pages = [await list(`${q}&offset=0`), await list(`${q}&offset=100`), await list(`${q}&offset=200`)];
+    expect(pages.map((p) => p.json.grants.length)).toEqual([100, 100, 50]);
+    const seen = pages.flatMap(ids);
+    expect(new Set(seen).size).toBe(250);
+    expect(seen).toEqual(Array.from({ length: 250 }, (_, i) => `gr_25_page_${String(250 - i).padStart(4, "0")}`));
+    expect(pages.every((p) => p.json.total === 250)).toBe(true);
+    // past the end: an empty page that still says how many there are
+    expect((await list(`${q}&offset=250`)).json).toEqual({ grants: [], total: 250, limit: 100, offset: 250, status: "revoked", tenant: u.id });
+  });
+
+  test("a value that cannot be read is refused (400), never ignored", async () => {
+    for (const status of ["bogus", "ACTIVE", "", "active,revoked"]) {
+      const r = await list(`?status=${encodeURIComponent(status)}`);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("status_invalid");
+      expect(r.json.detail.allowed).toEqual(["active", "revoked", "expired", "captured"]);
+    }
+    for (const tenant of ["", "t_x' OR '1'='1", "t/../x", "a".repeat(65)]) {
+      const r = await list(`?tenant=${encodeURIComponent(tenant)}`);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("tenant_invalid");
+    }
+    for (const limit of ["0", "1001", "abc", "1.5", "-1", "", "1e3", "99999999999"]) {
+      const r = await list(`?limit=${encodeURIComponent(limit)}`);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("limit_invalid");
+    }
+    for (const offset of ["-1", "x", "1.5", "", "99999999999"]) {
+      const r = await list(`?offset=${encodeURIComponent(offset)}`);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("offset_invalid");
+    }
+    // a key this route does not know, or a key given twice, is refused too: before, both answered the newest 200 of every
+    // tenant (or the first tenant only) as if the filter had been applied
+    const t0 = await newTenant("admin-list-keys", "studio");
+    for (const q of [`?tenant_id=${t0.id}`, `?Tenant=${t0.id}`, "?page=2", "?status=active&state=revoked", "?limit=10&per_page=5"]) {
+      const r = await list(q);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("query_unknown");
+      expect(r.json.detail.allowed).toEqual(["status", "tenant", "limit", "offset"]);
+    }
+    for (const q of [`?tenant=${t0.id}&tenant=t_someoneelse`, "?status=active&status=revoked", "?limit=1&limit=2", "?offset=0&offset=0"]) {
+      const r = await list(q);
+      expect(r.status).toBe(400);
+      expect(r.json.error).toBe("query_repeated");
+    }
+    // a key spelled with an escape is the key itself: it filters, and it counts as given twice when also given plainly
+    const escaped = await list(`?%74enant=${t0.id}`);
+    expect(escaped.status).toBe(200);
+    expect(escaped.json.tenant).toBe(t0.id);
+    expect(ids(escaped)).toEqual([t0.grantId]);
+    const twice = await list(`?%74enant=${t0.id}&tenant=t_someoneelse`);
+    expect(twice.status).toBe(400);
+    expect(twice.json.error).toBe("query_repeated");
+    // the edges that are allowed
+    expect((await list("?limit=1000&offset=0")).status).toBe(200);
+    expect((await list("?offset=1000000000")).json.grants).toEqual([]);
+    // and it stays the admin's: no key, or an owner's key, is refused as before
+    expect((await req("GET", "/api/admin/grants?status=active")).status).toBe(401);
+    const t = await newTenant("admin-list-owner", "studio");
+    expect((await req("GET", "/api/admin/grants?status=active", { token: t.token })).status).toBe(401);
+  });
+});
+
+describe("26. the one events bus: outbox kind bus.publish (src/busout.js)", () => {
+  // Test-only key from test/bus-vectors.json (the same file the gateway's suite reads).
+  const KEY = JSON.parse(readFileSync(resolve(here, "bus-vectors.json"), "utf8")).key;
+  const URL_ = "https://rail.example.test/events";
+  const busRows = async () => (await dbQuery("SELECT id, payload, attempts, done, last_error FROM outbox WHERE kind = 'bus.publish' ORDER BY id")).rows;
+  const payloadOf = (row) => (typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload);
+  // newTenant records more than one event (tenant.created, the root grant's): pick out the tenant's own.
+  const createdRow = async (before, tenant) =>
+    (await busRows()).slice(before).filter((r) => payloadOf(r).type === "tenant.created" && payloadOf(r).tenant === tenant);
+  const callsFor = (seen, id) => seen.filter((c) => JSON.parse(c.body).id === id);
+  const lastEventId = async (type, tenant) =>
+    (await dbQuery("SELECT id FROM events WHERE type = $1 AND tenant = $2 ORDER BY id DESC LIMIT 1", [type, tenant])).rows[0].id;
+  // Arm (or not), and answer the bus URL with `status()`; everything else goes to the harness as before.
+  async function withBus({ url, key, status = () => 200 }, fn) {
+    const saved = { url: process.env.BUS_EVENTS_URL, key: process.env.BUS_EVENTS_KEY, fetch: globalThis.fetch };
+    const seen = [];
+    if (url === undefined) delete process.env.BUS_EVENTS_URL; else process.env.BUS_EVENTS_URL = url;
+    if (key === undefined) delete process.env.BUS_EVENTS_KEY; else process.env.BUS_EVENTS_KEY = key;
+    globalThis.fetch = async (input, init) => {
+      const href = typeof input === "string" ? input : input.url ?? String(input);
+      if (href !== URL_) return saved.fetch(input, init);
+      seen.push({ body: init.body, sig: init.headers["x-bus-signature"] });
+      return new Response("{}", { status: status(seen.length) });
+    };
+    try {
+      return await fn(seen);
+    } finally {
+      globalThis.fetch = saved.fetch;
+      if (saved.url === undefined) delete process.env.BUS_EVENTS_URL; else process.env.BUS_EVENTS_URL = saved.url;
+      if (saved.key === undefined) delete process.env.BUS_EVENTS_KEY; else process.env.BUS_EVENTS_KEY = saved.key;
+    }
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 150)); // enqueueOutbox drains 30 ms after a write
+  const verifies = (body, sig) => {
+    const m = /^t=(\d+),v1=([0-9a-f]{64})$/.exec(sig || "");
+    return !!m && Math.abs(Date.now() / 1000 - Number(m[1])) <= 300 && hmacHex(KEY, `${m[1]}.${body}`) === m[2];
+  };
+  afterAll(() => dbQuery("DELETE FROM outbox WHERE kind = 'bus.publish'"));
+
+  test("OFF by default: events are recorded, no bus.publish row, no call", async () => {
+    await withBus({}, async (seen) => {
+      const before = (await busRows()).length;
+      const t = await newTenant("bus-off", "pro");
+      expect(await lastEventId("tenant.created", t.id)).toBeDefined(); // the event itself still lands
+      await settle();
+      expect((await busRows()).length).toBe(before);
+      expect(seen.length).toBe(0);
+    });
+  });
+
+  test("NEGATIVE CONTROL: only one of the pair set, or an http URL, still enqueues nothing", async () => {
+    for (const cfg of [{ url: URL_ }, { key: KEY }, { url: "http://rail.example.test/events", key: KEY }]) {
+      await withBus(cfg, async (seen) => {
+        const before = (await busRows()).length;
+        await newTenant("bus-half", "pro");
+        await settle();
+        expect([cfg, (await busRows()).length, seen.length]).toEqual([cfg, before, 0]);
+      });
+    }
+  });
+
+  test("armed: one row per event, id = the events row id, signed so the gateway accepts it", async () => {
+    await withBus({ url: URL_, key: KEY }, async (seen) => {
+      const before = (await busRows()).length;
+      const t = await newTenant("bus-on", "pro");
+      await settle();
+      // the paired positive of the two tests above: the same action now queues rows, one per event
+      const allNew = (await busRows()).slice(before);
+      const evCount = (await dbQuery("SELECT count(*)::int AS n FROM events WHERE tenant = $1", [t.id])).rows[0].n;
+      expect(allNew.length).toBe(evCount);
+      const rows = await createdRow(before, t.id);
+      expect(rows.length).toBe(1);
+      const evId = await lastEventId("tenant.created", t.id);
+      const p = payloadOf(rows[0]);
+      expect(p).toMatchObject({ id: `rt_ev_${evId}`, type: "tenant.created", source: "creator-os-runtime", tenant: t.id, actor: "admin", data: { tier: "pro" } });
+      expect(rows[0].done).toBe(true);
+      const calls = callsFor(seen, p.id);
+      expect(calls.length).toBe(1);
+      expect(JSON.parse(calls[0].body)).toEqual(p);
+      expect(verifies(calls[0].body, calls[0].sig)).toBe(true);
+    });
+  });
+
+  test("5xx is retried with the SAME id (the gateway dedups on it); success then marks it done", async () => {
+    let up = false; // the bus answers 503 until `up`
+    await withBus({ url: URL_, key: KEY, status: () => (up ? 200 : 503) }, async (seen) => {
+      const before = (await busRows()).length;
+      const t = await newTenant("bus-retry", "pro");
+      await settle();
+      let [row] = await createdRow(before, t.id);
+      expect([row.attempts, row.done, row.last_error]).toEqual([1, false, "bus 503"]);
+      up = true;
+      await dbQuery("UPDATE outbox SET next_at = now() WHERE kind = 'bus.publish' AND done = false"); // skip the backoff wait
+      expect((await admin("POST", "/api/admin/outbox/drain")).status).toBe(200);
+      [row] = await createdRow(before, t.id);
+      expect([row.attempts, row.done]).toEqual([1, true]);
+      const calls = callsFor(seen, payloadOf(row).id);
+      expect(calls.length).toBe(2);
+      expect(calls[1].body).toBe(calls[0].body); // same id, same bytes: the gateway's Nats-Msg-Id dedup holds
+      expect(verifies(calls[1].body, calls[1].sig)).toBe(true); // re-signed with a fresh timestamp
+    });
+  });
+
+  test("a 4xx (other than 408/429) is terminal: one attempt, done, error kept", async () => {
+    await withBus({ url: URL_, key: KEY, status: () => 400 }, async (seen) => {
+      const before = (await busRows()).length;
+      const t = await newTenant("bus-bad", "pro");
+      await settle();
+      const [row] = await createdRow(before, t.id);
+      expect([row.attempts, row.done, row.last_error, callsFor(seen, payloadOf(row).id).length]).toEqual([1, true, "bus 400", 1]);
+    });
+  });
+});
+
+
+// Runtime-observed receipts: the response header correlates the invocation with
+// a persisted row. No test accepts a client assertion as execution evidence.
+describe("tool invocation receipts", () => {
+  async function receipt(response) {
+    const id = response.headers.get("x-runtime-receipt");
+    expect(id).toMatch(/^tr_/);
+    return (await dbQuery("SELECT * FROM tool_receipts WHERE id = $1", [id])).rows[0];
+  }
+  test("successful calls bind the verified grant and contain no arguments or results", async () => {
+    const t = await newTenant("receipt-success");
+    const r = await mcp(t.token, "tools/call", { name: "grant_verify", arguments: { secret: "never-save-this" } });
+    expect(r.status).toBe(200);
+    const row = await receipt(r);
+    expect(row.grant_id).toBe(t.grantId);
+    expect(row.tenant).toBe(t.id);
+    expect(row.auth_decision).toBe("authorized");
+    expect(row.authority_kind).toBe("grant");
+    expect(row.outcome).toBe("succeeded");
+    expect(row.finished_at).not.toBeNull();
+    expect(JSON.stringify(row)).not.toContain("never-save-this");
+    expect(JSON.stringify(row)).not.toContain(t.token);
+  });
+  test("HTTP 200 MCP capability denials persist as denied, not success", async () => {
+    const t = await newTenant("receipt-denied");
+    const child = await req("POST", "/api/grants", { token: t.token, body: {
+      sub: "receipt-reader", caps: ["ledger.read"], budget: { usd_cents: 0, calls: 10, deploys: 0 }, ttlSec: 300,
+    } });
+    expect(child.status).toBe(201);
+    const r = await mcp(child.json.token, "tools/call", { name: "memory_write", arguments: { partition: "x", key: "x", content: "denied" } });
+    expect(r.status).toBe(200);
+    const row = await receipt(r);
+    expect(row.grant_id).toBe(child.json.id);
+    expect(row.outcome).toBe("denied");
+    expect(row.auth_decision).toBe("denied");
+    expect(row.reason).toBe("missing_cap");
+  });
+  test("unauthenticated attempts cannot impersonate a tenant and unknown names are not stored", async () => {
+    const r = await mcp(undefined, "tools/call", { name: "sk-secret-in-name", arguments: { tenant: "forged", token: "secret" } });
+    expect(r.status).toBe(401);
+    const row = await receipt(r);
+    expect(row.tenant).toBeNull();
+    expect(row.grant_id).toBeNull();
+    expect(row.tool).toBe("authentication_rejected");
+    expect(row.record_kind).toBe("rejection_summary");
+    expect(row.outcome).toBe("denied");
+    expect(JSON.stringify(row)).not.toContain("sk-secret");
+    expect((await req("GET", "/api/admin/tool-receipts")).status).toBe(401);
+  });
+  test("readers see their subtree only; sibling and foreign-tenant receipts stay private", async () => {
+    const t = await newTenant("receipt-subtree"), other = await newTenant("receipt-other");
+    const kids = [];
+    for (const sub of ["a", "b"]) {
+      const r = await req("POST", "/api/grants", { token: t.token, body: { sub, caps: ["ledger.read"], budget: { usd_cents: 0, calls: 10, deploys: 0 }, ttlSec: 300 } });
+      expect(r.status).toBe(201); kids.push(r.json);
+    }
+    for (const token of [t.token, other.token, ...kids.map(k => k.token)])
+      await mcp(token, "tools/call", { name: "runtime_health", arguments: {} });
+    const leaf = await req("GET", "/api/tool-receipts", { token: kids[0].token });
+    expect(leaf.status).toBe(200);
+    expect(leaf.json.receipts.length).toBe(1);
+    expect(leaf.json.receipts.every(r => r.grant_id === kids[0].id)).toBe(true);
+    const root = await req("GET", "/api/tool-receipts", { token: t.token });
+    expect(root.json.receipts.length).toBe(5); // two HTTP grant issues + three MCP calls
+    expect(root.json.receipts.every(r => r.tenant === t.id)).toBe(true);
+    expect(root.json.receipts.some(r => r.grant_id === kids[1].id)).toBe(true);
+  });
+  test("failure to save the start prevents the tool side effect", async () => {
+    const t = await newTenant("receipt-start-fail");
+    await dbQuery(`CREATE FUNCTION refuse_receipt_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test receipt storage unavailable'; END $$`);
+    await dbQuery(`CREATE TRIGGER refuse_receipt_insert BEFORE INSERT ON tool_receipts FOR EACH ROW EXECUTE FUNCTION refuse_receipt_insert()`);
+    try {
+      const r = await mcp(t.token, "tools/call", { name: "grant_issue", arguments: { sub: "must-not-exist", caps: ["ledger.read"], budget: { calls: 1 }, ttlSec: 60 } });
+      expect(r.status).toBe(503);
+      expect(r.json.error).toBe("receipt_unavailable");
+      expect(r.json.executed).toBe(false);
+      expect((await dbQuery("SELECT id FROM grants WHERE parent = $1", [t.grantId])).rows.length).toBe(0);
+    } finally { await dbQuery("DROP TRIGGER refuse_receipt_insert ON tool_receipts"); await dbQuery("DROP FUNCTION refuse_receipt_insert()"); }
+  });
+  test("lost completion leaves a durable start and reports uncertainty, never safe retry", async () => {
+    const t = await newTenant("receipt-completion-fail");
+    await dbQuery(`CREATE FUNCTION refuse_receipt_finish() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.finished_at IS NOT NULL THEN RAISE EXCEPTION 'test completion unavailable'; END IF; RETURN NEW; END $$`);
+    await dbQuery(`CREATE TRIGGER refuse_receipt_finish BEFORE UPDATE ON tool_receipts FOR EACH ROW EXECUTE FUNCTION refuse_receipt_finish()`);
+    try {
+      const r = await mcp(t.token, "tools/call", { name: "runtime_health", arguments: {} });
+      expect(r.status).toBe(503);
+      expect(r.json.error).toBe("receipt_completion_unavailable");
+      expect(r.json.execution).toBe("unknown");
+      expect(r.json.retry_safe).toBe(false);
+      const row = await receipt(r);
+      expect(row.outcome).toBe("started");
+      expect(row.finished_at).toBeNull();
+      expect(row.grant_id).toBe(t.grantId);
+      expect(row.auth_decision).toBe("authorized");
+    } finally { await dbQuery("DROP TRIGGER refuse_receipt_finish ON tool_receipts"); await dbQuery("DROP FUNCTION refuse_receipt_finish()"); }
+  });
+  test("HTTP tool operations leave receipts using the route template, never raw target or query", async () => {
+    const t = await newTenant("receipt-http");
+    const r = await req("GET", `/api/grants/${t.grantId}?secret=never-save-query`, { token: t.token });
+    expect(r.status).toBe(200);
+    const row = await receipt(r);
+    expect(row.tool).toBe("GET /api/grants/:id");
+    expect(row.grant_id).toBe(t.grantId);
+    expect(row.auth_decision).toBe("authorized");
+    expect(JSON.stringify(row)).not.toContain("never-save-query");
+    const denied = await req("GET", "/api/grants/forged");
+    expect(denied.status).toBe(401);
+    expect((await receipt(denied)).outcome).toBe("denied");
+  });
+  test("HTTP 200 tool validation failures are recorded as failed", async () => {
+    const t = await newTenant("receipt-tool-failed");
+    const r = await mcp(t.token, "tools/call", { name: "memory_write", arguments: {} });
+    expect(r.status).toBe(200);
+    expect(r.json.result.isError).toBe(true);
+    expect((await receipt(r)).outcome).toBe("failed");
+  });
+  test("anonymous rejection bursts aggregate and cannot consume a legitimate caller's receipt capacity", async () => {
+    await inOneWindow(async () => {
+      const ids = new Set();
+      for (let i = 0; i < 25; i++) {
+        const r = await mcp(undefined, "tools/call", { name: "runtime_health", arguments: {} });
+        expect(r.status).toBe(401); ids.add(r.headers.get("x-runtime-receipt"));
+      }
+      expect(ids.size).toBe(1);
+      const summary = (await dbQuery("SELECT * FROM tool_receipts WHERE id = $1", [[...ids][0]])).rows[0];
+      expect(summary.record_kind).toBe("rejection_summary");
+      expect(Number(summary.attempts)).toBeGreaterThanOrEqual(25);
+      const t = await newTenant("receipt-after-burst");
+      const good = await mcp(t.token, "tools/call", { name: "runtime_health", arguments: {} });
+      expect((await receipt(good)).outcome).toBe("succeeded");
+    });
+  });
+  test("operator keys, operator sessions and public guest policy have distinct authority provenance", async () => {
+    const op = await admin("GET", "/api/admin/overview");
+    expect((await receipt(op)).authority_kind).toBe("operator_key");
+    const login = await admin("POST", "/api/admin/session");
+    const cookie = login.headers.get("set-cookie").split(";")[0];
+    const session = await req("GET", "/api/admin/overview", { headers: { cookie } });
+    expect((await receipt(session)).authority_kind).toBe("operator_session");
+    const guest = await req("POST", "/mcp", { headers: { "x-real-ip": "203.0.113.209" }, body: {
+      jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "guest_welcome", arguments: {} },
+    } });
+    expect(guest.status).toBe(200);
+    const row = await receipt(guest);
+    expect(row.authority_kind).toBe("public_guest_policy");
+    expect(row.grant_id).toBeNull();
+    expect(JSON.stringify(row)).not.toContain(cookie);
+  });
+  test("MCP receipt lookup uses the existing ledger.read permission and subtree", async () => {
+    const t = await newTenant("receipt-mcp-reader");
+    const call = await mcp(t.token, "tools/call", { name: "runtime_health", arguments: {} });
+    const read = await mcp(t.token, "tools/call", { name: "tool_receipts", arguments: { limit: 10 } });
+    expect(read.status).toBe(200);
+    expect(read.json.result.structuredContent.receipts.some(row => row.id === call.headers.get("x-runtime-receipt"))).toBe(true);
+    expect(read.json.result.structuredContent.receipts.every(row => row.tenant === t.id)).toBe(true);
+  });
+  test("implicit HEAD dispatch cannot bypass the receipt start before OAuth state insertion", async () => {
+    const t = await newTenant("receipt-head");
+    const beforeEnv = [Bun.env.RAILWAY_OAUTH_CLIENT_ID, Bun.env.RAILWAY_OAUTH_CLIENT_SECRET];
+    Bun.env.RAILWAY_OAUTH_CLIENT_ID = "test-head-client";
+    Bun.env.RAILWAY_OAUTH_CLIENT_SECRET = "test-head-secret";
+    try {
+      const good = await req("HEAD", "/auth/railway/start", { token: t.token });
+      expect(good.status).toBe(200);
+      const row = await receipt(good);
+      expect(row.tool).toBe("HEAD /auth/railway/start");
+      expect(row.grant_id).toBe(t.grantId);
+      const before = (await dbQuery("SELECT count(*)::int AS n FROM oauth_states WHERE tenant = $1", [t.id])).rows[0].n;
+      expect(before).toBe(1);
+      await dbQuery(`CREATE FUNCTION refuse_head_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test receipt start unavailable'; END $$`);
+      await dbQuery(`CREATE TRIGGER refuse_head_receipt BEFORE INSERT ON tool_receipts FOR EACH ROW EXECUTE FUNCTION refuse_head_receipt()`);
+      try {
+        const stopped = await req("HEAD", "/auth/railway/start", { token: t.token });
+        expect(stopped.status).toBe(503);
+        expect((await dbQuery("SELECT count(*)::int AS n FROM oauth_states WHERE tenant = $1", [t.id])).rows[0].n).toBe(before);
+      } finally { await dbQuery("DROP TRIGGER refuse_head_receipt ON tool_receipts"); await dbQuery("DROP FUNCTION refuse_head_receipt()"); }
+    } finally {
+      for (const [k, v] of [["RAILWAY_OAUTH_CLIENT_ID", beforeEnv[0]], ["RAILWAY_OAUTH_CLIENT_SECRET", beforeEnv[1]]]) {
+        if (v === undefined) delete Bun.env[k]; else Bun.env[k] = v;
+      }
+    }
+  });
+  test("a database statement that silently saves no receipt cannot authorize execution", async () => {
+    const t = await newTenant("receipt-silent-start");
+    await dbQuery(`CREATE FUNCTION drop_receipt_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$`);
+    await dbQuery(`CREATE TRIGGER drop_receipt_insert BEFORE INSERT ON tool_receipts FOR EACH ROW EXECUTE FUNCTION drop_receipt_insert()`);
+    try {
+      const r = await mcp(t.token, "tools/call", { name: "grant_issue", arguments: { sub: "must-not-exist", caps: ["ledger.read"], budget: { calls: 1 }, ttlSec: 60 } });
+      expect(r.status).toBe(503);
+      expect(r.json.error).toBe("receipt_unavailable");
+      expect((await dbQuery("SELECT id FROM grants WHERE parent = $1", [t.grantId])).rows.length).toBe(0);
+    } finally { await dbQuery("DROP TRIGGER drop_receipt_insert ON tool_receipts"); await dbQuery("DROP FUNCTION drop_receipt_insert()"); }
+  });
+  test("handshakes do not pretend to be tool calls", async () => {
+    const t = await newTenant("receipt-handshake");
+    const r = await mcp(t.token, "tools/list", {});
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-runtime-receipt")).toBeNull();
+    expect((await dbQuery("SELECT id FROM tool_receipts WHERE grant_id = $1", [t.grantId])).rows.length).toBe(0);
   });
 });

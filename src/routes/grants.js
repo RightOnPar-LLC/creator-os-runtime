@@ -1,9 +1,11 @@
+import { readToolReceipts } from "../tool-receipts.js";
 // Routes: grant-holder API: grants, cog, deploys, ledger, events, tenant. Registration order is significant.
-import { HttpError, nowSec, parseJson } from "../util.js";
+import { HttpError, nowSec, parseJson, withRedactedIntent } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "../db.js";
 import { normalizeUsage, remainingBudget, TIERS } from "../policy.js";
-import { issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
+import { endedAbove, issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
 import { HOST_DEFAULT_BUDGET, HOST_DEFAULT_CAPS, HOST_DEFAULTS, HOST_TIERS, hostLimits, hostName } from "../hostpolicy.js";
+import { notATourReason } from "../tours.js";
 import { AUTONOMY_LEVELS, autonomyOf } from "../autonomy.js";
 import { openEscrow, serializeEscrow } from "../escrow.js";
 import { deleteDeploy, deployWorker, refreshDeployStatus, restartDeploy, TEMPLATES } from "../railway.js";
@@ -104,13 +106,9 @@ app.post("/api/grants/:id/revoke", requireGrant("grant.issue"), async (e) => {
     ).length
   )
     throw new HttpError(403, "not_in_subtree");
-  return e.json({
-    revoked: await revokeGrantTree(
-      a,
-      String((await readJsonBody(e)).reason || "revoked by " + t.row.sub),
-      t.row.sub,
-    ),
-  });
+  let reason = String((await readJsonBody(e)).reason || "revoked by " + t.row.sub);
+  notATourReason(reason); // "tour: ..." is the runtime's own (tours.js): the alarm reads one of them back
+  return e.json({ revoked: await revokeGrantTree(a, reason, t.row.sub) });
 });
 app.post("/api/cog/plan", requireGrant("cog.plan"), async (e) => {
   let t = e.get("auth"),
@@ -155,8 +153,9 @@ app.get("/api/deploys", requireGrant("worker.status"), async (e) => {
 });
 app.get("/api/deploys/:id", requireGrant("worker.status"), async (e) => {
   let t = e.get("auth");
+  // The stored intent's env values never leave (util.js redactIntent).
   return e.json({
-    deploy: await refreshDeployStatus(t, e.req.param("id")),
+    deploy: withRedactedIntent(await refreshDeployStatus(t, e.req.param("id"))),
   });
 });
 app.post("/api/deploys/:id/restart", requireGrant("worker.restart"), async (e) => {
@@ -218,10 +217,12 @@ app.get("/api/approvals", requireGrant(null), async (e) => {
   let t = e.get("auth");
   // Subtree-scoped like /api/ledger: a caller sees approvals for its own grant and
   // its descendants; the root sees the whole tenant.
+  // A pending deploy's intent carries its env values; readers get the names only.
   return e.json({
-    approvals:
+    approvals: (
       await sql`WITH RECURSIVE sub AS (SELECT id FROM grants WHERE id = ${t.row.id} UNION ALL SELECT g.id FROM grants g JOIN sub ON g.parent = sub.id)
-      SELECT * FROM approvals WHERE tenant = ${t.tenant.id} AND grant_id IN (SELECT id FROM sub) ORDER BY created_at DESC LIMIT 100`,
+      SELECT * FROM approvals WHERE tenant = ${t.tenant.id} AND grant_id IN (SELECT id FROM sub) ORDER BY created_at DESC LIMIT 100`
+    ).map(withRedactedIntent),
   });
 });
 app.post("/api/approvals/:id", requireGrant(null), async (e) => {
@@ -244,13 +245,15 @@ app.post("/api/approvals/:id", requireGrant(null), async (e) => {
     return e.json({ id: ap.id, status: "denied" });
   }
   // Approved: run the exact intent the agent asked for, under the agent's own grant —
-  // which must still be live. The kill switch stops approved actions too.
+  // which must still be live, and so must every grant above it (grants.js, endedAbove: this
+  // path does not come through verifyGrant, and a deploy is created before it is charged).
+  // The kill switch stops approved actions too.
   let fail = async (reason) => {
     await sql`UPDATE approvals SET status = 'failed', result = ${{ reason }}::jsonb WHERE id = ${ap.id}`;
     throw new HttpError(409, reason);
   };
   if (await isKillSwitchOn()) await fail("kill_switch_on");
-  if (!g || g.status !== "active" || Number(g.exp) <= nowSec()) await fail("requesting_grant_not_active");
+  if (!g || g.status !== "active" || Number(g.exp) <= nowSec() || (await endedAbove(sql, g.id))) await fail("requesting_grant_not_active");
   let tenant = await getTenant(g.tenant),
     intent = parseJson(ap.intent),
     result;
@@ -365,4 +368,11 @@ app.get("/api/hosts/:id", requireGrant(null), async (e) => {
     live: rows.slice(1).filter((g) => g.status === "active" && Number(g.exp) > now).length,
     pendingApprovals: pending,
   });
+});
+
+// Receipt readers have the same grant-subtree boundary as the monetary ledger.
+// Anonymous/authentication failures are visible only to the operator endpoint.
+app.get("/api/tool-receipts", requireGrant("ledger.read"), async (e) => {
+  const auth = e.get("auth");
+  return e.json({ receipts: await readToolReceipts(auth, 200) });
 });

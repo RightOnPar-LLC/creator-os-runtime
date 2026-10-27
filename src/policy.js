@@ -115,6 +115,36 @@ export var remainingBudget = (e) =>
     subtractUsage(normalizeUsage(parseJson(e.budget)), normalizeUsage(parseJson(e.reserved))),
     normalizeUsage(parseJson(e.settled)),
   );
+// The owner's rule (2026-10-09 UTC): a key that an AGENT hands to a sub-agent lives 24 hours at
+// most. "An agent" is any issuing key that is not the tenant's own root key (depth >= 1).
+// The tier's maxTtlSec still bounds what the owner's root key may issue; a child can never
+// outlive its parent either way, so when a grant is up everything under it is up too.
+export var AGENT_ISSUED_MAX_TTL_SEC = 86400;
+// When a payment hold that asked for a time ends. `limit` is the latest end the limits allow
+// at `now`: now + the tier's longest lifetime, or the payer key's end, whichever is sooner.
+// The hold ends at exactly the time asked. If the limits would end it sooner (or cannot be
+// read), the answer is null and the caller must refuse: a hold is never cut short. A time less
+// than a minute from `now` ends later than asked: at the minute every key gets, or at the
+// limit if that comes first.
+export var holdExpiry = (heldUntil, now, limit) =>
+  limit >= heldUntil ? Math.max(heldUntil, Math.min(limit, now + 60)) : null;
+// Tours (tours.js): more time for an agent without a longer key. The owner's numbers (2026-10-09):
+// one signature opens or extends a tour by at most 7 days; a tour lasts at most 30 days in all, then
+// it needs opening afresh; a tour nobody has renewed for 48 hours is finished.
+export var TOUR_MAX_SIGNED_SEC = 7 * 86400;
+export var TOUR_MAX_TOTAL_SEC = 30 * 86400;
+export var TOUR_IDLE_END_SEC = 48 * 3600;
+// A renewed key's old copy may still arrive for calls already in flight; later than this it means
+// a second copy of the key exists, and the tour freezes.
+export var TOUR_REUSE_GRACE_SEC = 120;
+// No faster than this between renewals of one tour (each one cancels a key and issues another).
+export var TOUR_RENEW_MIN_GAP_SEC = 60;
+// A key that a renewal replaced, presented again, is looked into (the alarm, tours.js) at most this many times
+// a minute. Honest calls that were in flight at a renewal are a handful; more is somebody hammering a dead key.
+export var TOUR_ALARM_MAX_PER_MIN = 10;
+// An extension must add at least this much, or it is refused as being at the limit already (so a
+// tour at its limit cannot be nudged a second at a time, one receipt per second).
+export var TOUR_MIN_EXTEND_SEC = 3600;
 export var memoryPartitions = (e) => e.memory?.partitions ?? [""];
 // A scope prefix covers a partition only at a real boundary: exact match, the
 // empty prefix (root wildcard), a prefix that already ends in a separator, or

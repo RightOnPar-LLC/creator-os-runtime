@@ -6,11 +6,14 @@ import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "./db.js";
 import { parseGrantToken, signGrantToken } from "./tokens.js";
 import { AUTONOMY_LEVELS, DEFAULT_AUTONOMY, autonomyOf, lowerCheck, parseAutonomy } from "./autonomy.js";
 import { hireSub, hireViolation } from "./hostpolicy.js";
+import { TOUR_RENEWED, tourKeyReused } from "./tours.js";
 import {
   addUsage,
+  AGENT_ISSUED_MAX_TTL_SEC,
   attenuationViolations,
   CAPS,
   clampConstraints,
+  holdExpiry,
   memoryPartitions,
   normalizeUsage,
   remainingBudget,
@@ -90,6 +93,12 @@ export async function mintRootGrant(e, t = "tenant:root") {
 // the only way a code.write grant is issued, and the hash is bound into the grant's
 // scope (scope.code.filesSha256) so whatever honours code.write can check that the
 // bytes being written are the bytes that were diagnosed.
+// A lifetime must be a number. A non-number used to reach the database as NaN and answer 500.
+var ttlOf = (e) => {
+  let t = Number(e ?? 3600);
+  if (!Number.isFinite(t)) throw Object.assign(Error("ttl_invalid"), { status: 400 });
+  return t;
+};
 export async function issueChildGrant(e, t, a, w = {}) {
   let n = await getTenant(e.tenant);
   if (!n)
@@ -99,10 +108,31 @@ export async function issueChildGrant(e, t, a, w = {}) {
   let r = TIERS[n.tier],
     s = parseJson(e.scope),
     i = parseJson(e.constraints),
-    o = Math.min(Math.max(60, Math.floor(t.ttlSec ?? 3600)), r.maxTtlSec),
+    // A key handed out BY AN AGENT (any issuer that is not the tenant's root key) lives
+    // 24 hours at most, whatever the tier allows the owner (policy.js). An escrow custodian
+    // (w.escrow) is not an agent being handed a key: it holds value until the deadline the
+    // payer chose, so its lifetime is left alone (cutting it would refund the payer early
+    // and leave a later, valid delivery unpaid).
+    o = Math.min(Math.max(60, Math.floor(ttlOf(t.ttlSec))), r.maxTtlSec, Number(e.depth) >= 1 && !w?.escrow ? AGENT_ISSUED_MAX_TTL_SEC : Infinity),
     l = nowSec(),
-    c = Math.min(l + o, Number(e.exp)),
-    E = {
+    c = Math.min(l + o, Number(e.exp));
+  // A payment hold that asked for a time (w.heldUntil, from openEscrow) ends at exactly that
+  // time and is never cut short. buildEscrow has already refused a time past the payer key's
+  // end or the tier's longest lifetime, but it read the tier before this function did. This is
+  // the last word, on the tier (`r`) and the clock (`l`) read just above: if the tier moved in
+  // between, the hold is refused here, not shortened. Only openEscrow sets heldUntil, always
+  // to a whole number (0 = nothing asked); anything unreadable is treated as nothing asked.
+  let heldUntil = w?.escrow ? Number(w.heldUntil) || 0 : 0;
+  if (heldUntil) {
+    let limit = Math.min(l + r.maxTtlSec, Number(e.exp)),
+      end = holdExpiry(heldUntil, l, limit);
+    if (end === null)
+      throw Number(e.exp) < heldUntil
+        ? new HttpError(409, "escrow_deadline_exceeds_payer_key", { payer_exp: Number(e.exp) })
+        : new HttpError(409, "escrow_deadline_exceeds_tier_max", { max_ttl_sec: r.maxTtlSec, latest_deadline: limit });
+    c = end;
+  }
+  let E = {
       railway: {
         projects: t.scope?.railway?.projects ?? s.railway?.projects ?? [],
         environments: t.scope?.railway?.environments ?? s.railway?.environments ?? [],
@@ -124,6 +154,9 @@ export async function issueChildGrant(e, t, a, w = {}) {
       // data annotation, not authority (attenuationViolations ignores it and the
       // custodian's only cap is the no-op escrow.hold), so it never widens the child.
       ...(w?.escrow ? { escrow: w.escrow } : {}),
+      // tours (tours.js): the mark on a tour's HOLDING grant. Like escrow it is an annotation, not
+      // authority; it is how verifyGrant knows this grant is a record and never a credential.
+      ...(w?.tour ? { tour: w.tour } : {}),
     },
     T = normalizeUsage(t.budget ?? zeroUsage()),
     R = clampConstraints(t.constraints ?? {}, i),
@@ -182,7 +215,10 @@ export async function issueChildGrant(e, t, a, w = {}) {
   return (
     await sql.begin(async (H) => {
       let P = (await H`SELECT * FROM grants WHERE id = ${e.id} FOR UPDATE`)[0];
-      if (!P || P.status !== "active")
+      // This check, made while the parent is locked, is what revokeGrantTree leans on: once it has moved a grant
+      // from active, nothing more can be issued under that grant. (endedAbove: nor under one that hangs from a
+      // grant that has ended.)
+      if (!P || P.status !== "active" || (await endedAbove(H, P.id)))
         throw Object.assign(Error("parent_not_active"), {
           status: 403,
         });
@@ -216,32 +252,245 @@ export async function issueChildGrant(e, t, a, w = {}) {
     }
   );
 }
+// What a grant has NOT used, which is what goes back to its parent when it ends: what it was given, less
+// what it settled itself, less what is still held on it for the keys under it. Once those keys have
+// ended, what is still held IS what they used. So a key's spend counts against every grant above it, all
+// the way up. (Before 2026-10-09 the last term was missing: spend two levels down was forgotten the
+// moment the grant in between ended, and the grant above got its whole budget back.)
+function unusedOf(g, heldNow) {
+  let u = subtractUsage(subtractUsage(normalizeUsage(parseJson(g.budget)), normalizeUsage(parseJson(g.settled))), normalizeUsage(parseJson(heldNow)));
+  return { usd_cents: Math.max(0, u.usd_cents), calls: Math.max(0, u.calls), deploys: Math.max(0, u.deploys) };
+}
+// DEFENCE IN DEPTH: a grant is only as alive as everything above it. Cancelling a grant cancels everything under
+// it (revokeGrantTree), and a grant that runs out waits for the keys under it, so an ACTIVE grant under one that
+// has ended is not a state this code means to leave. Where one exists it must not work. Three ways one can exist:
+// a row left by the gap revokeGrantTree had until 2026-10-09; a hold opened with another hold's own token before
+// buildEscrow refused a hold as payer (the same day), once the hold above it has ended; a mistake still to be made.
+// "Ended" is any status but active: cancelled, run out, captured.
+//
+// WHO LOOKS: verifyGrant (every request that carries a key), settleGrantUsage, issueChildGrant, the owner's
+// approval of a request the grant filed (routes/grants.js), the OAuth refresh and the admin's token reissue
+// (neither hands out a fresh token for it). WHO DOES NOT: captureEscrow, on purpose. A hold under an ended grant
+// can still be captured on a signed delivery receipt; see the note there.
+//
+// ONE walk, used by all of them: grantAndChain reads a grant's row and, in the SAME statement, whether any grant
+// above it has ended. The walk goes up the parent chain, one primary-key look-up per step and at most as many
+// steps as the tier's maxDepth (6 today). `parent` is written once, when a row is made, and points at a row that
+// already exists, so the chain cannot loop. On the verify path this is the read verifyGrant made anyway, so the
+// walk costs no extra round trip to the database. `q` is what to read with: the write paths pass their own
+// transaction, so that they look AFTER they hold their own row's lock.
+async function grantAndChain(q, id) {
+  let row = (
+    await q`WITH RECURSIVE up AS (SELECT p.id, p.parent, p.status FROM grants c JOIN grants p ON p.id = c.parent WHERE c.id = ${id}
+        UNION ALL SELECT p.id, p.parent, p.status FROM grants p JOIN up ON p.id = up.parent)
+      SELECT g.*, (SELECT up.id FROM up WHERE up.status <> 'active' LIMIT 1) AS ended_above FROM grants g WHERE g.id = ${id}`
+  )[0];
+  if (!row) return { row: null, endedAbove: null };
+  let { ended_above, ...grant } = row;
+  return { row: grant, endedAbove: ended_above ?? null };
+}
+// The id of an ended grant above `id`, or null.
+export async function endedAbove(q, id) {
+  return (await grantAndChain(q, id)).endedAbove;
+}
+// THE COUNT, for the admin (GET /api/admin/grants/orphans). It reads the whole table and changes nothing: no
+// row is written and none is locked. Two lists, each from one statement (so they are a moment apart).
+//
+// LEFT: every grant that is still active with an ended grant somewhere above it. That is what the door refuses
+// one key at a time (grantAndChain); this finds them all at once. ONE walk, DOWN from the roots: each grant is
+// reached once, by way of its parent, and carries two things with it: the nearest grant above it that has ended
+// (`ended_above`; "ended" is the door's own test, any status but active) and the nearest above it that is still
+// active (`active_above`). A grant whose end has passed but which the sweep has not yet taken is counted apart
+// (`past_exp`): it is the same leftover, a moment before it lets go. `hold` marks a payment hold. `holds_under`
+// is how many payment holds that are still open sit anywhere under the grant, counted the way a cancel would
+// reach them: down through grants of ANY status (a cancel of the grant cancels, and so refunds, every one).
+//
+// WITHHELD: budget still held above an ended grant because something under it let go only AFTER it had. A grant
+// that ends gives back unusedOf(its row then). A key the cancel missed was still holding its whole budget on
+// that row, so the grant gave back that much less; when the key ends later, what it gives back lands on a grant
+// that has already let go, and nothing passes it on. Read: every ended grant that (1) has a 'release' row of
+// its own and (2) has a 'release' row written INTO it after its own first one. Without (2) a grant is not read,
+// whatever its row says. For each, three figures:
+//   gave_back            all its own 'release' rows together
+//   would_give_back_now  unusedOf on its row as it is now
+//   never_used           its budget, less everything really used at or under it: what it settled, what every
+//                        ended grant under it settled, and the WHOLE budget of any key under it that is still
+//                        active (that budget is still out)
+// `short` is the lesser of the last two, less gave_back, never below 0; the grant is listed when `short` is not
+// 0, and `to` is the grant that is holding it. WHY THE LESSER: the row can say more than is true. The sum used
+// before 2026-10-09 (budget less settled, whatever was held) gave back what the keys under a grant had USED as
+// well, so a key that let go under that sum leaves too little held on the grant above it. (An older service on
+// that sum read this same database until 2026-10-09 about 19:20 UTC, so such a release can be later than a
+// release under today's sum.) never_used does not depend on what is held on any row. With it, taking `short` off
+// what `to` holds never leaves `to` holding less for this grant than was really used under it.
+// A grant that itself ended under the old sum gave back at least what unusedOf says, so it is never listed:
+// nothing is held above for it. If `to` has ended too, then lowering what is held on it by `short` makes IT a
+// grant that is read, for what it owes the grant above it: the lowest grant first, then the one above.
+// EVERY grant that fits (1) and (2) is read and the sum is done on each before anything is cut to `limit`: the
+// lowest come first, and many of those owe nothing, so cutting first could hide the ones that do.
+export async function grantsLeftUnderEnded({ limit = 500 } = {}) {
+  let now = nowSec(),
+    left = await sql`WITH RECURSIVE down AS (
+        SELECT g.id, g.status, NULL::text AS ended_above, NULL::text AS ended_status, NULL::text AS active_above FROM grants g WHERE g.parent IS NULL
+        UNION ALL SELECT c.id, c.status,
+          CASE WHEN d.status <> 'active' THEN d.id ELSE d.ended_above END,
+          CASE WHEN d.status <> 'active' THEN d.status ELSE d.ended_status END,
+          CASE WHEN d.status = 'active' THEN d.id ELSE d.active_above END
+        FROM grants c JOIN down d ON c.parent = d.id),
+      open_hold AS (
+        SELECT h.id AS hold, h.parent AS above FROM grants h WHERE h.status = 'active' AND (h.scope->'escrow') IS NOT NULL AND h.parent IS NOT NULL
+        UNION ALL SELECT o.hold, g.parent FROM open_hold o JOIN grants g ON g.id = o.above WHERE g.parent IS NOT NULL),
+      hit AS (SELECT g.id, g.tenant, g.parent, g.depth, g.sub, g.exp, g.budget, g.settled, g.reserved, (g.scope->'escrow') IS NOT NULL AS hold,
+          (SELECT count(*) FROM open_hold o WHERE o.above = g.id)::int AS holds_under,
+          d.ended_above, d.ended_status, d.active_above, (g.exp > ${now}) AS live
+        FROM down d JOIN grants g ON g.id = d.id WHERE d.status = 'active' AND d.ended_above IS NOT NULL)
+      SELECT hit.*, (count(*) FILTER (WHERE live) OVER ())::int AS n_live, (count(*) FILTER (WHERE NOT live) OVER ())::int AS n_past
+      FROM hit ORDER BY live DESC, depth, id LIMIT ${limit}`,
+    late = await sql`WITH RECURSIVE cand AS (
+        SELECT g.id, g.tenant, g.parent, g.depth, g.status, g.budget, g.settled, g.reserved, p.status AS parent_status,
+          own.usd_cents, own.calls, own.deploys, own.times
+        FROM grants g JOIN grants p ON p.id = g.parent
+        JOIN (SELECT grant_id, min(id) AS first_id, sum(usd_cents)::float8 AS usd_cents, sum(calls)::float8 AS calls, sum(deploys)::float8 AS deploys, count(*)::int AS times
+            FROM ledger WHERE kind = 'release' GROUP BY grant_id) own ON own.grant_id = g.id
+        JOIN (SELECT parent, max(id) AS last_id FROM ledger WHERE kind = 'release' AND parent IS NOT NULL GROUP BY parent) under
+          ON under.parent = g.id AND under.last_id > own.first_id
+        WHERE g.status <> 'active'),
+      below AS (
+        SELECT c.id AS top, g.id, g.status, g.budget, g.settled FROM cand c JOIN grants g ON g.parent = c.id
+        UNION ALL SELECT b.top, g.id, g.status, g.budget, g.settled FROM below b JOIN grants g ON g.parent = b.id WHERE b.status <> 'active')
+      SELECT cand.*, (SELECT coalesce(jsonb_agg(jsonb_build_object('status', b.status, 'budget', b.budget, 'settled', b.settled)), '[]'::jsonb)
+          FROM below b WHERE b.top = cand.id) AS under_it
+      FROM cand ORDER BY cand.depth DESC, cand.id`,
+    usage = (j) => normalizeUsage(parseJson(j)),
+    notBelowZero = (u) => ({ usd_cents: Math.max(0, u.usd_cents), calls: Math.max(0, u.calls), deploys: Math.max(0, u.deploys) }),
+    withheld = [],
+    total = zeroUsage();
+  for (let g of late) {
+    let gave = normalizeUsage(g),
+      would = unusedOf(g, g.reserved),
+      used = usage(g.settled);
+    // A key that is still active counts with its whole budget, and nothing under it is looked at (the walk above
+    // stops there): whatever is under it comes out of that budget.
+    for (let b of parseJson(g.under_it)) used = addUsage(used, usage(b.status === "active" ? b.budget : b.settled));
+    let neverUsed = notBelowZero(subtractUsage(usage(g.budget), used)),
+      most = { usd_cents: Math.min(would.usd_cents, neverUsed.usd_cents), calls: Math.min(would.calls, neverUsed.calls), deploys: Math.min(would.deploys, neverUsed.deploys) },
+      short = notBelowZero(subtractUsage(most, gave));
+    if (!short.usd_cents && !short.calls && !short.deploys) continue;
+    total = addUsage(total, short);
+    withheld.push({ id: g.id, tenant: g.tenant, status: g.status, to: g.parent, to_status: g.parent_status, gave_back: gave, releases: g.times, would_give_back_now: would, never_used: neverUsed, short });
+  }
+  return {
+    now,
+    counts: { live: left[0]?.n_live ?? 0, past_exp: left[0]?.n_past ?? 0, withheld: withheld.length },
+    orphans: left.map((g) => ({
+      id: g.id,
+      tenant: g.tenant,
+      parent: g.parent,
+      depth: Number(g.depth),
+      sub: g.sub,
+      exp: Number(g.exp),
+      live: !!g.live,
+      hold: !!g.hold,
+      holds_under: Number(g.holds_under),
+      ended_above: g.ended_above,
+      ended_status: g.ended_status,
+      active_above: g.active_above,
+      budget: usage(g.budget),
+      settled: usage(g.settled),
+      reserved: usage(g.reserved),
+    })),
+    withheld: withheld.slice(0, limit),
+    withheld_total: total,
+    // `limit` cuts the two lists that are shown and nothing else: every count, and the total, is of the whole table.
+    truncated: { orphans: (left[0]?.n_live ?? 0) + (left[0]?.n_past ?? 0) > left.length, withheld: withheld.length > limit },
+    limit,
+  };
+}
+// When two transactions each hold a row the other wants, Postgres ends the wait after about a second by
+// aborting ONE of them (SQLSTATE 40P01, "deadlock detected"); everything that one had done is rolled back.
+// Bun.SQL carries the SQLSTATE in `errno`.
+const isDeadlock = (err) => String(err?.errno ?? err?.code ?? "") === "40P01" || /deadlock detected/i.test(String(err?.message || ""));
+// How often a cancel is tried in all when it keeps losing such a wait. Each lost try costs about a second.
+const CANCEL_TRIES = 3;
+// Cancel a grant and everything under it. Answers the ids it really moved from active, lower ones first.
+//
+// EVERYTHING UNDER IT, including what is written while this runs. The list read at the start locks nothing (the
+// FOR UPDATE that used to sit on it was on a WITH query, which Postgres does not lock), so a child can be issued
+// under a grant after the list was read and before that grant is taken. Until 2026-10-09 such a child was missed:
+// it stayed live under a cancelled parent and its whole budget stayed held on the grant above for good. Now each
+// grant is taken in ONE statement, and from that moment nothing can be issued under it: issueChildGrant locks its
+// parent and refuses one that is not active, so it either finished before the grant was taken or is refused after.
+// So right after taking a grant its active children are listed AGAIN, each is cancelled the same way (and its
+// children, and so on down), and only then is what is held on the grant read for its own release.
+// ONE LIMIT: that second look goes down through ACTIVE children only. A key under a child that was written and
+// ALSO ended while this ran is not reached. That takes a writer that ends a grant while something under it is
+// still active, and none does: the sweep and a capture wait until nothing is, and another cancel makes this
+// same look. (Until 2026-10-09 a capture did not wait, and a hold could open a hold under itself.)
+// (This leans on READ COMMITTED, the level Postgres runs at unless told otherwise and the one this service uses:
+// each statement sees everything committed before it began, so the second look sees a key whose issue finished
+// while the statement before it was waiting for the parent's lock.)
+//
+// LOCKS. Inside its one transaction this holds a grant, and the parent it released into, while it asks for the
+// next one: the next sibling, or a child found by the second look. Every other transaction that takes two grants
+// (the sweep and the lazy release below, captureEscrow) takes a child and then its parent. So this and one of
+// those, or two cancels over the same grants, can each end up holding what the other wants. (So can this and
+// lowerGrantAutonomy, whose one UPDATE takes a subtree's rows in no promised order.) Postgres aborts one side; no
+// balance moves, because that side's whole transaction is undone. When the side aborted is this one it simply
+// starts again: nothing of the failed try is left, the list is read afresh and a grant that somebody else ended
+// in the meantime is not moved again (it is still looked under). The fixed order (depth, then id) keeps two cancels that both LISTED the same two
+// grants of one depth from taking them in opposite orders. It does not rule the other cycles out (not even that
+// one, when one of the two cancels finds a grant only by its second look); the retry is what covers those.
 export async function revokeGrantTree(e, t, a) {
   let n = [];
-  if (
-    (await sql.begin(async (r) => {
-      let s = await r`WITH RECURSIVE sub AS (SELECT * FROM grants WHERE id = ${e}
-      UNION ALL SELECT g.* FROM grants g JOIN sub ON g.parent = sub.id) SELECT * FROM sub ORDER BY depth DESC FOR UPDATE`;
-      for (let i of s) {
-        if (i.status !== "active") continue;
-        await r`UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = ${t} WHERE id = ${i.id}`;
-        let o = subtractUsage(normalizeUsage(parseJson(i.budget)), normalizeUsage(parseJson(i.settled)));
-        if (i.parent) {
-          let l = (await r`SELECT reserved FROM grants WHERE id = ${i.parent} FOR UPDATE`)[0],
-            c = subtractUsage(normalizeUsage(parseJson(l.reserved)), o);
-          (await r`UPDATE grants SET reserved = ${{
-            usd_cents: Math.max(0, c.usd_cents),
-            calls: Math.max(0, c.calls),
-            deploys: Math.max(0, c.deploys),
-          }}::jsonb WHERE id = ${i.parent}`,
-            await r`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
-          VALUES (${i.tenant}, ${i.id}, ${i.parent}, 'release', ${o.usd_cents}, ${o.calls}, ${o.deploys}, ${i.id}, ${t})`);
-        }
-        n.push(i.id);
-      }
-    }),
-    n.length)
-  ) {
+  for (let attempt = 1; ; attempt++) {
+    n = [];
+    try {
+      await sql.begin(async (r) => {
+        const cancel = async (id) => {
+          // Only the caller that really moves the row from active lets it go (a sweep may have got there first:
+          // never release twice), and what it gives back is worked out from the row AS IT IS NOW (a settle may have
+          // landed, and the grants under it have let go, since the list was read).
+          let i = (await r`UPDATE grants SET status = 'revoked', revoked_at = now(), revoke_reason = ${t} WHERE id = ${id} AND status = 'active' RETURNING *`)[0];
+          // The second look: children issued since the list was read. Nothing can be added under this grant now.
+          // It is made ALSO when this call did not move the grant, because somebody else ended it first. Every
+          // writer that ends a grant means to leave nothing active under it (the sweep and a capture wait until
+          // nothing is; another cancel makes this same look), so this finds something only if one of them ever
+          // does not. Either way the grant is no longer active, so nothing more can be issued under it and one
+          // look is enough.
+          let late = await r`SELECT id FROM grants WHERE parent = ${id} AND status = 'active' ORDER BY id`;
+          for (let child of late) await cancel(child.id);
+          if (!i) return; // not this call's to let go
+          // What is held on it. This transaction has had the row locked since the statement above, so the only
+          // thing that can have changed it since is a release made just now by one of those late children.
+          let held = late.length ? (await r`SELECT reserved FROM grants WHERE id = ${id}`)[0].reserved : i.reserved,
+            o = unusedOf(i, held);
+          if (i.parent) {
+            let l = (await r`SELECT reserved FROM grants WHERE id = ${i.parent} FOR UPDATE`)[0],
+              c = subtractUsage(normalizeUsage(parseJson(l.reserved)), o);
+            (await r`UPDATE grants SET reserved = ${{
+              usd_cents: Math.max(0, c.usd_cents),
+              calls: Math.max(0, c.calls),
+              deploys: Math.max(0, c.deploys),
+            }}::jsonb WHERE id = ${i.parent}`,
+              await r`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
+            VALUES (${i.tenant}, ${i.id}, ${i.parent}, 'release', ${o.usd_cents}, ${o.calls}, ${o.deploys}, ${i.id}, ${t})`);
+          }
+          n.push(i.id);
+        };
+        // Deepest first, so that by the time a grant is reached everything under it that was in this list has let
+        // go. The list walks down through grants of any status, so an active grant under one that has already
+        // ended is cancelled too.
+        let s = await r`WITH RECURSIVE sub AS (SELECT id, depth FROM grants WHERE id = ${e}
+        UNION ALL SELECT g.id, g.depth FROM grants g JOIN sub ON g.parent = sub.id) SELECT id FROM sub ORDER BY depth DESC, id`;
+        for (let { id } of s) await cancel(id);
+      });
+      break;
+    } catch (err) {
+      if (!isDeadlock(err) || attempt >= CANCEL_TRIES) throw err;
+      await new Promise((go) => setTimeout(go, 15 * attempt + Math.random() * 25)); // let the other side finish
+    }
+  }
+  if (n.length) {
     let r = await getGrant(e);
     await recordEvent(
       "grant.revoked",
@@ -262,7 +511,8 @@ export async function revokeGrantTree(e, t, a) {
 export async function settleGrantUsage(e, t, a, n, k = "settle", m = {}) {
   await sql.begin(async (r) => {
     let s = (await r`SELECT * FROM grants WHERE id = ${e} FOR UPDATE`)[0];
-    if (!s || s.status !== "active")
+    // (endedAbove: nor does a grant settle when one above it has ended.)
+    if (!s || s.status !== "active" || (await endedAbove(r, s.id)))
       throw Object.assign(Error("grant_not_active"), {
         status: 401,
       });
@@ -330,17 +580,26 @@ export async function lowerGrantAutonomy(caller, targetId, level) {
   await recordEvent("grant.autonomy_lowered", { id: targetId, from: current, to: next, cascaded: changed.length }, t.tenant, caller.sub);
   return { id: targetId, from: AUTONOMY_LEVELS[current], to: AUTONOMY_LEVELS[next], grantsChanged: changed.length };
 }
-// Release a child grant's UNSPENT reservation (budget - settled, the same amount
-// revokeGrantTree computes) back to its parent when it transitions active->expired.
-// The `RETURNING id` length guard is the idempotency lever: only the call that
+// Release a grant's UNUSED reservation (unusedOf: budget - settled - what is still held on it for the keys
+// under it; the same amount revokeGrantTree computes) back to its parent when it transitions active->expired.
+// The `RETURNING` row-count guard is the idempotency lever: only the call that
 // actually flips the row releases, so a second sweep, the lazy verify path, and a
 // later revoke can never double-credit the parent. Mirrors revokeGrantTree's
 // release (same math, same 'release' ledger row).
 async function releaseExpiredGrant(tx, g) {
-  let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING id`;
+  // A grant lets go only AFTER everything under it has. Until then what is held on it is not yet "what the keys
+  // under it used", so it waits: the sweep goes deepest first, and a child never outlives its parent, so anything
+  // still active under an expired grant is itself due for the sweep (this pass, or the next if another writer held
+  // it). This only LOOKS at the children; it never locks one. The transaction holds one grant and then its parent
+  // and nothing else: child, then parent. (revokeGrantTree holds a parent while it asks for one of that parent's
+  // children, so this and a cancel can each hold what the other wants. Postgres then aborts one of the two
+  // without changing any balance: see the notes above revokeGrantTree and reapExpiredGrants.)
+  let waiting = await tx`SELECT 1 FROM grants WHERE parent = ${g.id} AND status = 'active' LIMIT 1`;
+  if (waiting.length) return !1;
+  let flipped = await tx`UPDATE grants SET status='expired' WHERE id = ${g.id} AND status='active' RETURNING reserved`;
   if (flipped.length !== 1) return !1; // someone else already moved it (revoked/expired) — never double-release
   if (!g.parent) return !0; // a root holds no reservation upward
-  let unspent = subtractUsage(normalizeUsage(parseJson(g.budget)), normalizeUsage(parseJson(g.settled))),
+  let unspent = unusedOf(g, flipped[0].reserved),
     p = (await tx`SELECT reserved FROM grants WHERE id = ${g.parent} FOR UPDATE`)[0];
   if (p) {
     let c = subtractUsage(normalizeUsage(parseJson(p.reserved)), unspent);
@@ -366,27 +625,55 @@ async function releaseExpiredGrant(tx, g) {
 // issueChildGrant, or a second replica's sweep, and Postgres would abort one side on
 // a real deadlock. Now: an UNLOCKED candidate scan (deepest first, so a child is
 // released before its parent), then each release in its OWN txn that locks the child
-// then its parent — the same child→parent order every other writer takes. A
-// single-grant txn's lock footprint is one grant + its parent, and a wait-for cycle
-// among such txns would require a cycle in the parent pointers, which a tree has none
-// of; every other writer that touches both rows also takes child-before-parent (or
-// the parent alone), so no writer ever holds a parent while requesting its child.
-export async function reapExpiredGrants({ limit = 500 } = {}) {
+// then its parent. A single-grant txn's lock footprint is one grant + its parent, and
+// a wait-for cycle among such txns alone would require a cycle in the parent pointers,
+// which a tree has none of. The lazy release in verifyGrant and captureEscrow take the
+// same two rows in the same order, and issueChildGrant and settleGrantUsage take one
+// row only, so none of those can cycle with a sweep txn.
+//
+// TWO WRITERS ARE DIFFERENT (corrected 2026-10-09; this note used to say that no writer
+// holds a parent while requesting its child):
+//   - revokeGrantTree: in its one txn it holds the parent it has just released into
+//     while it asks for the next sibling, or for a child issued while it ran;
+//   - lowerGrantAutonomy: its one UPDATE over a subtree takes those rows one after
+//     another, in no promised order.
+// So one of them can hold a parent and want child 2 while a sweep txn holds child 2
+// and wants that parent. They wait on each other until Postgres aborts one (40P01,
+// after about a second). No balance moves: the aborted txn is rolled back whole. A
+// cancel that is aborted tries again (revokeGrantTree); a dial-lowering that is
+// aborted fails that one request. If a sweep txn is the one aborted, that ONE
+// candidate is left for the next pass: each candidate is caught on its own below, so
+// one failure no longer ends the pass and leaves every later candidate waiting a
+// further minute.
+//
+// ANY failure of one candidate is caught, not only a lost lock wait: a candidate that
+// can never be released must not hold up every one after it, pass after pass (there
+// is no "stop after so many" for the same reason). It is not hidden: the pass says
+// what it left, in ONE log line, and in `failed` for a caller that passes a list (the
+// admin route puts it in its answer).
+export async function reapExpiredGrants({ limit = 500, failed = [] } = {}) {
   let candidates = await sql`SELECT id FROM grants WHERE status='active' AND exp <= ${nowSec()} ORDER BY depth DESC LIMIT ${limit}`,
     ids = [];
   for (let { id } of candidates) {
-    // Re-check status/exp UNDER the lock — the candidate scan was unlocked, so the
-    // row may have been revoked/settled/re-issued since. SKIP LOCKED (not a blocking
-    // wait): if another writer already holds this row, skip it this pass — the next
-    // sweep catches it, or that writer releases it — rather than queue behind them.
-    let reaped = await sql.begin(async (tx) => {
-      let g = (
-        await tx`SELECT * FROM grants WHERE id = ${id} AND status='active' AND exp <= ${nowSec()} FOR UPDATE SKIP LOCKED`
-      )[0];
-      return g ? await releaseExpiredGrant(tx, g) : !1;
-    });
-    if (reaped) ids.push(id);
+    try {
+      // Re-check status/exp UNDER the lock — the candidate scan was unlocked, so the
+      // row may have been revoked/settled/re-issued since. SKIP LOCKED (not a blocking
+      // wait): if another writer already holds this row, skip it this pass — the next
+      // sweep catches it, or that writer releases it — rather than queue behind them.
+      let reaped = await sql.begin(async (tx) => {
+        let g = (
+          await tx`SELECT * FROM grants WHERE id = ${id} AND status='active' AND exp <= ${nowSec()} FOR UPDATE SKIP LOCKED`
+        )[0];
+        return g ? await releaseExpiredGrant(tx, g) : !1;
+      });
+      if (reaped) ids.push(id);
+    } catch (err) {
+      // Nothing of this candidate's txn is left, so it is exactly as it was: still due, taken by the next pass. A
+      // grant above it in this pass sees it still active and waits for it (releaseExpiredGrant).
+      failed.push({ id, error: String(err?.message || err).slice(0, 200) });
+    }
   }
+  if (failed.length) console.error(`[reaper] ${failed.length} of ${candidates.length} left for the next pass; the first: ${failed[0].id} (${failed[0].error})`);
   if (ids.length) await recordEvent("grant.reaped", { ids }, null, "reaper");
   return ids;
 }
@@ -417,15 +704,24 @@ export async function verifyGrant(e, t, a, countRate = !0) {
     if (Number(r.exp) <= nowSec()) {
       // lazy release: a re-presented expired token frees its reservation now, via
       // the SAME helper the sweep uses (idempotent — the RETURNING guard means the
-      // sweep won't release it again).
+      // sweep won't release it again). If a key under it is still waiting for the
+      // sweep, nothing is freed here: the sweep takes both, lower one first.
       await sql.begin(async (tx) => {
         let g = (await tx`SELECT * FROM grants WHERE id = ${r.id} FOR UPDATE`)[0];
-        if (g) await releaseExpiredGrant(tx, g);
+        // The ROW's end decides, not the token's: a tour's holding grant can be extended after its token text
+        // was written (tours.js), and an old token for it must not end it early.
+        if (g && Number(g.exp) <= nowSec()) await releaseExpiredGrant(tx, g);
       });
       throw new HttpError(401, "grant_expired");
     }
-    let s = await getGrant(r.id);
+    let { row: s, endedAbove: above } = await grantAndChain(sql, r.id);
+    // A key that a tour renewal already replaced, presented again: the alarm (tours.js). It answers 401 either way.
+    if (s && s.status === "revoked" && s.revoke_reason === TOUR_RENEWED) await tourKeyReused(s);
     if (!s || s.status !== "active") throw new HttpError(401, "grant_revoked");
+    // Active itself, but a grant above it has ended: as dead as if it had been cancelled with it (endedAbove).
+    if (above) throw new HttpError(401, "grant_revoked", { why: "a grant above this one has ended" });
+    // A tour's holding grant is a record, never a credential, whoever came to hold a token for it.
+    if (parseJson(s.scope)?.tour?.holder) throw new HttpError(401, "holding_grant");
     let i = await getTenant(s.tenant);
     if (!i || i.status !== "active") throw new HttpError(403, "tenant_suspended");
     if (await isKillSwitchOn()) throw new HttpError(503, "runtime_paused");

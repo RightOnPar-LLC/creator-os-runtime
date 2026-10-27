@@ -234,3 +234,29 @@ org repo are unaffected. Lift the guard by populating creator-worker and setting
 - **File:** `live/runtime-0.3.4.bundle.js` — 95,845 bytes, sha256
   `560c0099e861f2b927c129e5907901a89b2109d47609beddd9806eab6cc9b4eb`. Suite 65/65 on source
   and dist. Both services shipped to this bundle (runtime-svc on merge, Function via startCommand API).
+
+## Retiring the Function `runtime` (2026-10-09 → retired 2026-10-14)
+
+`runtime-svc` (https://runtime.meshtool.ai) is the one canonical runtime. It builds `master`
+from `deploy/Dockerfile` once CI passes. The Function `runtime` · `9d9ea993…`
+(https://runtime-production-9d95.up.railway.app) was the original hand-pasted service from the
+September rescue. It now runs a bundle that has drifted from runtime-svc's, and it still costs money.
+Retirement is DW's step, because deleting a service can't be undone.
+
+Read-only check, 2026-10-09, last 7 days: 57 requests to the Function. 21 were `/health`, all 2xx.
+17 were `/mcp`, **all 4xx**, which means some client still points at the old URL and is being
+refused. It has no custom domain. `mcp-gate`'s `RUNTIME_URL` is confirmed as `https://runtime.meshtool.ai`.
+
+1. ✅ `mcp-gate` `RUNTIME_URL` → runtime.meshtool.ai (DW confirmed).
+2. ✅ In-repo defaults (`gate/index.ts`, `live/verify.mjs`) now point at runtime.meshtool.ai,
+   so a missing variable can no longer fall back to the Function.
+3. ⚠ Any claude.ai connector still on `runtime-production-9d95…/mcp` now gets no answer, because
+   the host is gone. Repoint it to `https://runtime.meshtool.ai/mcp`.
+4. — Skipped: the service was deleted before a zero-traffic day was confirmed. That's harmless,
+   because every `/mcp` call it received was already refused (4xx).
+5. ✅ DW deleted the service `runtime` `9d9ea993…` (2026-10-14). The project now holds
+   `runtime-svc`, `mcp-gate`, `lsp-mcp` and `Postgres`. runtime-svc is healthy on #46.
+6. ✅ `_hq` `registry.json` marks it `"retired": true`.
+
+From here, `runtime-production-9d95.up.railway.app` is dead. Any old note in this file that
+names it is history, not a live address.

@@ -14,9 +14,10 @@ import { autonomyOf, decide } from "../autonomy.js";
 app.post("/api/escrow", requireGrant("escrow.hold"), async (e) => {
   let t = e.get("auth"),
     a = await readJsonBody(e);
-  // The autonomy dial: validate first (buildEscrow throws on a bad escrow), so a human
-  // is only ever asked about an escrow that could actually open.
-  buildEscrow(t.row, a);
+  // The autonomy dial: validate first (buildEscrow throws on a bad escrow), so a human is
+  // never asked about a request buildEscrow refuses. Limits that belong to the key itself
+  // (depth, budget left) are still only checked when the hold is issued.
+  buildEscrow(t.row, a, t.tenant.tier);
   let dial = decide(autonomyOf(parseJson(t.row.constraints)), "escrow.open");
   if (dial.decision === "refuse") {
     await recordAutonomyRow(t.row, "autonomy-refused", "escrow", `escrow open refused at autonomy ${dial.levelName}`, {
