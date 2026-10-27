@@ -6,7 +6,7 @@
  * with the newest live/runtime-*.bundle.js here. Exit 0 = same bytes, 1 = drift
  * (live changed and git did not follow — pull it again), 2 = could not check.
  *
- *   node live/verify.mjs [--url https://runtime-production-9d95.up.railway.app]
+ *   node live/verify.mjs [--url https://runtime.meshtool.ai]
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const i = process.argv.indexOf("--url");
-const URL_ = (i > 0 ? process.argv[i + 1] : null) ?? "https://runtime-production-9d95.up.railway.app";
+const URL_ = (i > 0 ? process.argv[i + 1] : null) ?? "https://runtime.meshtool.ai";
 
 const bundles = readdirSync(HERE).filter((f) => /^runtime-.*\.bundle\.js$/.test(f)).sort();
 if (!bundles.length) { console.error("no live/runtime-*.bundle.js to compare"); process.exit(2); }

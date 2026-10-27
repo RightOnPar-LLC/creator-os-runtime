@@ -57,11 +57,70 @@ everything; add one scope block and two terminal statuses.
 
 1. **open** = `issueChildGrant` with `sub=escrow:*`, the `scope.escrow` block, `exp = deadline`.
    Reserve fires → the payer's value is held. Reuse; add scope validation. Ledger `escrow-hold`.
+
+   Who can pay (as built): any key that holds `escrow.hold`, except a hold itself (the autonomy dial
+   still applies: a key at `observe` is refused and one at `ask` is filed for the owner). The custodian's
+   only capability is `escrow.hold` (a marker), and its token goes back to the payer, so a hold's
+   own token would otherwise pass `POST /api/escrow`'s check and pledge the held value a second
+   time. `buildEscrow` refuses it: `403 escrow_custodian_cannot_pay`, before a hold opens or an
+   approval is filed.
+
+   How long it is held (as built, `buildEscrow` in `src/escrow.js`). Every rule is checked before
+   a hold opens or an approval is filed for the owner, and again when an approval is run:
+   - The payer gives `deadline` (unix seconds) or `ttlSec`. With both, the deadline wins. With
+     neither, the hold lasts one hour.
+   - `deadline` absent, `null` or the number `0` means "not given". Anything else must be a time
+     later than now, or the open is refused: `400 escrow_deadline_invalid`. It is never swapped
+     for the default hour.
+   - `ttlSec`, when given, must be a number (or a string that reads as one): else `400 ttl_invalid`.
+   - A time asked for past the payer key's own end is refused: `409 escrow_deadline_exceeds_payer_key`
+     (`detail.payer_exp`). If the payer key's end cannot be read, or is not still ahead, nothing opens.
+   - A time asked for past the tier's longest lifetime is refused the same way:
+     `409 escrow_deadline_exceeds_tier_max` (`detail.max_ttl_sec`, and `detail.latest_deadline`, the
+     latest time this key can ask for right now). It used to be cut to the tier's limit with a 201.
+   - A time that was asked for is never cut short: the hold ends at exactly that time, or the open
+     is refused. Times are whole seconds; a fraction of a second in `deadline` or `ttlSec` is
+     dropped. The check runs in `buildEscrow` and once more where the hold's end is written
+     (`holdExpiry` in `src/policy.js`, called by `issueChildGrant` on its own read of the tier and
+     the clock), so a tier that moves in the middle of a request refuses the hold instead of
+     shortening it.
+   - The one case where a hold ends later than asked: a time less than a minute away at the moment
+     the hold is written. It ends at the minute every key gets, or at the payer key's own end if
+     that comes first. `ttlSec` of zero or less meets the same floor.
+   - Nothing opens under a tier the runtime does not know: `403 unknown_tier` from `buildEscrow`.
+     (If a tier became unknown in the middle of one request, `issueChildGrant` would fail with a
+     500, as it does for any key. Still nothing opens.)
+   - "Ends at" means the end stored on the hold. The refund happens when the reaper next runs, or
+     when the hold's token is next presented, not on that second. Until the refund, a delivery
+     receipt can still capture the hold: `captureEscrow` checks that the hold is active, not the clock.
+   - The default hour is not a promise. It still ends at the payer key's own end or at the tier's
+     longest lifetime, whichever comes first. The answer carries the deadline the hold really got.
 2. **refund** = revoke, or let it expire. Release returns the held value to the payer. **Reuse
    entirely** — the reaper auto-refunds at the deadline, so refund-on-timeout is free. Ledger `escrow-refund`.
 3. **capture** (new) = verify the condition, then in **one transaction**: settle the escrow's
    amount (ledger `escrow-capture`) **and** emit a MESH credit to the payee. Only the runtime,
    holding the escrow, can capture; the *condition* is the authorization, never either party's say-so.
+
+   What a capture pays (as built, `captureEscrow` and `captureAmount` in `src/escrow.js`): the value
+   the hold still holds itself. That is the whole amount for every hold, because nothing can be
+   opened under a hold. The rule is written for the case where something was:
+   - While anything under the hold is still open, the capture waits (`pledged_to_a_hold_below`,
+     the hold stays open), the same way a grant waits before it lets go.
+   - Then it pays the hold's amount less everything that was passed on: what was captured directly
+     under it (`settled`) and what is held on it for spend further down (`reserved`; a grant keeps
+     what the keys under it used held). `nothing_left_to_capture` if that was all of it.
+   - On rows that only this code has touched, captures therefore never credit more than the payer
+     paid, at any depth and in any order (a randomized test and two independent reviews ran
+     thousands of sequences of deliveries, refunds and deadlines over holds under holds).
+   - **Not covered:** a hold left open under a hold that older code had already ended. The older
+     code paid out, or gave back, the upper hold's whole amount, the lower hold's part included,
+     so a capture of the lower hold credits that part a second time. A rule for it was tried in
+     review and taken out: it only looked one level up, and it turned away a delivery that should
+     be paid when the hold above had merely been cancelled. The live runtime had no such row when
+     this went live (nothing had ever been captured there, and no hold under a hold was open;
+     read-only count before the merge), and none can be made now.
+   - A capture that waited is not tried again by the runtime. The same receipt, sent again, is.
+     If it never is, the hold is refunded at its deadline.
 
 ## Condition kinds (start with two)
 

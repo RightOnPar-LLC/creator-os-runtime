@@ -4,7 +4,8 @@ import { HttpError, newId, parseJson } from "./util.js";
 import { recordEvent, sql } from "./db.js";
 import { vaultDecrypt, vaultKey } from "./tokens.js";
 import { remainingBudget, TIERS, usageWithin } from "./policy.js";
-import { settleGrantUsage } from "./grants.js";
+import { recordAutonomyRow, settleGrantUsage } from "./grants.js";
+import { autonomyOf, decide } from "./autonomy.js";
 
 // Workers that run the creator-worker codebase are built by Railway straight from
 // the repo (Dockerfile at its root). No registry image, no pull credentials:
@@ -102,6 +103,20 @@ export var TEMPLATES = {
     needs: ["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "COS_GRANT_TOKEN", "BUILDER_TOKEN"],
     estCents: 120,
   },
+  // The agent-host (docs/specs/agent-host.md): a machine an agent runs in and hires
+  // sub-agents from. COS_GRANT_TOKEN is the HOST grant minted by POST /api/hosts —
+  // never the owner's root — so everything it hires is a child of the host, capped
+  // by the host's budget, ceilings and dial.
+  "agent-host": {
+    repo: WORKER_REPO,
+    kind: "agent-host",
+    desc: "A machine where one agent hires sub-agents under its own grant and dial",
+    env: {
+      WORKER_KIND: "agent-host",
+    },
+    needs: ["ANTHROPIC_API_KEY", "COS_GRANT_TOKEN"],
+    estCents: 120,
+  },
 };
 var REPO_RE = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
 function resolveSource(e, t) {
@@ -170,7 +185,9 @@ async function resolveRailwayToken(e) {
     };
   return null;
 }
-export async function deployWorker(e, t, a, n) {
+// `o.approvedBy` is set only when the tenant's root grant approved THIS deploy
+// (routes/grants.js POST /api/approvals/:id) — never from the request body.
+export async function deployWorker(e, t, a, n, opts = {}) {
   let r = TEMPLATES[t.template];
   if (!r) throw new HttpError(400, "unknown_template");
   let s = parseJson(e.row.constraints),
@@ -215,6 +232,34 @@ export async function deployWorker(e, t, a, n) {
       need: R,
       remaining: remainingBudget(e.row),
     });
+  // The autonomy dial (autonomy.js), checked only after scope + budget pass so a
+  // human is never asked to approve a deploy that could not run anyway.
+  let dial = decide(autonomyOf(s), "deploy", { approvedBy: opts.approvedBy || null });
+  if (dial.decision === "refuse") {
+    await recordAutonomyRow(e.row, "autonomy-refused", c, `deploy ${c} refused at autonomy ${dial.levelName}`, {
+      autonomy: dial.level,
+      decision: "refuse",
+    });
+    await recordEvent("autonomy.refused", { action: "deploy", name: c, level: dial.levelName }, e.tenant.id, n);
+    throw new HttpError(403, dial.reason, { autonomy: dial.levelName });
+  }
+  if (dial.decision === "ask") {
+    let ap = newId("ap");
+    await sql`INSERT INTO approvals (id, tenant, grant_id, action, intent, autonomy, requested_by)
+      VALUES (${ap}, ${e.tenant.id}, ${e.row.id}, 'deploy', ${t}::jsonb, ${dial.level}, ${n})`;
+    await recordAutonomyRow(e.row, "autonomy-ask", ap, `deploy ${c} awaits the owner's approval`, {
+      autonomy: dial.level,
+      decision: "ask",
+    });
+    await recordEvent("autonomy.ask", { action: "deploy", name: c, approval: ap, level: dial.levelName }, e.tenant.id, n);
+    return {
+      id: ap,
+      executed: !1,
+      status: "awaiting_approval",
+      reason: dial.reason,
+      approval: { id: ap, action: "deploy", name: c, approve: `POST /api/approvals/${ap}` },
+    };
+  }
   let S = {
       ...r.env,
       ...(t.env || {}),
@@ -269,7 +314,11 @@ export async function deployWorker(e, t, a, n) {
           },
         )
       )?.serviceCreate?.id || null;
-    await settleGrantUsage(e.row.id, R, C, `deploy ${c}`);
+    await settleGrantUsage(e.row.id, R, C, `deploy ${c}`, "settle", {
+      autonomy: dial.level,
+      decision: opts.approvedBy ? "approved" : "act",
+      approver: opts.approvedBy || null,
+    });
     ee = "deploying";
     te = !0;
     ke = {

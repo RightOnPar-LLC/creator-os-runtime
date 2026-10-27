@@ -10,7 +10,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const bun = join(root, "test", "node_modules", "bun", "bin", process.platform === "win32" ? "bun.exe" : "bun");
+// npm's bun package ships its binary as bin/bun.exe on every platform (a Linux ELF
+// under that name, too), so look for either name rather than assuming by OS.
+const bunDir = join(root, "test", "node_modules", "bun", "bin");
+const bun = ["bun.exe", "bun"].map((n) => join(bunDir, n)).find((p) => existsSync(p)) || join(bunDir, "bun");
 if (!existsSync(bun)) {
   console.error("pinned bun missing: run `npm ci` in test/ first");
   process.exit(2);

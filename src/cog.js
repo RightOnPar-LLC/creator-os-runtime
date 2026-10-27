@@ -3,7 +3,7 @@ import { randomBytes } from "crypto";
 import { env } from "./config.js";
 import { HttpError, parseJson } from "./util.js";
 import { getGrant, recordEvent, sql } from "./db.js";
-import { gatehouseEvaluate, normalizeOverlay, normalizeUsage, remainingBudget, tenantWorkerPrefix, TIERS } from "./policy.js";
+import { gatehouseEvaluate, memoryPartitions, normalizeOverlay, normalizeUsage, remainingBudget, tenantWorkerPrefix, TIERS } from "./policy.js";
 import { issueChildGrant, revokeGrantTree } from "./grants.js";
 import { searchMemories, writeMemory } from "./memory.js";
 import { deployWorker, TEMPLATES } from "./railway.js";
@@ -18,9 +18,19 @@ function guessTemplateFromIntent(e) {
   if (/\brelay|webhook|bridge\b/.test(t)) return "webhook-relay";
   return null;
 }
-async function gatherPlanEvidence(e, t, a) {
-  let n = await searchMemories(e, a ? `${a} ${t}` : t, "", 5),
-    r = a
+// Evidence comes ONLY from memory the caller's own key may read: the key needs memory.read,
+// and the search stays under the key's own memory sections. It used to search the whole
+// tenant for anyone allowed to plan, so a guest (all guests share one tenant), or a key
+// with an empty memory scope, could read other memory through the planner.
+async function gatherPlanEvidence(e, t, a, row) {
+  let caps = parseJson(row?.caps),
+    parts = Array.isArray(caps) && caps.includes("memory.read") ? memoryPartitions(parseJson(row.scope) || {}).slice(0, 5) : [],
+    n = [];
+  for (let p of parts) {
+    if (n.length >= 5) break;
+    n.push(...(await searchMemories(e, a ? `${a} ${t}` : t, p, 5 - n.length)));
+  }
+  let r = a
       ? await sql`SELECT 1 FROM events WHERE tenant = ${e} AND type = 'worker.failed' AND data->>'template' = ${a} LIMIT 3`
       : [];
   return {
@@ -118,23 +128,37 @@ function buildDeterministicPlan(
   };
 }
 async function planWithLlm(e, t, a, n, r) {
-  if (!env.ANTHROPIC_API_KEY) return null;
+  // Rewired off Anthropic onto the Z-13's own Ollama instance (work order 14:
+  // "cog_plan and cog_execute need to hit Ollama, not the Anthropic API").
+  // OLLAMA_URL is the Tailscale address of the Z-13's Ollama server (confirmed
+  // listening on :11435, not Ollama's usual default :11434, with gpt-oss:120b
+  // already pulled). No Anthropic key, no Anthropic network call, anywhere in
+  // this function.
+  if (!env.OLLAMA_URL) return null;
   try {
     let s = (
       (
         await (
-          await fetch("https://api.anthropic.com/v1/messages", {
+          await fetch(`${env.OLLAMA_URL.replace(/\/$/, "")}/api/chat`, {
             method: "POST",
             headers: {
               "content-type": "application/json",
-              "x-api-key": env.ANTHROPIC_API_KEY,
-              "anthropic-version": "2023-06-01",
             },
+            // The Z-13 is a physical box: it sleeps, reboots, drops off the tailnet.
+            // Without a deadline a dead Ollama hung the plan request with it; now the
+            // planner gives up after cogLlmTimeoutMs() and the deterministic plan
+            // answers instead. keep_alive pins the model between plans so a warm
+            // planner doesn't pay a cold load every time.
+            signal: AbortSignal.timeout(cogLlmTimeoutMs()),
             body: JSON.stringify({
-              model: env.COG_MODEL || "claude-sonnet-4-5",
-              max_tokens: 300,
-              system: `You are the COG planner. Choose exactly one template from: ${Object.keys(TEMPLATES).join(", ")}. Reply ONLY with JSON {"template": string, "env": object, "why": string}. Never invent secrets.`,
+              model: env.COG_MODEL || "gpt-oss:120b",
+              keep_alive: env.COG_KEEP_ALIVE || "30m",
+              stream: false,
               messages: [
+                {
+                  role: "system",
+                  content: `You are the COG planner. Choose exactly one template from: ${Object.keys(TEMPLATES).join(", ")}. Reply ONLY with JSON {"template": string, "env": object, "why": string}. Never invent secrets.`,
+                },
                 {
                   role: "user",
                   content: `Creator intent: ${a}
@@ -145,7 +169,7 @@ Evidence (prior memory): ${JSON.stringify(r.evidence.map((l) => l.snippet))}`,
             }),
           })
         ).json()
-      )?.content?.[0]?.text || ""
+      )?.message?.content || ""
     ).match(/\{[\s\S]*\}/);
     if (!s) return null;
     let i = JSON.parse(s[0]);
@@ -165,17 +189,29 @@ Evidence (prior memory): ${JSON.stringify(r.evidence.map((l) => l.snippet))}`,
       r,
     );
     return ((o.planner = "llm+deterministic"), (o.rationale = `${i.why || ""} \u2014 ${o.rationale}`), o);
-  } catch {
-    return null;
+  } catch (l) {
+    // Say WHY the deterministic plan answered, so a slow or dead Ollama shows up in
+    // the proposal instead of passing silently.
+    return { fallback: l?.name === "TimeoutError" || l?.name === "AbortError" ? "timeout" : "error" };
   }
+}
+// How long the planner waits for Ollama before falling back. A cold gpt-oss:120b
+// load measured ~2 minutes on the Z-13, so the default leaves room for a warm
+// answer, not a cold one; keep_alive is what keeps it warm.
+export function cogLlmTimeoutMs() {
+  let e = Number(env.COG_LLM_TIMEOUT_MS);
+  return e > 0 ? Math.min(Math.floor(e), 240000) : 60000;
 }
 export async function cogPlan(e, t, a) {
   let n = await gatherPlanEvidence(
       e.tenant.id,
       t,
       a.template && TEMPLATES[a.template] ? a.template : guessTemplateFromIntent(t),
+      e.row,
     ),
-    r = (await planWithLlm(e.tenant, e.row, t, a, n)) || buildDeterministicPlan(e.tenant, e.row, t, a, n);
+    m = await planWithLlm(e.tenant, e.row, t, a, n),
+    r = m && !m.fallback ? m : buildDeterministicPlan(e.tenant, e.row, t, a, n);
+  if (m?.fallback) r.warnings = [...(r.warnings || []), `planner_fallback:${m.fallback}`];
   return (
     await recordEvent(
       "cog.planned",

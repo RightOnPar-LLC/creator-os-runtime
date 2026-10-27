@@ -1,0 +1,42 @@
+# The gate for ship-on-green (docs/specs/ship-on-green.md): the full characterisation
+# suite on every PR and every push to master. When the Railway service is switched to
+# deploy from this repo with "Wait for CI", a push only deploys once this is green.
+#
+# test/ carries its own pinned toolchain (bun + pglite + hono) in test/package-lock.json;
+# run.mjs links it and runs runtime.test.js, bridgewire.test.js and autonomy.test.js.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: test/package-lock.json
+
+      - name: Install the pinned test toolchain
+        run: npm ci
+        working-directory: test
+
+      - name: Characterisation suite (src/)
+        run: node test/run.mjs
+
+      - name: Production bundle builds
+        run: test/node_modules/.bin/bun build src/index.js --target=bun --minify --external hono --outfile /tmp/runtime.js

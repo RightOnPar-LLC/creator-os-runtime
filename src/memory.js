@@ -6,6 +6,7 @@ import { cogBridgeUrl, enqueueOutbox } from "./outbox.js";
 import { memoryPartitions, partitionCovers } from "./policy.js";
 import { guestWriteContext } from "./guest.js";
 import { checkNamedRateLimit } from "./grants.js";
+import { fromBridgeChange } from "./bridgewire.js";
 
 export var serializeMemory = (e) => ({
   id: e.id,
@@ -68,14 +69,30 @@ export async function writeMemory(e, t, a, n, r, s, auth = null) {
   if (!gx) await enqueueOutbox("memory.sync", toSyncRecord(i[0]));
   return o;
 }
+// LIKE with the prefix's own % and _ taken literally (a partition may contain them).
+var likeLiteral = (e) => e.replace(/[\\%_]/g, "\\$&");
+// `a` is the scope prefix to search under. The match is the SAME boundary rule as
+// partitionCovers (policy.js), so listing can never reach further than assertMemoryScope
+// allows: the prefix itself, or the prefix followed by a real separator. A bare
+// `LIKE prefix%` let a key scoped to "article:job4" list "article:job42" too.
+// No prefix at all (a key whose memory scope is the empty list) lists nothing: the old
+// `undefined + "%"` only returned nothing by accident, and DID return a partition whose
+// name happened to start with "undefined". Anything that is not a string lists nothing
+// too (String([[]]) is "", which would have meant "everything").
 export async function searchMemories(e, t, a, n) {
+  if (typeof a !== "string") return [];
   let r = Math.min(50, Math.max(1, Math.floor(n || 10))),
-    s = a + "%";
+    p = a,
+    l = likeLiteral(p),
+    open = p === "" || /[:/-]$/.test(p),
+    s1 = open ? l + "%" : l + ":%",
+    s2 = open ? s1 : l + "/%",
+    s3 = open ? s1 : l + "-%";
   return (
     t.trim()
-      ? await sql`SELECT * FROM memories WHERE tenant = ${e} AND deleted = false AND partition LIKE ${s} AND (to_tsvector('english', content) @@ plainto_tsquery('english', ${t}) OR content ILIKE ${"%" + t + "%"})
+      ? await sql`SELECT * FROM memories WHERE tenant = ${e} AND deleted = false AND (partition = ${p} OR partition LIKE ${s1} OR partition LIKE ${s2} OR partition LIKE ${s3}) AND (to_tsvector('english', content) @@ plainto_tsquery('english', ${t}) OR content ILIKE ${"%" + t + "%"})
         ORDER BY ts_rank(to_tsvector('english', content), plainto_tsquery('english', ${t})) DESC, updated_at DESC LIMIT ${r}`
-      : await sql`SELECT * FROM memories WHERE tenant = ${e} AND deleted = false AND partition LIKE ${s} ORDER BY updated_at DESC LIMIT ${r}`
+      : await sql`SELECT * FROM memories WHERE tenant = ${e} AND deleted = false AND (partition = ${p} OR partition LIKE ${s1} OR partition LIKE ${s2} OR partition LIKE ${s3}) ORDER BY updated_at DESC LIMIT ${r}`
   ).map(serializeMemory);
 }
 export async function forgetMemory(e, t, auth = null) {
@@ -132,9 +149,14 @@ export async function pullMemoryFromBridge() {
       },
     });
   if (!t.ok) throw new HttpError(502, "bridge_error", t.status);
+  // The bridge answers { changes, watermark } (see bridgewire.js); reading
+  // { records, next } here found nothing and never advanced the cursor.
   let a = await t.json(),
-    n = await applySyncRecords(Array.isArray(a.records) ? a.records : []),
-    r = Number(a.next) || e;
+    changes = Array.isArray(a.changes) ? a.changes : [],
+    records = changes.map((c) => fromBridgeChange(c)).filter(Boolean),
+    n = await applySyncRecords(records),
+    r = Number(a.watermark) || e;
+  n.foreign = changes.length - records.length;
   if (r > e) await setSetting("memory_pull_cursor", String(r));
   return {
     ...n,

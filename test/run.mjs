@@ -26,10 +26,15 @@ try { linked = lstatSync(rootModules).isSymbolicLink(); } catch {}
 if (!existsSync(rootModules)) symlinkSync(testModules, rootModules, "junction");
 else if (!linked) console.warn("note: using the existing real node_modules at the repo root");
 
-const bun = join(testModules, "bun", "bin", process.platform === "win32" ? "bun.exe" : "bun");
+// npm's bun package ships its binary as bin/bun.exe on every platform (a Linux ELF
+// under that name, too), so look for either name rather than assuming by OS.
+const bunDir = join(testModules, "bun", "bin");
+const bun = ["bun.exe", "bun"].map((n) => join(bunDir, n)).find((p) => existsSync(p)) || join(bunDir, "bun");
 const arg = process.argv[2];
 const env = { ...process.env };
 if (arg === "dist") env.RUNTIME_ENTRY = join(root, "dist", "runtime.js");
 else if (arg) env.RUNTIME_ENTRY = resolve(root, arg);
-const r = spawnSync(bun, ["test", "runtime.test.js"], { cwd: here, env, stdio: "inherit" });
+// The per-test time limit has to be given HERE. This bun reads [test] in bunfig.toml but ignores a
+// `timeout` key there: from 2026-09-25 bunfig said 30 s and every test ran with bun's own 5 s.
+const r = spawnSync(bun, ["test", "--timeout", "30000", "runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "hostpolicy.test.js", "bus.test.js"], { cwd: here, env, stdio: "inherit" });
 process.exit(r.status ?? 1);

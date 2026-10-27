@@ -2,6 +2,11 @@
 
 export var MCP_TOOLS = [
   {
+    name: "tool_receipts",
+    description: "Read runtime-observed tool invocation receipts for your grant subtree (ledger.read). Started means completion is unknown; a receipt is not permission for another action. Does not cover tools called outside this runtime.",
+    inputSchema: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 200 } } },
+  },
+  {
     name: "guest_welcome",
     description: "Keyless: mint a guest grant and return the welcome package in one call — no grant required. Optional agent_name, home_url.",
     inputSchema: {
