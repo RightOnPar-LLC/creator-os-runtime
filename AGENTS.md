@@ -1,3 +1,5 @@
+
+
 <!-- ESTATE-DOOR:BEGIN — managed by the governance engine (governance-sync). Do not hand-edit; edit the master laws file and re-run sync. -->
 # Editor-agent door — creator-os-runtime
 
@@ -23,7 +25,7 @@ This is a **mainstream (non-adult)** repo. The estate also runs an ADULT vertica
 ## 4 · The four hard floors (never automatic — a human signs)
 Everything else: default to action. These four are the only things you never do on your own:
 1. **Money-out** — spending, transfers, trades, moving funds or assets.
-2. **Outward publish / send** — posting, publishing, or sending anything to the outside world on the owner's behalf.
+2. **Outward publish / send** — posting, publishing, or sending anything to the outside world on the owner's behalf. *Wayfinding exception:* a change a repo's publish-class gate classifies as WAYFINDING — only pointers to surfaces that already exist, each proven by a test that follows it; no numbers, money, legal or figure wording, no new behaviour — may ship on green. The gate fails closed (anything it cannot read is a claim), and claims always need the signature.
 3. **Credential / ACL changes to people** — granting or changing another person's access, secrets, or permissions.
 4. **Irreversible deletes** — hard-deleting data, history, or resources.
 
