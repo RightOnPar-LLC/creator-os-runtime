@@ -45,7 +45,7 @@ app.get("/api/memory", requireGrant("memory.read"), async (e) => {
 });
 app.get("/api/memory/:id", requireGrant("memory.read"), async (e) => {
   let t = e.get("auth"),
-    a = await sql`SELECT * FROM memories WHERE id = ${e.req.param("id")} AND tenant = ${t.tenant.id}`;
+    a = await sql`SELECT * FROM memories WHERE id = ${e.req.param("id")} AND tenant = ${t.tenant.id} AND deleted = false`;
   if (!a.length) throw new HttpError(404, "memory_not_found");
   return (
     assertMemoryScope(t, a[0].partition),
