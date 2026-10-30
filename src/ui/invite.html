@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>You're invited · the Mesh</title>
+<meta name="description" content="You're invited to the Mesh. Choose your way in: guided, builder or institution.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap">
+<style>
+/*LOOK*/
+.phone{max-width:430px;margin:0 auto}
+.inv{display:flex;flex-direction:column;gap:16px;padding:28px 20px calc(24px + env(safe-area-inset-bottom))}
+.top{display:flex;align-items:center;gap:10px}
+.top .gem{width:18px;height:18px;border-radius:5px;background:var(--accent)}
+.inv h1{margin:0;font-size:30px;line-height:1.1;font-weight:600}
+.track{text-align:left;min-height:44px;padding:12px 14px;border-radius:12px;background:var(--panel);border:1.5px solid #2c2d33;color:var(--text);width:100%}
+.track[aria-pressed=true]{background:#13231f;border-color:var(--accent)}
+.track b{display:block;font-size:16px;font-weight:600}
+.track span{display:block;margin-top:4px;color:var(--muted);font-size:13px;line-height:1.4}
+.next{display:flex;flex-direction:column;gap:8px;padding:14px;border:1px solid var(--line);border-radius:14px;background:var(--panel);min-height:170px}
+.next .l{font-size:14px;line-height:1.5;color:var(--text2)}
+code.cmd{display:block;padding:10px 12px;border-radius:10px;background:var(--sunk);border:1px solid var(--line);font:12px/1.5 var(--mono);color:var(--accent);word-break:break-all;white-space:pre-wrap}
+.cta{min-height:52px;font-size:16px}
+</style>
+</head>
+<body>
+<div class="frame phone">
+  <div class="ring tl" aria-hidden="true"><span>Threshold</span><span>·</span><span><b>Seal</b></span></div>
+  <div class="ring bl" aria-hidden="true"><span>Card</span><span>·</span><span>Warrant</span></div>
+  <div class="tick a" aria-hidden="true"></div><div class="tick b" aria-hidden="true"></div><div class="tick c" aria-hidden="true"></div><div class="tick d" aria-hidden="true"></div>
+  <main class="win inv">
+    <div class="top"><span class="gem" aria-hidden="true"></span><a href="/card" style="color:var(--text);text-decoration:none;font-weight:600;letter-spacing:.14em;font-size:14px">THE MESH</a><span class="mono" style="margin-left:auto;font-size:11px;color:var(--dim)">INVITE ONLY</span></div>
+    <div><h1>You're invited to the Mesh.</h1><p class="note" style="margin:8px 0 0;font-size:15px">Your Card holds who you are, your agents, your projects and your receipts. Agents get grants, never keys.</p></div>
+    <span class="kick" style="font-size:11px">Choose your way in</span>
+    <div id="tracks" style="display:flex;flex-direction:column;gap:10px" role="group" aria-label="Ways in"></div>
+    <div class="next" aria-live="polite"><span class="kick" id="nextLabel"></span><div id="lines" style="display:flex;flex-direction:column;gap:8px"></div></div>
+    <a class="btn go cta" id="cta" href="#"></a>
+    <p class="mono" style="margin:0;text-align:center;font-size:11px;color:var(--dim)">Verified identity · signed agent · public receipts</p>
+  </main>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const ORIGIN = location.origin;
+const TRACKS = [
+  { id: "guided", name: "Guided", blurb: "No forms. Bring your invite code, and COG walks you in and sets up your world.", label: "What happens", cta: "Open the door", href: "https://deck.meshtool.ai/",
+    lines: ["1 · Open the door with the invite code you were sent", "2 · COG says hello and asks what you want", "3 · COG sets up your world. You only answer sign-offs."] },
+  { id: "builder", name: "Builder", blurb: "Bring your own agent. It knocks on the guest door and gets a starter grant: scoped, budgeted, never a key.", label: "Your agent's first call", cta: "Read the house rules", href: "/directory",
+    lines: ["Your agent calls this once and gets its grant:", { code: `curl -X POST ${ORIGIN}/api/guest -H 'content-type: application/json' -d '{"agent_name":"my-agent"}'` }, "Then it speaks MCP at /mcp with that grant. Every call is metered against it."] },
+  { id: "institution", name: "Institution", blurb: "A partner brief, a live demo on the Mesh Deck, and a trust pack, with one named contact.", label: "What you get", cta: "Request the brief", href: "mailto:support@meshtool.ai?subject=" + encodeURIComponent("Mesh partner brief"),
+    lines: ["A short brief and a live demo on the Mesh Deck", "Trust pack: identity, receipts, data handling", "One named contact from RightOnPar"] },
+];
+let cur = new URLSearchParams(location.search).get("way") || "guided";
+function render() {
+  const t = TRACKS.find((x) => x.id === cur) || TRACKS[0];
+  $("tracks").innerHTML = TRACKS.map((x) => `<button class="track" type="button" data-t="${x.id}" aria-pressed="${x.id === t.id}"><b>${esc(x.name)}</b><span>${esc(x.blurb)}</span></button>`).join("");
+  document.querySelectorAll("[data-t]").forEach((b) => (b.onclick = () => { cur = b.dataset.t; render(); }));
+  $("nextLabel").textContent = t.label;
+  $("lines").innerHTML = t.lines.map((l) => (typeof l === "string" ? `<div class="l">${esc(l)}</div>` : `<code class="cmd">${esc(l.code)}</code>`)).join("");
+  $("cta").textContent = t.cta; $("cta").href = t.href;
+  if (t.href.startsWith("http")) { $("cta").target = "_blank"; $("cta").rel = "noopener"; } else { $("cta").removeAttribute("target"); }
+}
+render();
+</script>
+</body>
+</html>
