@@ -1,0 +1,176 @@
+diff --git a/src/cockpit.js b/src/cockpit.js
+index 93da7a1..8f4f55a 100644
+--- a/src/cockpit.js
++++ b/src/cockpit.js
+@@ -5,10 +5,11 @@ import { isKillSwitchOn, sql } from "./db.js";
+ import { sourceBytes, sourceSha256 } from "./http.js";
+ import { OAUTH_PROFILES, profileForRedirect } from "./oauth.js";
+ 
++// The plain pages (status, docs, the connector approval) wear the same look as the Runtime Browser (src/ui/look.css).
+ var PAGE_CSS =
+-  "body{margin:0;background:#050506;color:#f6f1e4;font:15px/1.5 Geist,system-ui,sans-serif;padding:16px}main{max-width:980px;margin:0 auto}h1{letter-spacing:-.02em}a{color:#f5c542;text-decoration:none}code{font-family:'Geist Mono',ui-monospace,monospace;color:#19f0d8;word-break:break-all}.card{background:rgba(20,19,24,.72);border:1px solid rgba(245,197,66,.16);border-radius:14px;padding:16px;margin:12px 0}button{background:#f5c542;color:#050506;border:0;border-radius:10px;padding:8px 14px;font-weight:600;cursor:pointer}input,select{background:#09090b;color:#f6f1e4;border:1px solid rgba(245,197,66,.3);border-radius:8px;padding:8px}table{border-collapse:collapse;width:100%}td{padding:8px;border-bottom:1px solid rgba(245,197,66,.1);vertical-align:top}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.g{background:#19f0d8;box-shadow:0 0 8px #19f0d8}.r{background:#ff3d7f;box-shadow:0 0 8px #ff3d7f}.p{background:#5a5566}.dim{color:#9a927f;font-size:13px}.btn{display:inline-block;background:#f5c542;color:#050506;border-radius:10px;padding:6px 12px;font-weight:600}";
++  "body{margin:0;background:#07080a;background-image:radial-gradient(900px 500px at 12% -10%,rgba(54,224,200,.14),transparent 60%);color:#e9e7e2;font:15px/1.5 'Space Grotesk',system-ui,sans-serif;padding:16px}main{max-width:980px;margin:0 auto}h1{letter-spacing:-.01em;font-weight:600}a{color:#36e0c8;text-decoration:none}a:hover{color:#7cf0de}code{font-family:'IBM Plex Mono',ui-monospace,monospace;color:#36e0c8;word-break:break-all}.card{background:#131418;border:1px solid #26272d;border-radius:14px;padding:16px;margin:12px 0}button{background:#36e0c8;color:#0d0e11;border:0;border-radius:10px;padding:8px 14px;font:600 14px 'Space Grotesk',sans-serif;min-height:40px;cursor:pointer}input,select{background:#0f1a18;color:#e9e7e2;border:1px solid #2f4a45;border-radius:9px;padding:8px;min-height:40px;font:inherit}table{border-collapse:collapse;width:100%}td{padding:8px;border-bottom:1px solid #22232a;vertical-align:top}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.g{background:#36e0c8;box-shadow:0 0 8px #36e0c8}.r{background:#ff7a7a;box-shadow:0 0 8px #ff7a7a}.p{background:#5a5b62}.dim{color:#9a9aa3;font-size:13px}.btn{display:inline-block;background:#36e0c8;color:#0d0e11;border-radius:10px;padding:6px 12px;font-weight:600}";
+ export var renderPage = (e, t) =>
+-  `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e}</title><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;600&family=Geist+Mono&display=swap"><style>${PAGE_CSS}</style></head><body><main>${t}</main></body></html>`;
++  `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e}</title><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600&display=swap"><style>${PAGE_CSS}</style></head><body><main>${t}</main></body></html>`;
+ var RAILWAY_VARS_PATH = "Railway @@BS@@u2192 creator-os-runtime @@BS@@u2192 runtime @@BS@@u2192 Variables";
+ var STATUS_CHECKS = [
+   ["admin", "core", "Admin key (cockpit unlock + approvals)", "RUNTIME_ADMIN_KEY"],
+diff --git a/src/routes/admin.js b/src/routes/admin.js
+index f1d9478..347d244 100644
+--- a/src/routes/admin.js
++++ b/src/routes/admin.js
+@@ -1,6 +1,6 @@
+ // Routes: admin: tenants, kill switch, policy, breakglass, grants, read-only tables. Registration order is significant.
+ import { armedIntegrations, POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN } from "../config.js";
+-import { HttpError, newId } from "../util.js";
++import { HttpError, newId, withRedactedIntent } from "../util.js";
+ import { getGrant, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
+ import { reissueGrantToken } from "../tokens.js";
+ import { CAPS, remainingBudget, TIERS } from "../policy.js";
+@@ -363,3 +363,18 @@ app.get("/api/admin/events", requireAdmin, async (e) =>
+ 
+ app.get("/api/admin/tool-receipts", requireAdmin, async (e) =>
+   e.json({ receipts: await sql`SELECT * FROM tool_receipts ORDER BY started_at DESC, id DESC LIMIT 200` }));
++
++// READ ONLY. The seal on the Runtime Browser: approvals across every world, pending by default, newest first.
++// ?status= one of APPROVAL_STATUSES (or "all"). A pending deploy's intent carries env values: like
++// GET /api/approvals, this answers with the names only (withRedactedIntent). Deciding stays where it was:
++// POST /api/approvals/:id with the world's root grant.
++const APPROVAL_STATUSES = ["pending", "approved", "denied", "failed"];
++app.get("/api/admin/approvals", requireAdmin, async (e) => {
++  let st = e.req.query("status") ?? "pending";
++  if (st !== "all" && !APPROVAL_STATUSES.includes(st)) throw new HttpError(400, "status_invalid", { allowed: [...APPROVAL_STATUSES, "all"] });
++  let rows =
++    st === "all"
++      ? await sql`SELECT * FROM approvals ORDER BY created_at DESC, id DESC LIMIT 200`
++      : await sql`SELECT * FROM approvals WHERE status = ${st} ORDER BY created_at DESC, id DESC LIMIT 200`;
++  return e.json({ approvals: rows.map(withRedactedIntent), status: st });
++});
+diff --git a/src/routes/cockpit.js b/src/routes/cockpit.js
+index 1779594..52cffc2 100644
+--- a/src/routes/cockpit.js
++++ b/src/routes/cockpit.js
+@@ -3,18 +3,20 @@ import { escapeHtml, HttpError } from "../util.js";
+ import { sql } from "../db.js";
+ import { app, requireAdmin } from "../http.js";
+ import { buildStatusReport, getDoc, listDocNames, markdownToHtml, renderPage } from "../cockpit.js";
++import { PAGE_HEADERS, PAGES } from "../ui/pages.js";
+ 
+-app.get("/", async (e) => {
+-  let t = await getDoc("_cockpit");
+-  return e.html(
+-    t ||
+-      renderPage(
+-        "creator-os-runtime",
+-        '<h1>creator-os-runtime</h1><div class="card">Cockpit not uploaded yet @@BS@@u2014 <code>PUT /api/admin/docs/_cockpit</code> with cockpit.html. Machine surface: <a href="/health">/health</a> @@BS@@xB7 <a href="/routes">/routes</a> @@BS@@xB7 <a href="/mcp">/mcp</a> @@BS@@xB7 <a href="/docs">/docs</a></div>',
+-      ),
+-  );
+-});
+-app.get("/cockpit/:page", (e) => e.redirect(`/#/${e.req.param("page")}`));
++// The human pages ship in the bundle (src/ui). The old cockpit was a database doc (`_cockpit`) that drifted from
++// the repo; "/" no longer reads it (DW, 2026-10-30: out with the old, in with the new).
++const page = (name) => (e) => {
++  for (const [k, v] of Object.entries(PAGE_HEADERS)) e.header(k, v);
++  return e.html(PAGES[name]);
++};
++app.get("/", page("runtime"));
++app.get("/loop", page("loop"));
++app.get("/card", page("card"));
++app.get("/invite", page("invite"));
++// Old cockpit links (/cockpit/grants, /#/tenants …) still land: the Runtime Browser maps the old page names.
++app.get("/cockpit/:page", (e) => e.redirect(`/#/${encodeURIComponent(e.req.param("page"))}`));
+ app.get("/status.json", async (e) => e.json(await buildStatusReport()));
+ app.get("/status", async (e) => {
+   let t = await buildStatusReport(),
+@@ -24,7 +26,7 @@ app.get("/status", async (e) => {
+   return e.html(
+     renderPage(
+       "Runtime status",
+-      `<h1>Runtime status</h1><div class="card"><b style="font-size:20px">${t.ok ? a(!0) + "All green" : a(!1) + t.red + " thing" + (t.red > 1 ? "s" : "") + " need you"}</b><div class="dim">v${t.version} @@BS@@xB7 source ${String(t.source.sha256).slice(0, 12)} @@BS@@xB7 ${escapeHtml(t.time)} @@BS@@xB7 <a href="/status.json">json</a> @@BS@@xB7 <a href="/">cockpit</a></div></div>
++      `<h1>Runtime status</h1><div class="card"><b style="font-size:20px">${t.ok ? a(!0) + "All green" : a(!1) + t.red + " thing" + (t.red > 1 ? "s" : "") + " need you"}</b><div class="dim">v${t.version} @@BS@@xB7 source ${String(t.source.sha256).slice(0, 12)} @@BS@@xB7 ${escapeHtml(t.time)} @@BS@@xB7 <a href="/status.json">json</a> @@BS@@xB7 <a href="/">runtime</a></div></div>
+ <div class="card"><h3>Products</h3><table>${t.bodies.map((r) => `<tr><td>${a(r.up && r.connected !== !1)}<b>${escapeHtml(r.name)}</b><div class="dim">${r.up ? "up @@BS@@xB7 " + r.ms + " ms" : "down (" + r.code + ")"}</div></td><td>${r.connected === null ? '<span class="dim">no link needed</span>' : r.connected ? "Connected @@BS@@u2713 <span class=dim>since " + escapeHtml(new Date(r.since).toISOString().slice(0, 10)) + "</span>" : r.connect ? `<a class="btn" href="${r.connect}">Connect ${escapeHtml(r.name)}</a>` : '<span class="dim">Connect button ships with its next deploy</span>'}</td></tr>`).join("")}</table></div>
+ <div class="card"><h3>Core</h3><table>${t.checks
+         .filter((r) => r.kind === "core")
+@@ -47,7 +49,7 @@ app.get("/docs", async (e) => {
+   return e.html(
+     renderPage(
+       "Docs",
+-      `<a href="/">@@BS@@u2190 Back to hub</a><h1>Docs</h1><p>Served by the running instance. The deployed instance is the spec.</p><div class="card">${t.map((a) => `<div><a href="/docs/${a}">${a}</a></div>`).join("") || "No docs uploaded yet (PUT /api/admin/docs/:name)."}</div>`,
++      `<a href="/">@@BS@@u2190 Back to the runtime</a><h1>Docs</h1><p>Served by the running instance. The deployed instance is the spec.</p><div class="card">${t.map((a) => `<div><a href="/docs/${a}">${a}</a></div>`).join("") || "No docs uploaded yet (PUT /api/admin/docs/:name)."}</div>`,
+     ),
+   );
+ });
+diff --git a/test/routes.snapshot.json b/test/routes.snapshot.json
+index c3ee98f..dae9176 100644
+--- a/test/routes.snapshot.json
++++ b/test/routes.snapshot.json
+@@ -1,5 +1,5 @@
+ {
+-  "count":190,
++  "count": 195,
+   "appRoutes": [
+     "ALL /api/*",
+     "ALL /auth/*",
+@@ -61,6 +61,8 @@
+     "GET /api/admin/events",
+     "GET /api/admin/tool-receipts",
+     "GET /api/admin/tool-receipts",
++    "GET /api/admin/approvals",
++    "GET /api/admin/approvals",
+     "GET /api/grants/verify",
+     "GET /api/grants/verify",
+     "POST /api/grants/settle",
+@@ -182,6 +184,9 @@
+     "POST /sso/callback",
+     "GET /.well-known/agent.json",
+     "GET /",
++    "GET /loop",
++    "GET /card",
++    "GET /invite",
+     "GET /cockpit/:page",
+     "GET /status.json",
+     "GET /status",
+@@ -223,6 +228,7 @@
+     "GET /api/admin/webhooks :: admin",
+     "GET /api/admin/events :: admin",
+     "GET /api/admin/tool-receipts :: admin",
++    "GET /api/admin/approvals :: admin",
+     "GET /api/grants/verify :: grant",
+     "POST /api/grants/settle :: grant",
+     "POST /api/grants :: grant:grant.issue",
+@@ -294,6 +300,9 @@
+     "POST /sso/callback :: public",
+     "GET /.well-known/agent.json :: public",
+     "GET / :: public",
++    "GET /loop :: public",
++    "GET /card :: public",
++    "GET /invite :: public",
+     "GET /cockpit/:page :: public(page)+admin(data)",
+     "GET /status.json :: public",
+     "GET /status :: public",
+diff --git a/test/run.mjs b/test/run.mjs
+index 74d6fd7..86b1ec3 100644
+--- a/test/run.mjs
++++ b/test/run.mjs
+@@ -42,4 +42,5 @@ const main = run(["runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "
+ // shuts them down when it ends. runtime.test.js holds that boot, so any other such file runs in its
+ // own bun process, after it, and the run fails if either failed.
+ const market = run(["market.test.js"]);
+-process.exit((main.status ?? 1) || (market.status ?? 1));
++const pages = run(["pages.test.js"]);
++process.exit((main.status ?? 1) || (market.status ?? 1) || (pages.status ?? 1));
+diff --git a/test/runtime.test.js b/test/runtime.test.js
+index 5bb516c..70e6ec8 100644
+--- a/test/runtime.test.js
++++ b/test/runtime.test.js
+@@ -2746,8 +2746,9 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
+     const html = await req("GET", "/docs/guide");
+     expect(html.text).toContain("<h1>Hi</h1>");
+     expect((await req("GET", "/docs/guide?raw")).text).toBe("# Hi@@BS@@n@@BS@@n`code`");
++    // "/" no longer serves the _cockpit doc (2026-10-30: the pages ship in src/ui; see test/pages.test.js).
+     await admin("PUT", "/api/admin/docs/_cockpit", { raw: "<p>cockpit</p>" });
+-    expect((await req("GET", "/")).text).toBe("<p>cockpit</p>");
++    expect((await req("GET", "/")).text).not.toBe("<p>cockpit</p>");
+     expect((await req("GET", "/docs/_cockpit")).status).toBe(404);
+   });
