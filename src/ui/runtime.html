@@ -1,0 +1,759 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Runtime · the Mesh browser</title>
+<meta name="description" content="runtime.meshtool.ai: grants, receipts and the kill switch for every agent on the Mesh.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap">
+<style>
+/*LOOK*/
+:root{--agent:var(--blue);--worker:#c9a7ff;--fan:#f0a868;--line-2:var(--line2);--text-2:var(--muted);--muted-2:var(--dim)}
+.omni{flex:1 1 360px;min-width:0;height:42px;display:flex;align-items:center;gap:8px;padding:0 5px 0 6px;border-radius:12px;border:1px solid #2f3037;background:#121317;box-shadow:0 0 0 4px rgba(54,224,200,.06)}
+.omni .cell{display:flex;align-items:center;gap:6px;height:28px;padding:0 10px;border-radius:8px;background:rgba(54,224,200,.12);color:var(--accent);font:400 11px var(--mono);letter-spacing:.08em;white-space:nowrap}
+.omni .cell i{width:7px;height:7px;border-radius:2px;background:var(--accent)}
+.omni input{flex:1;min-width:0;height:36px;border:0;background:transparent;font:14px var(--mono);outline:none}
+.omni .modes{display:flex;gap:2px;padding:3px;border-radius:9px;background:#0b0c0f;border:1px solid var(--line)}
+.omni .modes button{height:28px;padding:0 10px;border-radius:6px;border:0;background:transparent;color:var(--muted);font:500 12px var(--sans)}
+.omni .modes button[aria-pressed=true]{background:var(--accent);color:var(--accent-ink);font-weight:600}
+.hist{display:flex;gap:2px}
+.icon{width:36px;height:36px;border-radius:9px;border:0;background:transparent;color:var(--muted);display:grid;place-items:center;padding:0}
+.icon:hover{background:#1b1c22;color:var(--text)}
+.on-pill{display:flex;align-items:center;gap:8px;height:34px;padding:0 12px;border-radius:999px;border:1px solid var(--teal-line);background:var(--teal-sunk);font:400 11px var(--mono);color:#b9e9e1;white-space:nowrap}
+.crownb{width:36px;height:36px;border-radius:50%;border:1px solid rgba(233,185,73,.55);background:radial-gradient(circle at 50% 40%,#2a2414,#121317 70%);color:var(--gold);display:grid;place-items:center;padding:0}
+.crownb.pulled{background:var(--gold);color:var(--accent-ink)}
+.who{min-width:36px;height:36px;padding:0 10px;border-radius:999px;border:2px solid var(--gold);background:#1f2026;display:grid;place-items:center;font:600 12px var(--sans);color:var(--text)}
+.who.out{border-color:var(--line3);font-weight:500}
+.body{display:grid;grid-template-columns:232px minmax(0,1fr) 344px;min-height:780px}
+.rail{display:flex;flex-direction:column;gap:18px;padding:16px 12px;border-right:1px solid var(--line2);background:var(--rail)}
+.rail .grp{display:flex;flex-direction:column;gap:2px}
+.rail .grp>.kick{padding:0 8px 6px}
+.ws{display:flex;align-items:center;gap:10px;min-height:38px;padding:0 8px;border-radius:9px;border:1px solid transparent;background:transparent;color:var(--muted);font:500 13px var(--sans);text-align:left;width:100%}
+.ws:hover{background:#1b1c22;color:var(--text)}
+.ws[aria-pressed=true]{border-color:var(--teal-line);background:var(--teal-bg);color:var(--text)}
+.ws .sw{width:10px;height:10px;border-radius:3px;flex-shrink:0}
+.ws .n{margin-left:auto;font:400 10px var(--mono);color:var(--dim)}
+.tab{display:flex;align-items:center;gap:10px;min-height:44px;padding:0 8px;border-radius:9px;color:var(--text);text-decoration:none;text-align:left}
+.tab:hover{background:#1b1c22;color:var(--text)}
+.tab .ini{width:22px;height:22px;border-radius:6px;background:#22332f;color:var(--accent);display:grid;place-items:center;font:600 10px var(--mono);flex-shrink:0}
+.tab .ini.gold{background:var(--gold-bg);color:var(--gold)}
+.tab .t{display:flex;flex-direction:column;min-width:0}
+.tab .t b{font-size:13px;font-weight:500}
+.tab .t span{font:400 10px var(--mono);color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tab .dot{margin-left:auto}
+.cell-private .btn{white-space:normal;text-align:center;line-height:1.3;padding:8px 12px}
+.cell-private{margin-top:auto;display:flex;flex-direction:column;gap:8px;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--panel)}
+.loupe{min-width:0;display:flex;flex-direction:column;gap:14px;padding:18px 20px;background:var(--win)}
+.lhead{display:flex;align-items:flex-end;flex-wrap:wrap;gap:12px 16px}
+.lhead h1{margin:0;font-size:30px;font-weight:600;letter-spacing:-.01em;line-height:1.15}
+.lhead .k{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.lhead .act{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+.secnav{display:flex;gap:2px;border-bottom:1px solid var(--line2);overflow-x:auto;scrollbar-width:none}
+.secnav a{padding:10px 12px;font-size:13px;color:var(--dim);text-decoration:none;white-space:nowrap}
+.secnav a:hover{color:var(--text)}
+.secnav a[aria-current=page]{color:var(--text);box-shadow:inset 0 -2px 0 var(--accent)}
+.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.three .card{display:flex;flex-direction:column;gap:9px;min-height:250px}
+.ch{display:flex;align-items:baseline;gap:8px}
+.ch h2{margin:0;font-size:15px;font-weight:600}
+.ch .kick{margin-left:auto}
+.row{display:flex;align-items:center;gap:8px;font-size:13px;min-width:0}
+.row b{white-space:nowrap}.row .sub{color:var(--dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.row .tag{margin-left:auto;font:400 10px var(--mono);color:var(--muted);white-space:nowrap}
+.bar2{height:4px;border-radius:2px;background:var(--line2)}
+.bar2 i{display:block;height:4px;border-radius:2px;background:var(--accent)}
+.bar2 i.gold{background:var(--gold)}
+.floor{display:flex;align-items:center;gap:8px;font-size:13px}
+.floor b{width:18px;height:18px;border-radius:5px;background:var(--gold-bg);color:var(--gold);display:grid;place-items:center;font:600 10px var(--mono);flex-shrink:0}
+.floor b.t{background:#22332f;color:var(--accent)}
+.chip-state{margin-top:auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;background:var(--teal-sunk);border:1px solid var(--teal-line);font:400 11px var(--mono);color:#b9e9e1}
+.chip-state.pulled{background:var(--gold-bg);border-color:rgba(233,185,73,.5);color:var(--gold)}
+.inbox{display:grid;grid-template-columns:300px minmax(0,1fr);border:1px solid var(--line);border-radius:14px;background:var(--panel);overflow:hidden;min-height:330px}
+.inbox .list{display:flex;flex-direction:column;border-right:1px solid var(--line2);min-width:0}
+.inbox .lh{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--line2)}
+.inbox .lh h2{margin:0;font-size:15px;font-weight:600}
+.count{margin-left:auto;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:var(--gold);color:var(--accent-ink);display:grid;place-items:center;font:600 11px var(--mono)}
+.count.zero{background:var(--line2);color:var(--dim)}
+.item{display:flex;flex-direction:column;gap:3px;padding:12px 14px;border:0;border-bottom:1px solid var(--line2);background:transparent;color:var(--text);text-align:left;width:100%}
+.item:hover{background:#17181d}
+.item[aria-current=true]{background:var(--gold-bg);box-shadow:inset 3px 0 0 var(--gold)}
+.item .m{display:flex;font:400 10px var(--mono);color:var(--gold)}
+.item .m span{margin-left:auto;color:var(--muted)}
+.item b{font-size:14px;font-weight:600}
+.item .s{font-size:12px;color:var(--muted)}
+.pane{display:flex;flex-direction:column;gap:14px;padding:18px 20px;min-width:0}
+.pane h3{margin:0;font-size:20px;font-weight:600}
+.prov{display:flex;flex-direction:column;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:var(--sunk);font:400 11px var(--mono);color:var(--muted)}
+.prov .r{display:flex;gap:10px;padding:4px 0}
+.prov .r span:nth-child(2){width:80px;flex-shrink:0}
+pre.intent{margin:0;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:var(--sunk);font:12px/1.5 var(--mono);color:var(--text2);white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto}
+.acts{margin-top:auto;display:flex;gap:10px;flex-wrap:wrap}
+.empty{padding:22px;color:var(--muted);font-size:14px}
+.tblwrap{overflow:auto;border:1px solid var(--line);border-radius:14px;background:var(--panel)}
+table.t{border-collapse:collapse;width:100%;font-size:13px}
+table.t th{position:sticky;top:0;background:#17181d;text-align:left;font:500 10px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--dim);padding:10px 12px;border-bottom:1px solid var(--line2);white-space:nowrap}
+table.t td{padding:9px 12px;border-bottom:1px solid var(--line2);vertical-align:top}
+table.t tr:last-child td{border-bottom:0}
+.idc{font:400 11px var(--mono);color:var(--muted);word-break:break-all}
+.jsn{font:400 11px var(--mono);color:var(--dim);word-break:break-word}
+.hood{font:400 11px var(--mono);color:var(--dim)}
+.signin{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:14px}
+.signin .card{display:flex;flex-direction:column;gap:12px;padding:20px}
+.signin h2{margin:0;font-size:22px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font:400 12px var(--mono);color:var(--muted)}
+.kv b{font-weight:500;color:var(--text)}
+.cog{display:flex;flex-direction:column;gap:12px;padding:16px;border-left:1px solid var(--line2);background:linear-gradient(180deg,#111a18 0%,#101115 38%);min-width:0}
+.cog .hd{display:flex;align-items:center;gap:10px}
+.cog .badge{width:30px;height:30px;border-radius:9px;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font:700 10px var(--mono);flex-shrink:0}
+.atelier{display:flex;flex-direction:column;gap:10px;padding:12px;border-radius:14px;border:1px solid var(--teal-line);background:var(--teal-sunk)}
+.marks{flex:1;min-height:240px;display:flex;flex-direction:column;gap:6px;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--sunk);overflow:auto}
+.mk{display:grid;grid-template-columns:40px 74px minmax(0,1fr);gap:8px;font:400 11px var(--mono);color:var(--muted)}
+.mk span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.msg{font-size:13px;min-height:18px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border-radius:999px;border:1px solid var(--line3);background:transparent;font:500 11px var(--mono)}
+.chip.off{opacity:.45}
+.mbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.mbar select,.mbar input{min-height:38px;padding:0 10px;border-radius:9px;border:1px solid var(--line3);background:var(--sunk)}
+.viz{overflow:hidden}
+.viz svg{display:block;max-width:100%}
+.viz .dot{cursor:pointer}
+.ent{display:grid;grid-template-columns:48px minmax(0,1fr);gap:10px;cursor:pointer}
+.ent .c{margin-top:4px;font-size:14px;color:var(--text2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ent.open .c{display:block}
+.ent.gone{opacity:.55}
+.ent.hit{border-color:var(--accent)}
+.day{margin:14px 0 4px;font:500 10px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+.connect{max-width:640px;display:flex;flex-direction:column;gap:12px}
+.connect .r{display:flex;gap:10px;font:400 12px var(--mono);color:var(--muted)}
+.connect .r b{width:70px;font-weight:500;color:var(--text)}
+@media (max-width:1180px){.body{grid-template-columns:220px minmax(0,1fr)}.cog{grid-column:1/-1;border-left:0;border-top:1px solid var(--line2)}.marks{max-height:340px}}
+@media (max-width:860px){.three{grid-template-columns:1fr}.three .card{min-height:0}.inbox{grid-template-columns:1fr}.inbox .list{border-right:0;border-bottom:1px solid var(--line2)}.signin{grid-template-columns:1fr}}
+@media (max-width:760px){.body{grid-template-columns:1fr}.rail{order:3;border-right:0;border-top:1px solid var(--line2)}.loupe{order:1;padding:16px}.cog{order:2}.lhead h1{font-size:24px}.omni{order:5;flex-basis:100%}.hist{display:none}.omni .cell{display:none}}
+</style>
+</head>
+<body>
+<div class="frame">
+  <div class="ring tl" aria-hidden="true"><span>Threshold</span><span>·</span><span>Tracing</span><span>·</span><span><b>Seal</b></span><span>·</span><span>Atelier</span><span>·</span><span>Escapement</span><span>·</span><span>Hallmark</span><span>·</span><span>Loupe</span><span>·</span><span>Patina</span></div>
+  <div class="ring tr" aria-hidden="true">Movement № 0001 · Estate of Dw</div>
+  <div class="ring bl" aria-hidden="true"><span>Bezel</span><span>·</span><span>Warrant</span><span>·</span><span>Crown</span><span>·</span><span>Cloisonné</span><span>·</span><span>Jewels</span><span>·</span><span>Provenance</span></div>
+  <div class="ring br" aria-hidden="true">every arrow leaves a hallmark · you only touch the seal</div>
+  <div class="ring vl" aria-hidden="true">Cloisonné · worlds in their own cells</div>
+  <div class="ring vr" aria-hidden="true">the Loupe · look closely</div>
+  <div class="tick a" aria-hidden="true"></div><div class="tick b" aria-hidden="true"></div><div class="tick c" aria-hidden="true"></div><div class="tick d" aria-hidden="true"></div>
+
+  <div class="win">
+    <header class="bar">
+      <a class="brand" href="/" aria-label="Runtime home"><span class="gem" aria-hidden="true"></span><span><b>RUNTIME</b><span>THE MESH BROWSER</span></span></a>
+      <nav class="hist" aria-label="History">
+        <button class="icon" type="button" id="back" aria-label="Back"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg></button>
+        <button class="icon" type="button" id="fwd" aria-label="Forward"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg></button>
+        <button class="icon" type="button" id="reload" aria-label="Reload"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg></button>
+      </nav>
+      <form class="omni" id="omni" role="search">
+        <span class="cell" id="omniCell"><i></i>ESTATE</span>
+        <label class="sr" for="q">Go to a page, or find in this one</label>
+        <input id="q" autocomplete="off" spellcheck="false">
+        <span class="modes" role="group" aria-label="What the bar does">
+          <button type="button" data-mode="go" aria-pressed="true">Go</button>
+          <button type="button" data-mode="find" aria-pressed="false">Find</button>
+        </span>
+      </form>
+      <span class="on-pill" id="onPill"><span class="dot" id="onDot"></span><span id="onTxt">RUNTIME</span></span>
+      <button class="crownb" type="button" id="crown" aria-label="The Crown: pull it and every agent halts" title="The Crown"><svg class="turn" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="7"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg></button>
+      <button class="who out" type="button" id="who">Sign in</button>
+    </header>
+    <div class="guill" aria-hidden="true"></div>
+
+    <div class="body">
+      <aside class="rail" aria-label="Worlds and tabs">
+        <div class="grp"><span class="kick">Cloisonné · worlds</span><div id="worlds"></div></div>
+        <div class="grp"><span class="kick">Tabs · estate</span><div id="tabs"></div></div>
+        <div class="grp"><span class="kick">Pages</span>
+          <a class="tab" href="/loop"><span class="ini">LP</span><span class="t"><b>The loop</b><span>a world, live</span></span></a>
+          <a class="tab" href="/card"><span class="ini">CD</span><span class="t"><b>Card</b><span>a person's world</span></span></a>
+          <a class="tab" href="/invite"><span class="ini gold">IN</span><span class="t"><b>Invite</b><span>choose your way in</span></span></a>
+        </div>
+        <div class="cell-private">
+          <span class="kick">The private cell · agents never see</span>
+          <span class="note" style="font-size:12px">Keys, passwords and banking stay off this runtime. Agents only ever hold grants.</span>
+          <button class="btn crown" type="button" id="crown2">Pull the Crown · halt every agent</button>
+        </div>
+      </aside>
+
+      <main class="loupe" id="main" tabindex="-1">
+        <div class="lhead">
+          <div style="display:flex;flex-direction:column;gap:4px">
+            <span class="k"><span class="kick" id="lexKick">The Loupe · RightOnPar estate</span><span class="stamp" id="hall"><i></i>Hallmarked</span></span>
+            <h1 id="title">Everyone and everything on your Mesh</h1>
+          </div>
+          <div class="act" id="headAct"></div>
+        </div>
+        <nav class="secnav" aria-label="Sections" id="secnav"></nav>
+        <div id="view" style="display:flex;flex-direction:column;gap:14px;min-width:0"></div>
+      </main>
+
+      <aside class="cog" aria-label="COG panel">
+        <div class="hd"><span class="badge">COG</span><span style="display:flex;flex-direction:column"><b style="font-size:15px">COG</b><span class="mono" style="font-size:10px;color:var(--dim)">your stand-in · the movement's mainspring</span></span><span class="mono" id="cogMode" style="margin-left:auto;font-size:10px;color:var(--accent)">WATCHING</span></div>
+        <div class="atelier">
+          <div class="mono" style="display:flex;align-items:center;gap:8px;font-size:10px;color:#b9e9e1"><span class="dot pulse" id="atDot"></span><span id="atKick">ATELIER · LAST MOVE</span></div>
+          <span id="atText" style="font-size:13px;color:var(--text2);line-height:1.45">Sign in to watch what COG and the agents are doing.</span>
+          <a class="btn go" href="https://deck.meshtool.ai/" target="_blank" rel="noopener">Talk to COG on the deck</a>
+        </div>
+        <div class="marks" aria-live="polite">
+          <span class="kick">Hallmarks · live · every node</span>
+          <div id="marks" style="display:flex;flex-direction:column;gap:6px"></div>
+        </div>
+        <span class="note" style="font-size:12px">COG proposes, the runtime signs. Only the gold seal comes back to you.</span>
+      </aside>
+    </div>
+
+    <footer class="foot">
+      <span><span style="color:var(--accent)">●</span> spine · events bus</span>
+      <span>assay · ledger from hallmarks</span>
+      <span id="footCell">cell · all worlds</span>
+      <span class="stamp" id="prov" style="height:16px;font-size:8px"><i></i>Provenance intact</span>
+      <span class="end" id="footVer">runtime.meshtool.ai</span>
+    </footer>
+  </div>
+</div>
+
+<script>
+"use strict";
+// The Runtime Browser: one console for people, agents, grants and guardrails. Everything here is read
+// from this runtime's own API; nothing is invented. Signed out, it shows only what /health and
+// /status.json already make public. Signed in (Face ID at id.meshtool.ai, or the admin key once), every
+// /api/admin call rides on the HttpOnly session cookie the runtime sets.
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const now = () => Date.now();
+const ago = (v) => { const t = typeof v === "number" ? (v < 1e12 ? v * 1000 : v) : new Date(v).getTime(); if (!t) return ""; const s = Math.max(0, (now() - t) / 1000); return s < 60 ? "now" : s < 3600 ? Math.floor(s / 60) + "m" : s < 86400 ? Math.floor(s / 3600) + "h" : Math.floor(s / 86400) + "d"; };
+const hhmm = (v) => { const d = new Date(v); return isNaN(d) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }); };
+const when = (v) => { const d = new Date(typeof v === "number" && v < 1e12 ? v * 1000 : v); return isNaN(d) ? esc(v) : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); };
+const ss = { get: (k) => { try { return sessionStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { v == null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch {} } };
+
+const S = { signed: false, K: ss.get("cos_admin"), health: null, status: null, overview: null, tenants: [], grants: [], approvals: [], events: [], world: "", mode: "go", q: "", sel: null, view: "", busy: false, msg: "" };
+
+// ---- the wire ---------------------------------------------------------------------------------
+async function api(path, opts = {}) {
+  const h = { ...(opts.body ? { "content-type": "application/json" } : {}), ...(opts.headers || {}) };
+  if (S.K && !h.authorization) h.authorization = "Bearer " + S.K;
+  const r = await fetch(path, { ...opts, headers: h, credentials: "same-origin" });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && !opts.headers?.authorization) { S.signed = false; if (S.K) { S.K = null; ss.set("cos_admin", null); } }
+  if (!r.ok) { const e = new Error(j.error || "http " + r.status); e.status = r.status; e.detail = j; throw e; }
+  return j;
+}
+const pub = (p) => fetch(p, { credentials: "same-origin" }).then((r) => r.json()).catch(() => null);
+
+// ---- names -----------------------------------------------------------------------------------
+const tname = (id) => (S.tenants.find((t) => t.id === id) || {}).name || (id ? String(id).slice(0, 10) : "");
+const live = (g) => g.status === "active" && +g.exp * 1000 > now();
+function who(sub) {
+  const s = String(sub || "");
+  if (s === "tenant:root") return ["World root", "the owner's key"];
+  if (s.startsWith("connector:")) return [cap(s.slice(10)), "connector"];
+  if (s.startsWith("agent:")) { const [host, role] = s.slice(6).split("/"); return [cap(host), role ? role : "agent"]; }
+  if (s.startsWith("guest:")) return ["Guest", s.slice(6, 18)];
+  if (s.startsWith("worker:")) return [cap(s.slice(7)), "worker"];
+  const i = s.indexOf(":");
+  return i > 0 ? [cap(s.slice(i + 1)), s.slice(0, i)] : [cap(s), ""];
+}
+const NAMES = { cog: "COG", chatgpt: "ChatGPT", codex: "Codex", claude: "Claude", cline: "Cline", frank: "Frank", grok: "Grok", muse: "Muse" };
+function cap(s) { s = String(s || ""); return NAMES[s.toLowerCase()] || (s ? s[0].toUpperCase() + s.slice(1) : "—"); }
+const LEVEL = ["observe", "ask", "act"];
+const lvl = (v) => (typeof v === "number" || /^[0-9]$/.test(String(v)) ? LEVEL[+v] || String(v) : String(v ?? "ask"));
+const SW = ["var(--accent)", "var(--blue)", "var(--gold)", "var(--worker)", "var(--fan)"];
+const evTone = (t) => { t = String(t); return /fail|crash|denied|revok|paused/.test(t) ? "var(--bad)" : t.startsWith("cog") ? "var(--accent)" : t.startsWith("grant") ? "#7fe0a8" : /approv|autonomy|escrow/.test(t) ? "var(--gold)" : t.startsWith("deploy") || t.startsWith("worker") ? "var(--blue)" : t.startsWith("agent") ? "var(--worker)" : "var(--muted)"; };
+
+// ---- views -----------------------------------------------------------------------------------
+const VIEWS = {
+  "": { title: "Everyone and everything on your Mesh", nav: "Overview", lex: "The Loupe" },
+  grants: { title: "Grants", nav: "Grants", lex: "Warrants", one: "Every capability alive right now, what it may do, and what is left of its budget.", api: "/api/admin/grants?limit=500", key: "grants", cols: ["sub", "tenant", "status", "caps", "remaining", "exp", "id"] },
+  worlds: { title: "Worlds", nav: "Worlds", lex: "Cloisonné", one: "Each world in its own cell: who is on this runtime, and on what tier.", api: "/api/tenants", key: "tenants", cols: ["name", "tier", "status", "deploys_period", "created_at", "id"] },
+  receipts: { title: "Receipts", nav: "Receipts", lex: "Hallmarks", one: "Every action the runtime, COG and the agents took, newest first.", api: "/api/admin/events", key: "events", cols: ["ts", "type", "actor", "tenant", "data"] },
+  ledger: { title: "Ledger", nav: "Ledger", lex: "Assay", one: "Every reserve, settle and release: the money trail.", api: "/api/admin/ledger", key: "ledger", cols: ["ts", "kind", "usd_cents", "calls", "deploys", "tenant", "grant_id", "note"] },
+  workers: { title: "Workers", nav: "Workers", lex: "Escapement", one: "What is deployed, planned, or failed.", api: "/api/admin/deploys", key: "deploys", cols: ["name", "template", "status", "executed", "tenant", "created_at"] },
+  intake: { title: "Intake", nav: "Intake", lex: "Threshold", one: "What arrived from Stripe, Railway, GitHub, the Brain and the Mesh.", api: "/api/admin/webhooks", key: "webhooks", cols: ["source", "type", "received_at", "handled", "result"] },
+  outbox: { title: "Outbox", nav: "Outbox", lex: "Patina", one: "What is on its way to the Brain and the memory bridge.", api: "/api/admin/outbox", key: "outbox", cols: ["kind", "attempts", "next_at", "done", "last_error", "created_at"] },
+  memory: { title: "Memory", nav: "Memory", lex: "Patina", one: "What the runtime remembers, in the order it happened." },
+  guardrails: { title: "Guardrails", nav: "Guardrails", lex: "The Bezel", one: "The floors that never move, the Crown, and what is armed." },
+};
+const ALIAS = { tenants: "worlds", events: "receipts", deploys: "workers", webhooks: "intake", hub: "" };
+
+function parseRoute() {
+  const sp = new URLSearchParams(location.search);
+  if (sp.get("connect") === "1") return { k: "connect", qs: sp.toString() };
+  const raw = (location.hash || "#/").replace(/^#\/?/, "");
+  let [k, qs] = raw.split("?");
+  k = ALIAS[k] ?? k;
+  return { k: VIEWS[k] || k === "connect" ? k : "", qs: qs || "" };
+}
+
+function setHead(k) {
+  const v = VIEWS[k] || VIEWS[""];
+  $("title").textContent = k === "connect" ? "An app wants in" : v.title;
+  $("lexKick").textContent = (k === "connect" ? "The Threshold" : v.lex) + " · RightOnPar estate";
+  document.title = (k ? (k === "connect" ? "Connect" : v.title) + " · " : "") + "Runtime";
+  $("secnav").innerHTML = Object.entries(VIEWS).map(([key, x]) => `<a href="#/${key}" ${key === k ? 'aria-current="page"' : ""}>${esc(x.nav)}</a>`).join("");
+  $("q").value = S.mode === "find" ? S.q : "runtime.meshtool.ai / " + (k || "overview");
+  $("headAct").innerHTML = "";
+}
+
+async function route() {
+  const { k, qs } = parseRoute();
+  S.view = k;
+  setHead(k);
+  if (k === "connect") return connect(qs);
+  if (!S.signed) return signin();
+  if (k === "") return overview();
+  if (k === "memory") return memory();
+  if (k === "guardrails") return guardrails();
+  return table(k);
+}
+
+// ---- sign in ---------------------------------------------------------------------------------
+function signin(note) {
+  const h = S.health || {};
+  const sso = new URLSearchParams(location.search).get("sso");
+  const why = sso === "refused" ? "That sign-in pass was refused. Try again." : sso === "off" ? "Face ID sign-in is not switched on here yet; use the key once." : note || "";
+  $("view").innerHTML = `<div class="signin">
+    <div class="card">
+      <span class="kick">The Seal · owner only</span>
+      <h2>Sign in to look closely</h2>
+      <p class="note" style="margin:0">Grants, receipts, the ledger and anything waiting on your sign-off live behind this door. Agents never sign in here: they only ever hold grants.</p>
+      <a class="btn go" href="/sso/start?return=${encodeURIComponent(location.pathname + location.search)}">Sign in with MeshTool (Face ID)</a>
+      <form id="keyForm" style="display:flex;flex-direction:column;gap:8px">
+        <label for="k" class="note">Or the admin key, once. This browser stays signed in for 30 days; the key is not kept.</label>
+        <div style="display:flex;gap:8px"><input id="k" class="field" type="password" autocomplete="off"><button class="btn" type="submit">Unlock</button></div>
+      </form>
+      <div class="msg" id="sMsg">${why ? `<span class="err">${esc(why)}</span>` : ""}</div>
+    </div>
+    <div class="card">
+      <span class="kick">Public · anyone can see this</span>
+      <div class="kv">
+        <span>runtime</span><b>${h.ok ? (h.killSwitch ? "paused" : "online") : "checking"}</b>
+        <span>version</span><b>${esc(h.version || "—")} · policy ${esc(h.policy || "—")}</b>
+        <span>source</span><b>${esc(String((h.source || {}).sha256 || "").slice(0, 12) || "—")}</b>
+        <span>crown</span><b>${h.killSwitch ? "pulled · every grant fails closed" : "in · agents may run"}</b>
+      </div>
+      <div id="pubBodies" class="kv"></div>
+      <p class="note" style="margin:0">Machine surface: <a href="/status">status</a> · <a href="/routes">routes</a> · <a href="/directory">directory</a> · <a href="/mcp">mcp</a> · <a href="/docs">docs</a></p>
+    </div></div>`;
+  const b = (S.status && S.status.bodies) || [];
+  $("pubBodies").innerHTML = b.map((x) => `<span>${esc(x.name)}</span><b>${x.up ? "up · " + esc(x.ms) + " ms" : "down"}</b>`).join("");
+  $("keyForm").onsubmit = async (e) => {
+    e.preventDefault();
+    const k = $("k").value.trim(); $("k").value = "";
+    if (!k) return;
+    $("sMsg").textContent = "checking…";
+    try {
+      await api("/api/admin/session", { method: "POST", headers: { authorization: "Bearer " + k } });
+      S.K = null; ss.set("cos_admin", null);
+    } catch (err) {
+      if (err.status === 401) { $("sMsg").innerHTML = '<span class="err">That key was not accepted.</span>'; return; }
+      S.K = k; ss.set("cos_admin", k); // an older runtime without sessions: keep it in this tab only
+    }
+    await boot();
+  };
+}
+
+// ---- overview: seats, warrants, the bezel, and the seal ----------------------------------------
+function inWorld(r) { return !S.world || r.tenant === S.world || r.id === S.world; }
+function findOk(r) { return !S.q || JSON.stringify(r).toLowerCase().includes(S.q.toLowerCase()); }
+
+function overview() {
+  const g = S.grants.filter(live).filter(inWorld).filter(findOk);
+  const bySub = new Map();
+  g.forEach((x) => { const k = x.sub + "|" + x.tenant; const o = bySub.get(k) || { sub: x.sub, tenant: x.tenant, n: 0, depth: +x.depth, at: 0 }; o.n++; o.at = Math.max(o.at, new Date(x.created_at).getTime() || 0); bySub.set(k, o); });
+  const seats = [...bySub.values()].sort((a, b) => (a.depth === 0) - (b.depth === 0) || b.at - a.at);
+  const warrants = g.filter((x) => +x.depth > 0).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 5);
+  const pulled = !!(S.health && S.health.killSwitch);
+  const pend = S.approvals.filter(inWorld);
+  if (S.sel && !pend.find((a) => a.id === S.sel)) S.sel = null;
+  if (!S.sel && pend[0]) S.sel = pend[0].id;
+  const worldsOn = [...new Set(g.map((x) => x.tenant))];
+  $("headAct").innerHTML = `<a class="btn go" href="/loop${S.world ? "?world=" + encodeURIComponent(S.world) : ""}">Watch the loop</a>`;
+  $("view").innerHTML = `
+  <div class="three">
+    <section class="card" aria-label="Seats">
+      <div class="ch"><h2>Seats</h2><span class="kick">Jewels · agents · people</span></div>
+      <div style="display:flex;flex-direction:column;gap:7px">${seats.slice(0, 6).map((s) => { const [n, d] = who(s.sub); return `<div class="row"><span class="dot ${s.depth === 0 ? "gold" : ""} ${s.depth > 0 ? "pulse" : ""}"></span><b style="font-weight:600">${esc(n)}</b><span class="sub">${esc(d)}${S.world ? "" : " · " + esc(tname(s.tenant))}</span><span class="tag">${s.n > 1 ? s.n + " KEYS" : "HOLDS 1"}</span></div>`; }).join("") || '<span class="note">No one holds a live grant.</span>'}${seats.length > 6 ? `<a class="note" href="#/grants">+${seats.length - 6} more</a>` : ""}</div>
+      <div class="chips" style="margin-top:auto">${worldsOn.slice(0, 4).map((t, i) => `<span class="pill" style="border-color:${SW[i % SW.length]};color:${SW[i % SW.length]}">${esc(tname(t).toUpperCase())}</span>`).join("")}</div>
+    </section>
+    <section class="card" aria-label="Live grants">
+      <div class="ch"><h2>Warrants</h2><span class="kick">One job each</span></div>
+      ${warrants.map((w) => { const [n] = who(w.sub); const u = used(w); return `<div style="display:flex;flex-direction:column;gap:5px"><div class="row"><span>${esc(n)}</span><span class="tag">${esc((w.caps || []).slice(0, 2).join(" · ") || "—")}</span></div><div class="bar2" title="${Math.round(u * 100)}% of budget used"><i class="${u > 0.8 ? "gold" : ""}" style="width:${Math.max(2, Math.round(u * 100))}%"></i></div></div>`; }).join("") || '<span class="note">No agent holds a warrant right now.</span>'}
+      <p class="note" style="margin:auto 0 0;font-size:12px">Bar = budget used. A warrant ends when the job does, or when you pull it.</p>
+    </section>
+    <section class="card" aria-label="Guardrails">
+      <div class="ch"><h2>The Bezel</h2><span class="kick">Floors · always on</span></div>
+      <div class="floor"><b>$</b>Money waits for your gold OK</div>
+      <div class="floor"><b>↑</b>Deploys run dry first, inside a grant</div>
+      <div class="floor"><b>×</b>Deletes and keys never ride a grant</div>
+      <div class="floor"><b class="t">◎</b>Worlds stay in their own cells</div>
+      <div class="floor"><b class="t">#</b>Every action leaves a receipt</div>
+      <div class="chip-state ${pulled ? "pulled" : ""}">${pulled ? "■ Crown pulled · every grant fails closed" : "● Crown in · agents may run"}</div>
+    </section>
+  </div>
+  <section class="inbox" aria-label="Your inbox">
+    <div class="list">
+      <div class="lh"><h2>Inbox</h2><span class="kick">The Seal · only what needs you</span><span class="count ${pend.length ? "" : "zero"}">${pend.length}</span></div>
+      ${pend.slice(0, 8).map((a) => `<button class="item" type="button" data-ap="${esc(a.id)}" aria-current="${a.id === S.sel}"><span class="m">SIGN-OFF · ${esc(tname(a.tenant).toUpperCase())}<span>${ago(a.created_at)}</span></span><b>${esc(actionLabel(a))}</b><span class="s">${esc(asker(a))}</span></button>`).join("") || '<div class="empty">Nothing needs you. Every arrow left a hallmark.</div>'}
+    </div>
+    <article class="pane" id="pane" aria-label="Reading pane"></article>
+  </section>`;
+  document.querySelectorAll("[data-ap]").forEach((b) => (b.onclick = () => { S.sel = b.dataset.ap; overview(); }));
+  pane();
+}
+function used(g) {
+  const b = g.budget || {}, r = g.remaining || {};
+  for (const k of ["usd_cents", "calls", "deploys"]) if (+b[k] > 0) return Math.min(1, Math.max(0, 1 - (+r[k] || 0) / +b[k]));
+  return 0;
+}
+const actionLabel = (a) => ({ deploy: "Deploy a worker?", escrow: "Hold money in escrow?", "market.call": "Pay for a market call?" })[a.action] || cap(String(a.action).replace(/[._]/g, " ")) + "?";
+function asker(a) { const g = S.grants.find((x) => x.id === a.grant_id); return (g ? who(g.sub)[0] : a.requested_by || "an agent") + " asked · autonomy " + lvl(a.autonomy); }
+function pane() {
+  const a = S.approvals.find((x) => x.id === S.sel);
+  if (!$("pane")) return;
+  if (!a) { $("pane").innerHTML = `<span class="kick">Reading pane</span><h3>The seal is clear</h3><p class="note" style="margin:0">When an agent at autonomy “ask” wants to spend, deploy or hold money, it stops here and waits for you. Everything else runs on its own grant and leaves a receipt.</p>`; return; }
+  const g = S.grants.find((x) => x.id === a.grant_id);
+  $("pane").innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px"><span class="badge" style="width:34px;height:34px;border-radius:10px;background:#22332f;color:var(--accent);display:grid;place-items:center;font:600 11px var(--mono)">COG</span>
+      <div style="display:flex;flex-direction:column"><span class="note">${esc(asker(a))} · ${esc(tname(a.tenant))}</span><h3>${esc(actionLabel(a))}</h3></div></div>
+    <pre class="intent" aria-label="What it wants to do">${esc(JSON.stringify(a.intent, null, 2))}</pre>
+    <div class="prov"><span style="padding-bottom:8px;color:var(--dim);letter-spacing:.12em;display:flex;align-items:center;gap:10px">PROVENANCE<span class="stamp"><i></i>Assayed</span></span>
+      <div class="r"><span style="color:var(--accent)">●</span><span>grant</span><span>${esc(g ? who(g.sub).join(" · ") : a.grant_id)} · ${esc(a.grant_id)}</span></div>
+      <div class="r"><span style="color:var(--accent)">●</span><span>asked</span><span>${esc(a.action)} · ${when(a.created_at)}</span></div>
+      <div class="r"><span style="color:var(--accent)">●</span><span>stopped</span><span>at the seal · autonomy ${esc(lvl(a.autonomy))}</span></div>
+      <div class="r"><span style="color:var(--gold)">●</span><span style="color:var(--gold)">sign-off</span><span style="color:var(--text)">waiting on you</span></div></div>
+    <div class="acts"><button class="btn seal" type="button" id="apOk">Approve</button><button class="btn" type="button" id="apNo">Deny</button></div>
+    <div class="msg" id="apMsg"></div>`;
+  $("apOk").onclick = () => decide(a, "approve");
+  $("apNo").onclick = () => decide(a, "deny");
+}
+// The owner decides with the world's ROOT grant (the runtime refuses any other): sign a token for it
+// from this session, use it once, drop it.
+async function rootToken(tenant) {
+  const j = await api("/api/admin/grants?status=active&tenant=" + encodeURIComponent(tenant) + "&limit=1000");
+  const r = (j.grants || []).find((x) => +x.depth === 0 && +x.exp * 1000 > now() + 60000);
+  if (!r) throw new Error("this world has no live root grant");
+  return (await api(`/api/admin/grants/${encodeURIComponent(r.id)}/token`, { method: "POST" })).token;
+}
+async function decide(a, verdict) {
+  if (verdict === "approve" && !confirm(`Approve “${actionLabel(a)}” for ${tname(a.tenant)}? It runs right away under the agent's own grant.`)) return;
+  $("apOk").disabled = $("apNo").disabled = true; $("apMsg").textContent = "sealing…";
+  try {
+    let t = await rootToken(a.tenant);
+    const r = await fetch(`/api/approvals/${encodeURIComponent(a.id)}`, { method: "POST", headers: { authorization: "Bearer " + t, "content-type": "application/json" }, body: JSON.stringify({ decision: verdict }) });
+    t = null;
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || "http " + r.status);
+    $("apMsg").textContent = verdict === "approve" ? "Sealed. It's running." : "Denied. The agent was told.";
+    await refresh();
+  } catch (e) { $("apMsg").innerHTML = `<span class="err">Couldn't ${verdict}: ${esc(e.message)}</span>`; $("apOk").disabled = $("apNo").disabled = false; }
+}
+
+// ---- tables ----------------------------------------------------------------------------------
+function cell(col, v, r) {
+  if (v === null || v === undefined || v === "") return '<span class="jsn">—</span>';
+  if (col === "sub") { const [n, d] = who(v); return `<b style="font-weight:600">${esc(n)}</b> <span class="dim" style="font-size:12px">${esc(d)}</span>`; }
+  if (col === "tenant") return `<span title="${esc(v)}">${esc(tname(v))}</span>`;
+  if (col === "status" || col === "kind" || col === "tier" || col === "handled" || col === "done" || col === "executed") { const s = String(v); const t = /active|settle|success|deployed|true|done|approved/.test(s) ? "ok" : /revok|fail|crash|denied|suspend/.test(s) ? "bad" : /pending|plan|dry|expired|reserve/.test(s) ? "gold" : ""; return `<span class="pill ${t}">${esc(s)}</span>`; }
+  if (col === "type") return `<span style="color:${evTone(v)}">${esc(v)}</span>`;
+  if (["ts", "created_at", "received_at", "next_at", "exp"].includes(col)) return `<span class="idc">${when(v)}</span>`;
+  if (col === "caps" && Array.isArray(v)) return `<span class="jsn">${esc(v.join(" · "))}</span>`;
+  if (col === "remaining" && typeof v === "object") return `<span style="color:var(--accent)">¢${esc(v.usd_cents)}</span> <span class="jsn">· ${esc(v.calls)} calls · ${esc(v.deploys)} deploys</span>`;
+  if (col === "id" || col.endsWith("_id")) return `<span class="idc">${esc(v)}</span>`;
+  if (typeof v === "object") { const s = JSON.stringify(v); return `<span class="jsn" title="${esc(s)}">${esc(s.length > 140 ? s.slice(0, 140) + "…" : s)}</span>`; }
+  return esc(v);
+}
+async function table(k) {
+  const v = VIEWS[k];
+  $("view").innerHTML = `<p class="note" style="margin:0">${esc(v.one)}</p><div class="empty">loading…</div>`;
+  if (k === "outbox") $("headAct").innerHTML = `<button class="btn" type="button" id="drain">Drain the outbox</button>`;
+  let rows = [];
+  try { rows = (await api(v.api))[v.key] || []; } catch (e) { if (!S.signed) return signin(); $("view").innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
+  if (S.view !== k) return;
+  if (k === "grants") rows.forEach((r) => { if (r.status === "active" && +r.exp * 1000 < now()) r.status = "expired"; });
+  const shown = rows.filter((r) => (k === "worlds" ? !S.world || r.id === S.world : inWorld(r))).filter(findOk);
+  const canPull = (r) => k === "grants" && r.status === "active" && +r.depth > 0;
+  $("view").innerHTML = `<p class="note" style="margin:0">${esc(v.one)}</p>
+    <div class="tblwrap">${shown.length ? `<table class="t"><thead><tr>${v.cols.map((c) => `<th scope="col">${esc(c.replace(/_/g, " "))}</th>`).join("")}${k === "grants" ? '<th scope="col"><span class="sr">Action</span></th>' : ""}</tr></thead><tbody>${shown.map((r) => `<tr>${v.cols.map((c) => `<td>${cell(c, r[c], r)}</td>`).join("")}${k === "grants" ? `<td>${canPull(r) ? `<button class="btn sm bad" type="button" data-rv="${esc(r.id)}">Pull</button>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table>` : '<div class="empty">Nothing here yet.</div>'}</div>
+    <div class="hood">${shown.length} of ${rows.length} rows · newest first${S.world ? " · world " + esc(tname(S.world)) : ""}${S.q ? " · find “" + esc(S.q) + "”" : ""} · source ${esc(v.api.split("?")[0])}</div><div class="msg" id="tMsg"></div>`;
+  document.querySelectorAll("[data-rv]").forEach((b) => (b.onclick = async () => {
+    if (!confirm("Pull this warrant? The agent loses it right away, and so does everything it handed down.")) return;
+    b.disabled = true;
+    try { await api(`/api/admin/grants/${encodeURIComponent(b.dataset.rv)}/revoke`, { method: "POST", body: JSON.stringify({ reason: "owner pulled it in the runtime browser" }) }); await refresh(); }
+    catch (e) { b.disabled = false; $("tMsg").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+  }));
+  if ($("drain")) $("drain").onclick = async () => { $("drain").disabled = true; try { const j = await api("/api/admin/outbox/drain", { method: "POST" }); $("tMsg").textContent = "Drained: " + JSON.stringify(j); table("outbox"); } catch (e) { $("tMsg").innerHTML = `<span class="err">${esc(e.message)}</span>`; $("drain").disabled = false; } };
+}
+
+// ---- guardrails --------------------------------------------------------------------------------
+const ARMED = [["admin", "Owner sign-in and the admin API"], ["vault", "Vault: stored secrets are encrypted"], ["railway", "Railway exit: deploys run for real (else dry-run only)"], ["railwayOAuth", "Railway sign-in"], ["anthropic", "COG plan refinement"], ["ollama", "COG on a local model"], ["github", "GitHub webhook"], ["railwayWebhook", "Railway webhook"], ["mesh", "MeshMarket receipts"], ["brain", "Brain webhook"], ["brainOut", "Brain fan-out"], ["sync", "Memory sync (cognitive-mcp pulls)"], ["cognitiveBridge", "Memory bridge push"], ["lspMcp", "Code checks before COG executes"], ["stripe", "Stripe payments"]];
+async function guardrails() {
+  const h = S.health || {}, A = h.armed || {}, pulled = !!h.killSwitch;
+  let pol = null; try { pol = await api("/api/admin/policy"); } catch {}
+  if (S.view !== "guardrails") return;
+  $("view").innerHTML = `<p class="note" style="margin:0">${esc(VIEWS.guardrails.one)}</p>
+  <div class="three">
+    <section class="card"><div class="ch"><h2>The Crown</h2><span class="kick">Kill switch</span></div>
+      <p class="note" style="margin:0">${pulled ? "Pulled. Every grant fails closed, approved actions included, until you resume." : "In. Agents may act inside their grants. Pull it and everything stops at once."}</p>
+      <button class="btn ${pulled ? "seal" : "crown"}" type="button" id="crown3" style="margin-top:auto">${pulled ? "Resume the movement" : "Pull the Crown"}</button></section>
+    <section class="card"><div class="ch"><h2>Floors</h2><span class="kick">Never automatic</span></div>
+      <div class="floor"><b>$</b>Money out waits for your seal</div><div class="floor"><b>↑</b>Publishing and sending wait for you</div><div class="floor"><b>×</b>Hard deletes never ride a grant</div><div class="floor"><b>#</b>Access for people is yours alone</div>
+      <p class="note" style="margin:auto 0 0;font-size:12px">Policy ${esc(h.policy || "—")} · grants only ever narrow as they are handed down.</p></section>
+    <section class="card"><div class="ch"><h2>Operator</h2><span class="kick">Claude's own key</span></div>
+      <div class="row">Code-check caps<span class="tag">${S.overview && S.overview.operatorLspCaps ? "ON" : "OFF"}</span></div>
+      <div class="row">Guest door<span class="tag">${S.overview && S.overview.guest_pool ? (S.overview.guest_pool.open ? "OPEN" : "CLOSED") : "—"}</span></div>
+      <div class="row">Rate limit<span class="tag">${pol ? esc(pol.rateLimitPerMin) + " / MIN" : "—"}</span></div>
+      <div class="row">Caps known<span class="tag">${pol ? esc((pol.caps || []).length) : "—"}</span></div></section>
+  </div>
+  <div class="tblwrap"><table class="t"><thead><tr><th scope="col">What</th><th scope="col">Armed</th></tr></thead><tbody>${ARMED.map(([k, l]) => `<tr><td>${esc(l)}</td><td>${A[k] ? '<span class="pill ok">armed</span>' : '<span class="pill">off</span>'}</td></tr>`).join("")}</tbody></table></div>
+  ${pol ? `<div class="tblwrap"><table class="t"><thead><tr><th scope="col">Tier</th><th scope="col">Limits</th></tr></thead><tbody>${Object.entries(pol.tiers || {}).map(([k, t]) => `<tr><td><span class="pill">${esc(k)}</span></td><td class="jsn">${esc(JSON.stringify(t))}</td></tr>`).join("")}</tbody></table></div>` : ""}`;
+  $("crown3").onclick = crown;
+}
+
+// ---- memory (ported from the old cockpit: ledger strip + map) ----------------------------------
+const FAM = { tenant: ["tenant", "var(--accent)"], agent: ["agents", "var(--agent)"], worker: ["workers", "var(--worker)"], fan: ["fans", "var(--fan)"], other: ["other", "var(--dim)"] };
+const fam = (p) => (p === "tenant" ? "tenant" : p.startsWith("agent:") ? "agent" : p.startsWith("worker:") ? "worker" : p.startsWith("fan:") ? "fan" : "other");
+const col = (p) => FAM[fam(p)][1];
+const short = (p, n = 26) => (p.length > n ? p.slice(0, n / 2 - 1) + "…" + p.slice(-(n / 2 - 1)) : p);
+const famOrder = (p) => ["tenant", "agent", "worker", "fan", "other"].indexOf(fam(p));
+const dayLabel = (v) => { const d = new Date(v), t = new Date(); const k = (x) => x.toDateString(); if (k(d) === k(t)) return "Today"; t.setDate(t.getDate() - 1); if (k(d) === k(t)) return "Yesterday"; return d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }); };
+const M = { view: "ledger", fam: { tenant: true, agent: true, worker: true, fan: true, other: true }, gone: true, tenant: "" };
+async function memory() {
+  $("view").innerHTML = `<p class="note" style="margin:0">${esc(VIEWS.memory.one)}</p><div class="empty">loading…</div>`;
+  let m; try { m = await api("/api/admin/memory"); } catch (e) { if (!S.signed) return signin(); $("view").innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
+  if (S.view !== "memory") return;
+  const all = m.memories || [];
+  const byT = {}; all.forEach((r) => (byT[r.tenant] = (byT[r.tenant] || 0) + 1));
+  const tids = Object.keys(byT).sort((a, b) => byT[b] - byT[a]);
+  if (S.world && tids.includes(S.world)) M.tenant = S.world;
+  if (!tids.includes(M.tenant)) M.tenant = tids[0] || "";
+  if (!tids.length) { $("view").innerHTML = `<p class="note" style="margin:0">${esc(VIEWS.memory.one)}</p><div class="card empty">Nothing remembered yet.</div>`; return; }
+  $("view").innerHTML = `<p class="note" style="margin:0">${esc(VIEWS.memory.one)}</p>
+    <div class="card mbar"><label class="sr" for="ten">World</label><select id="ten">${tids.map((id) => `<option value="${esc(id)}" ${id === M.tenant ? "selected" : ""}>${esc(tname(id))} · ${byT[id]}</option>`).join("")}</select><span id="mchips" class="chips"></span>
+    <span class="modes" role="group" aria-label="View" style="margin-left:auto;display:flex;gap:6px"><button class="btn sm" type="button" id="vL">Timeline</button><button class="btn sm" type="button" id="vM">Map</button></span></div>
+    <div class="card viz" id="viz"></div><div id="entries" style="display:flex;flex-direction:column;gap:8px"></div><div class="hood" id="mhood"></div>`;
+  const rerender = () => {
+    const rows = all.filter((r) => r.tenant === M.tenant && M.fam[fam(r.partition)] && (M.gone || !r.deleted) && (!S.q || (r.key + " " + r.content + " " + r.partition + " " + (r.tags || []).join(" ")).toLowerCase().includes(S.q.toLowerCase()))).sort((a, b) => b.version - a.version);
+    const tr = all.filter((r) => r.tenant === M.tenant);
+    const cnt = (f) => tr.filter((r) => fam(r.partition) === f).length;
+    $("mchips").innerHTML = Object.entries(FAM).filter(([f]) => cnt(f)).map(([f, [label, c]]) => `<button type="button" class="chip ${M.fam[f] ? "" : "off"}" data-f="${f}" aria-pressed="${M.fam[f]}" style="border-color:${c};color:${c}">${label} <b>${cnt(f)}</b></button>`).join("") + (tr.some((r) => r.deleted) ? `<button type="button" class="chip ${M.gone ? "" : "off"}" data-f="gone" aria-pressed="${M.gone}">forgotten <b>${tr.filter((r) => r.deleted).length}</b></button>` : "");
+    document.querySelectorAll("#mchips .chip").forEach((b) => (b.onclick = () => { const f = b.dataset.f; if (f === "gone") M.gone = !M.gone; else M.fam[f] = !M.fam[f]; rerender(); }));
+    $("vL").setAttribute("aria-pressed", M.view === "ledger"); $("vM").setAttribute("aria-pressed", M.view === "map");
+    $("vL").className = "btn sm" + (M.view === "ledger" ? " go" : ""); $("vM").className = "btn sm" + (M.view === "map" ? " go" : "");
+    const viz = $("viz"), w = Math.max(280, viz.clientWidth - 28);
+    viz.innerHTML = rows.length ? (M.view === "ledger" ? strip(rows, w) : mapView(rows, tname(M.tenant), w)) : `<span class="note">Nothing here${S.q ? " for “" + esc(S.q) + "”" : " yet"}.</span>`;
+    viz.querySelectorAll(".dot").forEach((d) => (d.onclick = () => { const e = $("e-" + d.dataset.id); if (!e) return; document.querySelectorAll(".ent.hit").forEach((x) => x.classList.remove("hit")); e.classList.add("hit", "open"); e.scrollIntoView({ behavior: "smooth", block: "center" }); }));
+    let html = "", day = "";
+    rows.forEach((r) => { const d = dayLabel(r.version); if (d !== day) { day = d; html += `<div class="day">${d}</div>`; }
+      html += `<div class="card ent ${r.deleted ? "gone" : ""}" id="e-${esc(r.id)}" tabindex="0"><div class="idc">${hhmm(r.version)}</div><div><span class="pill" style="border-color:${col(r.partition)};color:${col(r.partition)}">${esc(short(r.partition, 34))}</span> ${r.key ? `<code class="idc">${esc(r.key)}</code>` : ""}${r.deleted ? ' <span class="pill">forgotten</span>' : ""}<div class="c">${esc(r.content)}</div></div></div>`; });
+    $("entries").innerHTML = html;
+    document.querySelectorAll(".ent").forEach((e) => { e.onclick = () => e.classList.toggle("open"); e.onkeydown = (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); e.classList.toggle("open"); } }; });
+    const A = (S.health || {}).armed || {};
+    const last = tr.length ? Math.max(...tr.map((r) => r.version)) : 0;
+    $("mhood").textContent = `${tr.length} memories · ${new Set(tr.map((r) => r.partition)).size} partitions · ${tr.filter((r) => r.deleted).length} forgotten · last write ${last ? ago(last) + " ago" : "never"} · brain out ${A.brainOut ? "armed" : "off"} · bridge ${A.cognitiveBridge ? "armed" : "off"} · sync ${A.sync ? "armed" : "off"}`;
+  };
+  $("ten").onchange = (e) => { M.tenant = e.target.value; rerender(); };
+  $("vL").onclick = () => { M.view = "ledger"; rerender(); };
+  $("vM").onclick = () => { M.view = "map"; rerender(); };
+  window.onresize = () => { if (S.view === "memory") rerender(); };
+  rerender();
+}
+function strip(rows, w) {
+  const parts = [...new Set(rows.map((r) => r.partition))].sort((a, b) => famOrder(a) - famOrder(b) || a.localeCompare(b));
+  const L = Math.min(220, Math.round(w * 0.3)), R = 18, T = 10, lh = 26, h = T + parts.length * lh + 28;
+  const vs = rows.map((r) => r.version); let lo = Math.min(...vs), hi = Math.max(...vs); if (hi - lo < 120000) { lo -= 60000; hi += 60000; } const pad = (hi - lo) * 0.05; lo -= pad; hi += pad;
+  const x = (v) => L + ((v - lo) / (hi - lo)) * (w - L - R);
+  let s = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="Memory timeline">`;
+  parts.forEach((p, i) => { const y = T + i * lh + lh / 2; s += `<line x1="${L}" x2="${w - R}" y1="${y}" y2="${y}" style="stroke:var(--line)"/><text x="${L - 10}" y="${y + 4}" text-anchor="end" style="fill:${col(p)}" font-size="11" font-family="IBM Plex Mono, monospace">${esc(short(p, Math.floor(L / 7.4)))}</text>`; });
+  const N = w < 560 ? 1 : w < 900 ? 2 : 4;
+  for (let i = 0; i <= N; i++) { const v = lo + ((hi - lo) * i) / N, xx = x(v); s += `<line x1="${xx}" x2="${xx}" y1="${T}" y2="${h - 24}" style="stroke:var(--line2)" stroke-dasharray="2 5"/><text x="${xx}" y="${h - 7}" text-anchor="${i === 0 ? "start" : i === N ? "end" : "middle"}" style="fill:var(--dim)" font-size="10" font-family="IBM Plex Mono, monospace">${esc(new Date(v).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }))}</text>`; }
+  rows.forEach((r) => { const y = T + parts.indexOf(r.partition) * lh + lh / 2, c = col(r.partition); s += `<circle class="dot" data-id="${esc(r.id)}" cx="${x(r.version).toFixed(1)}" cy="${y}" r="5.5" style="fill:${r.deleted ? "var(--panel)" : c};stroke:${c}" stroke-width="2"><title>${esc(r.partition + (r.key ? " / " + r.key : "") + "\n" + String(r.content).slice(0, 160))}</title></circle>`; });
+  return s + "</svg>";
+}
+function mapView(rows, name, w) {
+  const h = Math.round(Math.max(380, Math.min(640, w * 0.6))), cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 26;
+  const groups = {}; rows.forEach((r) => (groups[r.partition] = groups[r.partition] || []).push(r));
+  const parts = Object.keys(groups).sort((a, b) => famOrder(a) - famOrder(b) || a.localeCompare(b));
+  const fams = [...new Set(parts.map(fam))]; const nPer = (f) => parts.filter((p) => fam(p) === f).length;
+  let a = -Math.PI / 2; const sector = {}; fams.forEach((f) => { const span = (2 * Math.PI * nPer(f)) / parts.length; sector[f] = [a, a + span]; a += span; });
+  const pt = (ang, r) => [cx + Math.cos(ang) * r, cy + Math.sin(ang) * r];
+  let lines = "", nodes = "", labels = "";
+  fams.forEach((f) => { const [a0, a1] = sector[f], c = FAM[f][1], mid = (a0 + a1) / 2, [fx, fy] = pt(mid, R * 0.33);
+    lines += `<line x1="${cx}" y1="${cy}" x2="${fx}" y2="${fy}" style="stroke:${c}" stroke-opacity=".5" stroke-width="2"/>`;
+    nodes += `<circle cx="${fx}" cy="${fy}" r="7" style="fill:${c}"/>`; labels += `<text x="${fx}" y="${fy - 13}" text-anchor="middle" style="fill:${c}" font-size="12" font-weight="600">${FAM[f][0]}</text>`;
+    const ps = parts.filter((p) => fam(p) === f); ps.forEach((p, i) => { const ang = a0 + ((a1 - a0) * (i + 0.5)) / ps.length, [px, py] = pt(ang, R * 0.68);
+      lines += `<line x1="${fx}" y1="${fy}" x2="${px}" y2="${py}" style="stroke:${c}" stroke-opacity=".35"/>`; nodes += `<circle cx="${px}" cy="${py}" r="5" style="fill:${c}"/>`;
+      const right = Math.cos(ang) >= 0; labels += `<text x="${px + (right ? 9 : -9)}" y="${py + 4}" text-anchor="${right ? "start" : "end"}" style="fill:var(--muted)" font-size="11">${esc(short(p.replace(/^[a-z]+:/, ""), 22))}</text>`;
+      const ms = groups[p]; ms.forEach((r, j) => { const la = ang + (j - (ms.length - 1) / 2) * 0.11, [lx, ly] = pt(la, R * 0.93);
+        lines += `<line x1="${px}" y1="${py}" x2="${lx}" y2="${ly}" style="stroke:${c}" stroke-opacity=".22"/>`;
+        nodes += `<circle class="dot" data-id="${esc(r.id)}" cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="4" style="fill:${r.deleted ? "var(--panel)" : c};stroke:${c}" stroke-width="1.5"><title>${esc(r.partition + (r.key ? " / " + r.key : "") + "\n" + String(r.content).slice(0, 160))}</title></circle>`; }); }); });
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="Memory map">${lines}${nodes}<circle cx="${cx}" cy="${cy}" r="15" style="fill:var(--accent)"/><circle cx="${cx}" cy="${cy}" r="6" style="fill:var(--bg)"/><text x="${cx}" y="${cy + 34}" text-anchor="middle" style="fill:var(--text)" font-size="13" font-weight="600">${esc(name)}</text>${labels}</svg>`;
+}
+
+// ---- connect: an app (Claude) asks through the mcp gate; the owner approves here and a limited grant
+// is minted in this browser. Same gate allow-list, same grant, same hand-back as the old cockpit.
+const GATES = ["https://mcp-gate-production.up.railway.app"];
+const HOUSE = "RightOnPar (house)";
+async function mintConnector() {
+  let root = null, ten = ((await api("/api/tenants")).tenants || []).find((x) => x.name === HOUSE && x.status === "active");
+  if (!ten) { const c = await api("/api/tenants", { method: "POST", body: JSON.stringify({ name: HOUSE, tier: "house", railwayProjects: [] }) }); ten = c.tenant; root = c.rootGrant.token; }
+  if (!root) {
+    const t = now() / 1000, g = ((await api("/api/admin/grants?status=active&tenant=" + encodeURIComponent(ten.id) + "&limit=1000")).grants || []).find((x) => +x.depth === 0 && +x.exp > t + 31 * 86400);
+    root = g ? (await api(`/api/admin/grants/${g.id}/token`, { method: "POST" })).token : (await api(`/api/tenants/${ten.id}/root-grant`, { method: "POST", body: JSON.stringify({ sub: "tenant:root" }) })).token;
+  }
+  const r = await fetch("/api/grants", { method: "POST", headers: { authorization: "Bearer " + root, "content-type": "application/json" }, body: JSON.stringify({ sub: "connector:claude", caps: ["memory.read", "memory.write", "cog.plan"], ttlSec: 30 * 86400, scope: { memory: { partitions: ["tenant", "agent:claude"] }, railway: { projects: [], environments: [] } }, budget: { usd_cents: 0, calls: 20000, deploys: 0 }, constraints: { maxWorkers: 0, allowDelete: false, requireDryRun: true } }) });
+  const j = await r.json().catch(() => ({})); root = null;
+  if (!j.token) throw new Error(j.error || "mint_failed");
+  return j.token;
+}
+function connect(qs) {
+  const p = new URLSearchParams(qs || ""), gate = (p.get("gate") || "").replace(/\/$/, ""), req = p.get("req") || "", client = p.get("client") || "An app", to = p.get("to") || "?";
+  if (!GATES.includes(gate) || !/^[0-9a-f]{32}$/.test(req)) { $("title").textContent = "Not a valid sign-in"; $("view").innerHTML = `<p class="note">This link didn't come from your gate, so nothing was shared.</p>`; return; }
+  $("title").textContent = client + " wants in";
+  const row = (ok, k, v) => `<div class="r"><span style="color:${ok ? "var(--accent)" : "var(--dim)"}">${ok ? "✓" : "✗"}</span><b>${k}</b><span>${v}</span></div>`;
+  const back = "/?" + new URLSearchParams({ connect: "1", gate, req, client, to }).toString();
+  $("view").innerHTML = `<div class="card connect">
+    <p class="note" style="margin:0">It talks to this runtime through your gate, with its own grant, never your key.</p>
+    <div style="display:flex;align-items:center;gap:10px"><span class="kick">Grant · connector:claude</span><span class="pill ok">30 days</span></div>
+    ${row(1, "MEMORY", "read + write · tenant, agent:claude")}${row(1, "COG", "ask for plans, never executes")}${row(0, "DEPLOY", "no workers, restarts or deletes")}${row(0, "MONEY", "no spend, no ledger")}${row(0, "GRANTS", "can't mint more power")}
+    <p class="note" style="margin:0">Sends you back to ${esc(to)}. Pull it anytime on the Grants page.</p>
+    <div class="acts">${S.signed ? `<button class="btn seal" type="button" id="cOk">Approve</button>` : `<a class="btn seal" href="/sso/start?return=${encodeURIComponent(back)}">Sign in with Face ID to approve</a>`}<button class="btn" type="button" id="cNo">Deny</button></div>
+    ${S.signed ? "" : `<form id="cKey" style="display:flex;gap:8px"><label class="sr" for="ck">Admin key</label><input id="ck" class="field" type="password" placeholder="or the admin key, once" autocomplete="off"><button class="btn" type="submit">Unlock</button></form>`}
+    <div class="msg" id="cMsg"></div></div>`;
+  const send = (decision, grant) => { const f = document.createElement("form"); f.method = "POST"; f.action = gate + "/oauth/complete"; for (const [k, v] of Object.entries({ req, decision, grant })) { const i = document.createElement("input"); i.type = "hidden"; i.name = k; i.value = v; f.appendChild(i); } document.body.appendChild(f); f.submit(); };
+  $("cNo").onclick = () => send("deny", "");
+  if ($("cOk")) $("cOk").onclick = async () => { $("cOk").disabled = true; $("cMsg").textContent = "minting a limited grant…"; try { send("approve", await mintConnector()); } catch (e) { $("cOk").disabled = false; $("cMsg").innerHTML = `<span class="err">Couldn't mint: ${esc(e.message)}</span>`; } };
+  if ($("cKey")) $("cKey").onsubmit = async (e) => { e.preventDefault(); const k = $("ck").value.trim(); $("ck").value = ""; if (!k) return; try { await api("/api/admin/session", { method: "POST", headers: { authorization: "Bearer " + k } }); } catch (err) { if (err.status === 401) { $("cMsg").innerHTML = '<span class="err">That key was not accepted.</span>'; return; } S.K = k; ss.set("cos_admin", k); } await boot(); };
+}
+
+// ---- the chrome: bar, rail, COG panel, footer --------------------------------------------------
+function chrome() {
+  const h = S.health || {};
+  const pulled = !!h.killSwitch;
+  const subs = new Set(S.grants.filter(live).filter((g) => +g.depth > 0).filter(inWorld).map((g) => g.sub));
+  $("onTxt").textContent = !h.ok ? "RUNTIME DOWN" : pulled ? "CROWN PULLED" : S.signed ? subs.size + " AGENT" + (subs.size === 1 ? "" : "S") + " ON" : "ONLINE";
+  $("onDot").className = "dot " + (!h.ok || pulled ? "gold" : "pulse");
+  $("crown").className = "crownb" + (pulled ? " pulled" : "");
+  $("crown").setAttribute("aria-label", pulled ? "The Crown is pulled: resume every agent" : "The Crown: pull it and every agent halts");
+  $("crown2").textContent = pulled ? "Crown pulled · resume the movement" : "Pull the Crown · halt every agent";
+  $("crown2").className = "btn " + (pulled ? "seal" : "crown");
+  $("who").textContent = S.signed ? "DW" : "Sign in";
+  $("who").className = "who" + (S.signed ? "" : " out");
+  $("who").setAttribute("aria-label", S.signed ? "Signed in as the owner. Sign out" : "Sign in");
+  $("omniCell").innerHTML = `<i></i>${esc(S.world ? tname(S.world).toUpperCase() : "ESTATE")}`;
+  $("prov").className = "stamp" + (h.ok && h.db ? "" : " off");
+  $("hall").className = "stamp" + (h.ok ? "" : " off");
+  $("footVer").textContent = `v${h.version || "?"} · source ${String((h.source || {}).sha256 || "").slice(0, 12)} · runtime.meshtool.ai`;
+  $("footCell").textContent = "cell · " + (S.world ? tname(S.world) : "all worlds");
+  // worlds
+  if (!S.signed) $("worlds").innerHTML = '<span class="note" style="padding:0 8px;font-size:12px">Sign in to see each world.</span>';
+  else {
+    const cnt = (id) => S.grants.filter(live).filter((g) => g.tenant === id).length;
+    $("worlds").innerHTML = [`<button class="ws" type="button" data-w="" aria-pressed="${!S.world}"><span class="sw" style="background:var(--accent)"></span>All worlds<span class="n">${S.tenants.length}</span></button>`]
+      .concat(S.tenants.filter((t) => t.status === "active").slice(0, 8).map((t, i) => `<button class="ws" type="button" data-w="${esc(t.id)}" aria-pressed="${S.world === t.id}"><span class="sw" style="background:${SW[(i + 1) % SW.length]}"></span>${esc(t.name)}<span class="n">${cnt(t.id)}</span></button>`)).join("");
+    document.querySelectorAll("[data-w]").forEach((b) => (b.onclick = () => { S.world = b.dataset.w; chrome(); route(); }));
+  }
+  // estate tabs, with live probes from /status.json
+  const B = {}; ((S.status && S.status.bodies) || []).forEach((b) => (B[b.name] = b));
+  const st = (n) => (B[n] ? (B[n].up ? "up · " + B[n].ms + " ms" : "down") : "");
+  const dot = (n) => (B[n] ? `<span class="dot ${B[n].up ? "" : "bad"}"></span>` : "");
+  const T = [["RT", "Runtime status", "/status", "runtime.meshtool.ai", (S.status ? (S.status.ok ? '<span class="dot"></span>' : '<span class="dot gold"></span>') : "")],
+    ["DK", "Mesh Deck", "https://deck.meshtool.ai/", "deck.meshtool.ai", ""],
+    ["DD", "DevDesk", "https://devdesk.meshtool.ai/", st("DevDesk") || "devdesk.meshtool.ai", dot("DevDesk")],
+    ["MK", "MeshMarket", "https://market.meshtool.ai/", st("MeshMarket") || "market.meshtool.ai", dot("MeshMarket")],
+    ["GT", "MCP gate", "", st("MCP gate (Claude sign-in)") || "Claude sign-in", dot("MCP gate (Claude sign-in)")]];
+  $("tabs").innerHTML = T.map(([i, n, href, sub, d]) => href ? `<a class="tab" href="${href}" ${href.startsWith("http") ? 'target="_blank" rel="noopener"' : ""}><span class="ini ${i === "MK" ? "gold" : ""}">${i}</span><span class="t"><b>${esc(n)}</b><span>${esc(sub)}</span></span>${d}</a>` : `<div class="tab"><span class="ini">${i}</span><span class="t"><b>${esc(n)}</b><span>${esc(sub)}</span></span>${d}</div>`).join("");
+  // COG panel
+  const ev = S.events.filter(inWorld);
+  const cogEv = ev.find((e) => String(e.type).startsWith("cog") || String(e.type).startsWith("agent"));
+  $("cogMode").textContent = !S.signed ? "LOCKED" : pulled ? "HALTED" : "WATCHING";
+  if (!S.signed) { $("atText").textContent = "Sign in to watch what COG and the agents are doing."; $("marks").innerHTML = ""; }
+  else {
+    const fresh = cogEv && now() - new Date(cogEv.ts).getTime() < 5 * 60000;
+    $("atDot").className = "dot" + (fresh ? " pulse" : " off");
+    $("atKick").textContent = fresh ? "ATELIER · AT WORK NOW" : "ATELIER · LAST MOVE";
+    $("atText").innerHTML = cogEv ? `<b style="color:${evTone(cogEv.type)}">${esc(cogEv.type)}</b> · ${esc(cogEv.actor || "")}${cogEv.tenant ? " · " + esc(tname(cogEv.tenant)) : ""} · ${ago(cogEv.ts)} ago` : "COG has not moved on this runtime yet. Every move it makes shows up here.";
+    $("marks").innerHTML = ev.slice(0, 22).map((e) => `<div class="mk"><span class="dim">${hhmm(e.ts)}</span><span style="color:${evTone(e.type)};overflow:hidden;text-overflow:ellipsis">${esc(String(e.type).split(".")[0].toUpperCase())}</span><span title="${esc(e.type + " · " + (e.actor || ""))}">${esc(String(e.type).split(".").slice(1).join(".") || e.type)} · ${esc(e.actor || "")}</span></div>`).join("") || '<span class="note">No hallmarks yet.</span>';
+  }
+}
+
+async function crown() {
+  if (!S.signed) { location.hash = "#/"; return signin("Sign in first: only the owner holds the Crown."); }
+  const pulled = !!(S.health && S.health.killSwitch);
+  if (!pulled && !confirm("Pull the Crown? Every agent halts and every grant fails closed until you resume.")) return;
+  try { await api(pulled ? "/api/admin/resume" : "/api/admin/kill", { method: "POST" }); } catch (e) { alert("Couldn't: " + e.message); }
+  await refresh();
+}
+
+const byTime = (ev) => ev.slice().sort((a, b) => new Date(b.ts) - new Date(a.ts) || b.id - a.id);
+// ---- data --------------------------------------------------------------------------------------
+async function loadPublic() {
+  [S.health, S.status] = await Promise.all([pub("/health"), pub("/status.json")]);
+  if (!S.health) { await new Promise((r) => setTimeout(r, 800)); S.health = await pub("/health"); }
+}
+async function loadPrivate() {
+  try { S.overview = await api("/api/admin/overview"); S.signed = true; } catch { S.signed = false; return; }
+  const [t, g, a, e] = await Promise.all([
+    api("/api/tenants").catch(() => ({})), api("/api/admin/grants?status=active&limit=1000").catch(() => ({})),
+    api("/api/admin/approvals").catch(() => ({})), api("/api/admin/events").catch(() => ({}))]);
+  S.tenants = t.tenants || []; S.grants = g.grants || []; S.approvals = a.approvals || []; S.events = byTime(e.events || []);
+}
+async function refresh() { await loadPublic(); await loadPrivate(); chrome(); route(); }
+async function boot() { await refresh(); }
+async function tick() {
+  if (document.hidden) return;
+  S.health = (await pub("/health")) || S.health;
+  if (S.signed) {
+    const [a, e] = await Promise.all([api("/api/admin/approvals").catch(() => null), api("/api/admin/events").catch(() => null)]);
+    const before = S.approvals.length;
+    if (a) S.approvals = a.approvals || [];
+    if (e) S.events = byTime(e.events || []);
+    if (S.view === "" && a && S.approvals.length !== before) overview();
+  }
+  chrome();
+}
+
+// ---- wiring ------------------------------------------------------------------------------------
+$("back").onclick = () => history.back();
+$("fwd").onclick = () => history.forward();
+$("reload").onclick = () => refresh();
+$("crown").onclick = crown;
+$("crown2").onclick = crown;
+$("who").onclick = async () => {
+  if (!S.signed) { location.hash = "#/"; return signin(); }
+  if (!confirm("Sign out of the runtime in this browser?")) return;
+  try { await api("/api/admin/session", { method: "DELETE" }); } catch {}
+  S.K = null; ss.set("cos_admin", null); S.signed = false; await refresh();
+};
+document.querySelectorAll("[data-mode]").forEach((b) => (b.onclick = () => {
+  S.mode = b.dataset.mode;
+  document.querySelectorAll("[data-mode]").forEach((x) => x.setAttribute("aria-pressed", x === b));
+  $("q").value = S.mode === "find" ? S.q : ""; $("q").placeholder = S.mode === "find" ? "Find in this page" : "Go to grants, ledger, /loop, devdesk.meshtool.ai…"; $("q").focus();
+}));
+$("q").onfocus = () => { if (S.mode === "go") $("q").select(); };
+$("omni").onsubmit = (e) => {
+  e.preventDefault();
+  const v = $("q").value.trim();
+  if (S.mode === "find") { S.q = v; return route(); }
+  const k = v.toLowerCase().replace(/^runtime\.meshtool\.ai\s*\/\s*/, "").replace(/^#?\/?/, "");
+  const lex = { warrants: "grants", warrant: "grants", cloisonné: "worlds", cloisonne: "worlds", hallmarks: "receipts", hallmark: "receipts", assay: "ledger", escapement: "workers", threshold: "intake", patina: "memory", bezel: "guardrails", crown: "guardrails", overview: "", loupe: "", seal: "" };
+  const key = ALIAS[k] ?? lex[k] ?? k;
+  if (key in VIEWS) { location.hash = "#/" + key; return; }
+  if (["loop", "card", "invite", "status", "docs", "routes", "directory"].includes(k)) { location.href = "/" + k; return; }
+  if (/^[a-z0-9-]+(\.[a-z0-9-]+)+(\/.*)?$/i.test(k)) { window.open("https://" + k, "_blank", "noopener"); return; }
+  S.mode = "find"; S.q = v; document.querySelectorAll("[data-mode]").forEach((x) => x.setAttribute("aria-pressed", x.dataset.mode === "find")); route();
+};
+addEventListener("hashchange", () => { S.q = S.mode === "find" ? S.q : ""; route(); $("main").focus({ preventScroll: true }); });
+setInterval(tick, 8000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+const w0 = new URLSearchParams(location.search).get("world"); if (w0) S.world = w0;
+boot();
+</script>
+</body>
+</html>
