@@ -1,0 +1,77 @@
+/* The Movement — one look for every runtime page (Runtime Browser, the loop, the card, the invite).
+   Filigree edges carry the lexicon; colour carries meaning: teal = agents and live work, gold = the seal (only
+   what needs the owner), blue = another world. */
+:root{--bg:#07080a;--win:#0e0f12;--rail:#101115;--panel:#131418;--sunk:#0f1013;--line:#26272d;--line2:#22232a;--line3:#3a3b42;
+--text:#e9e7e2;--text2:#d6d4cf;--muted:#b9b8b3;--dim:#9a9aa3;--accent:#36e0c8;--accent-hi:#7cf0de;--accent-ink:#0d0e11;
+--teal-bg:#14231f;--teal-line:#2f4a45;--teal-sunk:#0f1a18;--gold:#e9b949;--gold-bg:#2a2414;--blue:#8fa8ff;--bad:#ff7a7a;--bad-bg:#2a1416;
+--mono:'IBM Plex Mono',ui-monospace,monospace;--sans:'Space Grotesk',system-ui,sans-serif}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;min-height:100vh;background:var(--bg);background-image:radial-gradient(900px 500px at 12% -10%,rgba(54,224,200,.14),transparent 60%),radial-gradient(700px 420px at 105% 110%,rgba(233,185,73,.10),transparent 60%);background-attachment:fixed;color:var(--text);font:15px/1.5 var(--sans)}
+a{color:var(--accent)}a:hover{color:var(--accent-hi)}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+button:disabled{cursor:default;opacity:.55}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sr{position:absolute!important;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.mono{font-family:var(--mono)}
+.kick{font:500 10px/1.4 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+.dim{color:var(--dim)}.muted{color:var(--muted)}
+/* motion */
+.pulse{animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.35;transform:scale(.8)}50%{opacity:1;transform:scale(1.15)}}
+.flow{stroke-dasharray:5 7;animation:flow 1.2s linear infinite}
+@keyframes flow{to{stroke-dashoffset:-24}}
+.turn{animation:turn 14s linear infinite;transform-origin:50% 50%}
+@keyframes turn{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.pulse,.flow,.turn{animation:none}}
+/* filigree: the frame, its ticks, the lexicon ring and the guilloché rule */
+.frame{position:relative;margin:28px auto;padding:0;max-width:1480px;width:calc(100% - 56px)}
+.ring{position:absolute;font:400 9px/1 var(--mono);letter-spacing:.32em;text-transform:uppercase;color:#6b6b74;white-space:nowrap;display:flex;gap:22px;pointer-events:none}
+.ring b{color:var(--accent);font-weight:500}
+.ring.tl{left:28px;top:-17px}.ring.tr{right:28px;top:-17px}.ring.bl{left:28px;bottom:-17px}.ring.br{right:28px;bottom:-17px}
+.ring.vl{left:-17px;top:50%;transform:rotate(-90deg) translateX(-50%);transform-origin:0 0}
+.ring.vr{right:-17px;top:50%;transform:rotate(90deg) translateX(50%);transform-origin:100% 0}
+.tick{position:absolute;width:8px;height:8px;border:0 solid rgba(233,185,73,.55);pointer-events:none}
+.tick.a{left:-6px;top:-6px;border-left-width:1px;border-top-width:1px}.tick.b{right:-6px;top:-6px;border-right-width:1px;border-top-width:1px}
+.tick.c{left:-6px;bottom:-6px;border-left-width:1px;border-bottom-width:1px}.tick.d{right:-6px;bottom:-6px;border-right-width:1px;border-bottom-width:1px}
+.win{border:1px solid #2a2b31;border-radius:18px;background:var(--win);overflow:hidden;box-shadow:0 40px 120px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.03) inset,0 0 0 7px var(--bg),0 0 0 8px rgba(233,185,73,.18)}
+.guill{height:3px;opacity:.9;background-image:repeating-linear-gradient(90deg,rgba(54,224,200,.22) 0 1px,transparent 1px 7px),repeating-linear-gradient(90deg,transparent 0 3px,rgba(233,185,73,.16) 3px 4px,transparent 4px 7px)}
+.stamp{display:inline-flex;align-items:center;gap:5px;height:18px;padding:0 7px;border-radius:3px;border:1px solid rgba(233,185,73,.45);color:var(--gold);font:500 9px var(--mono);letter-spacing:.18em;text-transform:uppercase;white-space:nowrap}
+.stamp i{width:4px;height:4px;border-radius:50%;background:currentColor;display:inline-block}
+.stamp.off{border-color:var(--line3);color:var(--dim)}
+/* the bar every page shares */
+.bar{min-height:60px;display:flex;align-items:center;flex-wrap:wrap;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line2);background:rgba(22,23,28,.92)}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--text)}
+.brand .gem{width:22px;height:22px;border-radius:6px;background:var(--accent);box-shadow:0 0 18px rgba(54,224,200,.45);flex-shrink:0}
+.brand b{display:block;font-size:14px;letter-spacing:.16em}
+.brand span{display:block;font:400 10px var(--mono);color:var(--dim);letter-spacing:.12em}
+.pages{display:flex;gap:2px;flex-wrap:wrap}
+.pages a{padding:8px 10px;border-radius:9px;font-size:13px;color:var(--muted);text-decoration:none}
+.pages a:hover{background:#1b1c22;color:var(--text)}
+.pages a[aria-current=page]{color:var(--text);box-shadow:inset 0 -2px 0 var(--accent);border-radius:9px 9px 0 0}
+/* parts */
+.card{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:14px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:40px;padding:0 16px;border-radius:10px;border:1px solid var(--line3);background:transparent;color:var(--text);font:500 13px var(--sans);text-decoration:none;white-space:nowrap}
+.btn:hover{background:#1b1c22;color:var(--text)}
+.btn.go{border:0;background:var(--accent);color:var(--accent-ink);font-weight:600}
+.btn.go:hover{background:var(--accent-hi);color:var(--accent-ink)}
+.btn.seal{border:0;background:var(--gold);color:var(--accent-ink);font-weight:600}
+.btn.seal:hover{background:#f3cd70;color:var(--accent-ink)}
+.btn.crown{border:1px solid rgba(233,185,73,.5);background:#1c170e;color:var(--gold);font-weight:600}
+.btn.bad{border-color:#6a3236;color:var(--bad)}
+.btn.sm{min-height:32px;padding:0 10px;font-size:12px;border-radius:8px}
+.pill{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:999px;border:1px solid var(--line3);color:var(--muted);font:500 10px var(--mono);letter-spacing:.06em;white-space:nowrap}
+.pill.ok{border-color:var(--teal-line);color:var(--accent)}.pill.gold{border-color:rgba(233,185,73,.5);color:var(--gold)}.pill.bad{border-color:#6a3236;color:var(--bad)}.pill.blue{border-color:#3b4673;color:var(--blue)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);flex-shrink:0}
+.dot.gold{background:var(--gold)}.dot.off{background:transparent;border:1.5px solid #6f6f78}.dot.bad{background:var(--bad)}.dot.blue{background:var(--blue)}
+.field{width:100%;min-height:44px;padding:0 12px;border-radius:11px;border:1px solid var(--teal-line);background:var(--teal-sunk);color:var(--text)}
+.note{font-size:13px;color:var(--muted);line-height:1.5}
+.err{color:var(--bad)}
+.foot{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px;min-height:28px;padding:6px 16px;border-top:1px solid var(--line2);background:#0b0c0e;font:400 10px var(--mono);color:var(--dim);letter-spacing:.06em}
+.foot .end{margin-left:auto}
+@media (max-width:760px){
+  .frame{margin:18px auto;width:calc(100% - 32px)}
+  .ring.vl,.ring.vr,.ring.tr,.ring.br{display:none}
+  .ring.tl,.ring.bl{left:12px;gap:12px;letter-spacing:.24em;overflow:hidden;max-width:calc(100% - 24px)}
+}
