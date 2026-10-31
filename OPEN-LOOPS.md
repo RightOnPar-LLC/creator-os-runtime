@@ -48,3 +48,13 @@ adapters. Direct tool calls still bypass the runtime. Next: file the reviewed br
 implementation/review work. Read the status document before continuing.
 
 Filed: draft PR https://github.com/RightOnPar-LLC/creator-os-runtime/pull/52; implementation 8a95e55. CI pending; no live rollout. Agents: continue in that PR/branch, record evidence in the status document, and claim the next unowned adapter step.
+
+## 2026-10-30 Runtime seat facelift
+
+- **State:** BLOCKED — existing Runtime admin credentials refused; Railway connector exposes variable names only. No credential reset or backend deploy.
+- **Owner:** codex@solidity-slop
+- **Destination:** https://runtime.meshtool.ai/
+- **Prepared:** cockpit.html derives from the exact public production cockpit with the canonical estate-ui palette ef1ab3a1 and static responsive styling. Functional scripts are byte-identical; hashes are in COCKPIT-RELEASE-2026-10-30.json.
+- **Evidence:** Chromium desktop1360/phone390: no overflow or JS exceptions. Public health/routes/docs/status checked. Nine dashboard data endpoints correctly return401 while locked. Existing /routes advertises their actual auth. No Pause, Resume, Drain, money or grant action taken.
+- **Approval:** DW explicitly approved live facelift including runtime.meshtool.ai in the owning chat on2026-10-30.
+- **Next step:** restore existing authorized Runtime admin access through its established secure flow; review/merge this static document, then PUT its exact bytes to /api/admin/docs/_cockpit. Verify root hash and /health source unchanged. Rollback is the prior cockpit document, not a backend redeploy.
