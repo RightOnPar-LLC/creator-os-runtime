@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The loop · Runtime</title>
+<meta name="description" content="A world on the Mesh, live: you talk to COG, COG routes the work, the workers report back.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap">
+<style>
+/*LOOK*/
+.grid{display:grid;grid-template-columns:290px minmax(0,1fr) 290px;gap:16px;padding:16px}
+.side{display:flex;flex-direction:column;gap:14px;padding:20px}
+.ava{width:88px;height:88px;border-radius:50%;background:#1f2026;border:2px solid var(--gold);display:grid;place-items:center;font-size:28px;font-weight:600}
+.side h1{margin:0;font-size:26px;font-weight:600;line-height:1.15}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.stat{padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--sunk)}
+.stat b{display:block;font-size:22px;font-weight:600}
+.stat span{font:400 10px var(--mono);letter-spacing:.1em;color:var(--dim);text-transform:uppercase}
+.world{position:relative;border:1px solid var(--line);border-radius:14px;background:#121317;background-image:radial-gradient(#23242b 1px,transparent 1px);background-size:22px 22px;padding:18px;display:flex;flex-direction:column;gap:14px;min-width:0}
+.chat{border:2px solid var(--accent);border-radius:14px;background:var(--teal-bg);padding:14px;display:flex;flex-direction:column;gap:10px}
+.bub{max-width:88%;padding:8px 12px;font-size:14px;line-height:1.4}
+.bub.cog{align-self:flex-start;border-radius:12px 12px 12px 4px;background:#1d1e24}
+.bub.you{align-self:flex-end;border-radius:12px 12px 4px 12px;background:#183a35}
+.bub.seal{align-self:flex-start;border-radius:12px 12px 12px 4px;background:var(--gold-bg);border:1px solid var(--gold);display:flex;flex-direction:column;gap:8px}
+svg.dia{width:100%;height:auto;display:block}
+svg.dia text{font-family:'Space Grotesk',sans-serif}
+.how{font-size:13px;line-height:1.55;color:var(--muted)}
+.legend{font:400 11px/1.6 var(--mono);color:var(--dim)}
+.loop{display:flex;flex-direction:column;gap:10px;padding:18px}
+.ev{padding:11px 12px;border:1px solid var(--line3);border-radius:12px;display:flex;flex-direction:column;gap:3px}
+.ev .k{font:500 10px var(--mono);letter-spacing:.06em}
+.ev b{font-size:14px;font-weight:500;word-break:break-word}
+.ev span:last-child{font-size:12px;color:var(--dim)}
+.ev.seal{border-color:var(--gold);background:var(--gold-bg)}
+select.w{min-height:40px;padding:0 10px;border-radius:9px;border:1px solid var(--line3);background:var(--sunk);width:100%}
+@media (max-width:1100px){.grid{grid-template-columns:260px minmax(0,1fr)}.loop{grid-column:1/-1}}
+@media (max-width:760px){.grid{grid-template-columns:1fr;padding:12px}.side{padding:16px}.ava{width:64px;height:64px;font-size:22px}}
+</style>
+</head>
+<body>
+<div class="frame">
+  <div class="ring tl" aria-hidden="true"><span>Threshold</span><span>·</span><span>Tracing</span><span>·</span><span><b>Atelier</b></span><span>·</span><span>Escapement</span><span>·</span><span>Hallmark</span></div>
+  <div class="ring tr" aria-hidden="true">the movement · one world</div>
+  <div class="ring bl" aria-hidden="true"><span>Warrant</span><span>·</span><span>Seal</span><span>·</span><span>Provenance</span></div>
+  <div class="ring br" aria-hidden="true">moving lines are live traffic, not decoration</div>
+  <div class="tick a" aria-hidden="true"></div><div class="tick b" aria-hidden="true"></div><div class="tick c" aria-hidden="true"></div><div class="tick d" aria-hidden="true"></div>
+  <div class="win">
+    <header class="bar">
+      <a class="brand" href="/"><span class="gem" aria-hidden="true"></span><span><b>THE MESH</b><span>A WORLD · LIVE LOOP</span></span></a>
+      <nav class="pages" aria-label="Pages"><a href="/">Runtime</a><a href="/loop" aria-current="page">The loop</a><a href="/card">Card</a><a href="/invite">Invite</a></nav>
+      <span class="on-pill mono" id="state" style="margin-left:auto;display:flex;align-items:center;gap:8px;height:34px;padding:0 12px;border-radius:999px;border:1px solid var(--teal-line);background:var(--teal-sunk);font-size:11px;color:#b9e9e1"><span class="dot" id="stDot"></span><span id="stTxt">loading</span></span>
+    </header>
+    <div class="guill" aria-hidden="true"></div>
+    <div class="grid">
+      <aside class="card side" id="side" aria-label="This world"></aside>
+      <section class="world" aria-label="The live loop">
+        <div><span class="kick">World</span><div style="font-size:18px;font-weight:600">You talk to COG. COG runs the loop.</div></div>
+        <section class="chat" aria-label="You and COG" id="chat"></section>
+        <svg class="dia" id="dia" viewBox="0 0 720 330" role="img" aria-label="How work moves through this world"></svg>
+        <p class="how"><b style="color:var(--text)">How it moves:</b> 1 you tell COG what you want · 2 COG routes it with a grant · 3 the workers do the job · 4 results, questions and thoughts land in the right column · 5 COG reads all of it, answers what it can and sends it back through the router · 6 only real decisions come back to you, in gold.</p>
+        <p class="legend"><span style="color:var(--accent)">- - ▸</span> work in motion &nbsp; <span style="color:#8a8a93">- - ▸</span> coming back &nbsp; <span style="color:var(--gold)">■</span> needs your OK &nbsp; <span id="quiet"></span></p>
+      </section>
+      <aside class="card loop" aria-label="The loop, live">
+        <h2 class="kick" style="margin:0;font-size:12px">The loop · live</h2>
+        <p class="note" style="margin:0 0 4px">Everything the workers send. COG reads it first.</p>
+        <div id="feed" style="display:flex;flex-direction:column;gap:10px" aria-live="polite"></div>
+      </aside>
+    </div>
+    <footer class="foot"><span><span style="color:var(--accent)">●</span> spine · events bus</span><span>cell · <span id="cell">one world</span></span><span class="end" id="ver">runtime.meshtool.ai</span></footer>
+  </div>
+</div>
+<script>
+/*KIT*/
+const sortT = (ev) => ev.slice().sort((a, b) => new Date(b.ts) - new Date(a.ts));
+let D = null, W = new URLSearchParams(location.search).get("world") || "";
+const FRESH = 5 * 60000;
+function render() {
+  const h = D.health || {};
+  $("ver").textContent = `v${h.version || "?"} · runtime.meshtool.ai`;
+  if (!D.signed) return publicView();
+  const ten = D.tenants.filter((t) => t.status === "active");
+  const score = (id) => D.grants.filter((g) => g.tenant === id).length + D.events.filter((e) => e.tenant === id).length;
+  if (!ten.find((t) => t.id === W)) W = (ten.slice().sort((a, b) => score(b.id) - score(a.id))[0] || {}).id || "";
+  const t = ten.find((x) => x.id === W);
+  const g = D.grants.filter((x) => x.tenant === W);
+  const ev = sortT(D.events.filter((e) => e.tenant === W));
+  const ap = D.approvals.filter((a) => a.tenant === W);
+  const fresh = ev[0] && now() - new Date(ev[0].ts).getTime() < FRESH;
+  const workers = [...new Map(g.filter((x) => +x.depth > 0 && !isCog(x.sub)).map((x) => [x.sub, x])).values()].slice(0, 4);
+  $("stTxt").textContent = h.killSwitch ? "crown pulled · loop halted" : fresh ? "loop running · " + workers.length + " workers" : "loop quiet · " + workers.length + " workers";
+  $("stDot").className = "dot " + (h.killSwitch ? "gold" : fresh ? "pulse" : "off");
+  $("cell").textContent = t ? t.name : "no world yet";
+  const today = ev.filter((e) => new Date(e.ts).toDateString() === new Date().toDateString()).length;
+  $("side").innerHTML = t ? `
+    <div class="ava" role="img" aria-label="${esc(t.name)}">${esc(t.name.replace(/[^A-Za-z0-9 ]/g, "").split(/\s+/).map((w) => w[0]).join("").slice(0, 2).toUpperCase() || "W")}</div>
+    <div><h1>${esc(t.name)}</h1><p class="note" style="margin:4px 0 0">${esc(cap(t.tier))} tier · ${esc(t.status)}</p></div>
+    <div class="chips" style="display:flex;flex-wrap:wrap;gap:6px"><span class="pill ok">OWN CELL</span><span class="pill">WORLD · ${esc(String(t.id).slice(0, 10))}</span></div>
+    <div class="stats"><div class="stat"><b>${g.length}</b><span>live grants</span></div><div class="stat"><b>${workers.length}</b><span>workers on</span></div><div class="stat"><b style="color:${ap.length ? "var(--gold)" : "inherit"}">${ap.length}</b><span>waiting on you</span></div><div class="stat"><b>${today}</b><span>receipts today</span></div></div>
+    <label class="note" for="wsel">Watch another world</label><select class="w" id="wsel">${ten.map((x) => `<option value="${esc(x.id)}" ${x.id === W ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select>
+    <div style="margin-top:auto;display:flex;flex-direction:column;gap:8px"><a class="btn go" href="/?world=${encodeURIComponent(W)}#/">Open in the runtime</a><a class="btn" href="/?world=${encodeURIComponent(W)}#/receipts">See its receipts</a></div>`
+    : `<h1>No world yet</h1><p class="note">Worlds appear here once a tenant exists on this runtime.</p>`;
+  if ($("wsel")) $("wsel").onchange = (e) => { W = e.target.value; history.replaceState(null, "", "/loop?world=" + encodeURIComponent(W)); render(); };
+  const cog = ev.filter((e) => /^cog\.|^agent\./.test(e.type)).slice(0, 3).reverse();
+  $("chat").innerHTML = `<div class="mono" style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--dim);letter-spacing:.12em"><span>YOU + COG</span><span style="margin-left:auto;color:var(--accent)">COG · your stand-in</span></div>
+    ${cog.map((e) => `<div class="bub cog">${esc(say(e))} <span class="dim" style="font-size:12px">· ${ago(e.ts)} ago</span></div>`).join("") || '<div class="bub cog">Quiet in this world. Tell me what you want on the deck and I\'ll route it.</div>'}
+    ${ap.slice(0, 1).map((a) => `<div class="bub seal"><span><b style="color:var(--gold)">Needs your OK:</b> ${esc(actionLabel(a.action))} · asked ${ago(a.created_at)} ago</span><span style="display:flex;gap:8px"><a class="btn seal sm" href="/?world=${encodeURIComponent(W)}#/">Decide on the runtime</a></span></div>`).join("")}
+    <a class="btn go" href="https://deck.meshtool.ai/" target="_blank" rel="noopener" style="align-self:flex-start">Talk to COG on the deck</a>`;
+  diagram(workers.map((x) => who(x.sub)), fresh, !!ap.length);
+  $("quiet").textContent = fresh ? "live: the last hallmark landed " + ago(ev[0].ts) + " ago" : "still lines: nothing moved in the last 5 minutes";
+  const items = ev.slice(0, 7).map((e) => { const [k, c] = kindOf(e.type); return `<div class="ev"><span class="k" style="color:${c}">${k} · ${esc(who(e.actor || "runtime")[0].toUpperCase())}</span><b>${esc(say(e))}</b><span>${ago(e.ts)} ago${e.type.startsWith("cog") ? " · kept in this world" : " · COG reads it"}</span></div>`; });
+  ap.forEach((a) => items.push(`<div class="ev seal"><span class="k" style="color:var(--gold)">SIGN-OFF · COG → YOU</span><b>${esc(actionLabel(a.action))}</b><span>waiting on you · ${ago(a.created_at)}</span></div>`));
+  $("feed").innerHTML = items.join("") || '<p class="note">Nothing yet. Every move in this world leaves a hallmark here.</p>';
+}
+function publicView() {
+  $("stTxt").textContent = "sign in to watch a world"; $("stDot").className = "dot off";
+  $("side").innerHTML = `<div class="ava" role="img" aria-label="Your world">YOU</div><div><h1>Your world</h1><p class="note" style="margin:4px 0 0">Your COG, your workers, your receipts. Nobody else's agents in your cell.</p></div>
+    <p class="note">COG can run on your own model. Your workers are your own Claude, ChatGPT and the rest, on your own subscriptions.</p>
+    <div style="margin-top:auto;display:flex;flex-direction:column;gap:8px"><a class="btn go" href="/">Sign in to watch yours</a><a class="btn" href="/invite">Get invited</a></div>`;
+  $("chat").innerHTML = `<div class="mono" style="display:flex;font-size:11px;color:var(--dim);letter-spacing:.12em"><span>YOU + COG</span><span style="margin-left:auto;color:var(--accent)">COG · your stand-in</span></div>
+    <div class="bub you">Build me a tee-time page and have it checked.</div><div class="bub cog">On it. Claude builds it, ChatGPT checks it. I'll only bring you what needs your OK.</div>
+    <div class="bub seal"><span><b style="color:var(--gold)">Needs your OK:</b> anything that spends, deploys or publishes</span></div><span class="note" style="font-size:12px">An example of how a world talks. Sign in to see yours, live.</span>`;
+  diagram([["Claude", "builds"], ["ChatGPT", "builds · checks"]], false, true);
+  $("quiet").textContent = "";
+  $("feed").innerHTML = [["DONE", "var(--accent)", "A task finished", "receipt ✓ · COG checked"], ["QUESTION", "var(--blue)", "A worker asks COG", "COG answered · sent back"], ["THOUGHT", "var(--muted)", "How COG split the job", "kept in your world"], ["SIGN-OFF", "var(--gold)", "The one decision COG can't make", "waiting on you"]].map(([k, c, b, s], i) => `<div class="ev ${i === 3 ? "seal" : ""}"><span class="k" style="color:${c}">${k}</span><b>${b}</b><span>${s}</span></div>`).join("");
+}
+function diagram(ws, moving, seal) {
+  const n = Math.max(1, ws.length), A = "#36e0c8", G = "#8a8a93", cls = moving ? "flow" : "", dash = moving ? "" : 'stroke-dasharray="5 7"';
+  const x0 = 200, x1 = 690, step = (x1 - x0) / n, cx = (i) => x0 + step * (i + 0.5);
+  let s = `<defs><marker id="ah" orient="auto" markerWidth="6" markerHeight="6" refX="3" refY="3"><path d="M0 0 L6 3 L0 6 Z" fill="${A}"/></marker><marker id="ag" orient="auto" markerWidth="6" markerHeight="6" refX="3" refY="3"><path d="M0 0 L6 3 L0 6 Z" fill="${G}"/></marker></defs>`;
+  s += `<rect x="20" y="20" width="150" height="60" rx="12" fill="#17181d" stroke="${A}" stroke-width="1.5"/><text x="95" y="46" text-anchor="middle" fill="#e9e7e2" font-size="15" font-weight="600">COG router</text><text x="95" y="64" text-anchor="middle" fill="#b9b8b3" font-size="11" font-family="IBM Plex Mono, monospace">routes · answers</text>`;
+  s += `<path class="${cls}" ${dash} d="M95 80 L95 150 L${cx(n - 1)} 150" fill="none" stroke="${A}" stroke-width="2"/>`;
+  s += `<text x="104" y="122" fill="${A}" font-size="12">tasks + grants</text>`;
+  ws.forEach(([name, what], i) => {
+    s += `<path class="${cls}" ${dash} d="M${cx(i)} 150 L${cx(i)} 178" fill="none" stroke="${A}" stroke-width="2" marker-end="url(#ah)"/>`;
+    s += `<rect x="${cx(i) - Math.min(75, step / 2 - 6)}" y="184" width="${Math.min(150, step - 12)}" height="58" rx="12" fill="#17181d" stroke="${A}" stroke-width="1.5"/><text x="${cx(i)}" y="208" text-anchor="middle" fill="#e9e7e2" font-size="14" font-weight="600">${esc(String(name).slice(0, 16))}</text><text x="${cx(i)}" y="226" text-anchor="middle" fill="#b9b8b3" font-size="10" font-family="IBM Plex Mono, monospace">${esc(String(what).slice(0, 20))}</text>`;
+    s += `<path class="${cls}" ${dash} d="M${cx(i)} 242 L${cx(i)} 290" fill="none" stroke="${G}" stroke-width="2"/>`;
+  });
+  s += `<path class="${cls}" ${dash} d="M${cx(0)} 290 L705 290 L705 50 L176 50" fill="none" stroke="${G}" stroke-width="2" marker-end="url(#ag)"/>`;
+  s += `<text x="${(cx(0) + 700) / 2}" y="312" text-anchor="middle" fill="#b9b8b3" font-size="12">results, questions, thoughts → back to COG</text>`;
+  if (seal) s += `<circle cx="95" cy="12" r="6" fill="#e9b949"/><text x="108" y="16" fill="#e9b949" font-size="12">only sign-offs reach you</text>`;
+  $("dia").innerHTML = s;
+}
+async function load() { D = await readMesh(); render(); }
+load();
+setInterval(() => { if (!document.hidden) load(); }, 10000);
+</script>
+</body>
+</html>
