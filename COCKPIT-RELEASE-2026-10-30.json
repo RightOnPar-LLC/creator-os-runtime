@@ -1,0 +1,15 @@
+{
+  "state": "READY FOR REVIEW \u2014 runtime publish access unresolved",
+  "source": "GET https://runtime.meshtool.ai/",
+  "baseline_sha256": "becc4a1efbb27c835daeae483a15e19987bca74808f7ff8ce8d13a1ecaa0c377",
+  "cockpit_sha256": "3c3d6761a78d60dbcc19feb9740773be17b01527e127e6bc741aa0d3c83fb2dd",
+  "palette_fingerprint": "ef1ab3a1",
+  "functional_scripts": "byte-identical",
+  "publish_path": "PUT /api/admin/docs/_cockpit",
+  "rollback": "restore baseline cockpit document; no runtime code deployment",
+  "approval": "DW approved live facelift incl runtime.meshtool.ai in owning chat 2026-10-30",
+  "functional_script_sha256": [
+    "ff022fc0f2a73a035f59e07b52a42a48c9f87396bd1d2fd84ee8d9aa4cbbe0e8"
+  ],
+  "browser_checks": "1360px and 390px: no horizontal overflow or browser exceptions"
+}
