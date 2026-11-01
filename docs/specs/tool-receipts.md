@@ -212,3 +212,5 @@ The canonical rule is maintained in the estate handoff contract; local startup
 readers and five agent instruction surfaces were configured/checked separately.
 Actual delivery by a new session still needs verification; this is not an
 unattended worker or an authorization to start unrelated tasks.
+
+- 2026-11-01, codex@solidity-slop — PLANNING REVIEW COMPLETE. Current master source rebuilt on meshtoolVM exactly matches production/staging181657byte35f18ea8 artifact; an older archived live bundle was the wrong source-drift comparator. Existing operator boundary is not rebuilt or reclassified as universal coverage. Real caller-grant proof, external/local adapter correlation and unified Desk remain unfinished. Next implementation unit: verified existing caller authority, then one adapter with durable pre-execution authorization/start and zero-effect denial/unavailable-storage controls, linked to the existing Market receipt. No grants, production services, routing or paid calls changed. See platform-realignment-review-2026-11-01.md for the verified plan; separate scheduled image test unchanged.
