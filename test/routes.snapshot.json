@@ -1,5 +1,5 @@
 {
-  "count":190,
+  "count": 193,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -182,6 +182,9 @@
     "POST /sso/callback",
     "GET /.well-known/agent.json",
     "GET /",
+    "GET /loop",
+    "GET /card",
+    "GET /invite",
     "GET /cockpit/:page",
     "GET /status.json",
     "GET /status",
@@ -294,6 +297,9 @@
     "POST /sso/callback :: public",
     "GET /.well-known/agent.json :: public",
     "GET / :: public",
+    "GET /loop :: public",
+    "GET /card :: public",
+    "GET /invite :: public",
     "GET /cockpit/:page :: public(page)+admin(data)",
     "GET /status.json :: public",
     "GET /status :: public",
