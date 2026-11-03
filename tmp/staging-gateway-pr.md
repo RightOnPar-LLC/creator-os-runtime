@@ -1,0 +1,5 @@
+Adds an opt-in staging-v1 profile to the existing /mcp route. It requires a child grant lasting at most 15 minutes, pins one tenant/project/environment, exposes only read tools, and charges call budget atomically using the existing ledger. Receipt start/completion remain the execution boundary. Disabled by default.
+
+Validation: source retry 350 passed/0 failed; production bundle 350 passed/0 failed. The new tests cover scope, TTL, tool discovery, write refusal, receipts, concurrent exhaustion and revocation. Initial source/Market-only runs encountered Windows Postgres connection-closed/setup timeouts; retained and reported in OPEN-LOOPS.
+
+Not deployed or live-proven. Automatic review rejected bulk Railway variable-value retrieval for an isolation check as unnecessary credential access. Targeted database isolation and existing staging operator authority are needed before rollout. No production settings or credentials changed. Signed audit agent and durable tap Workflow are ordered subsequent phases, not implemented here. See docs/specs/staging-capability-gateway.md and docs/specs/staging-gateway-evidence.json.
