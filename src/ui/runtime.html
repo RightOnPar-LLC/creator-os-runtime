@@ -90,11 +90,37 @@
 pre.intent{margin:0;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:var(--sunk);font:12px/1.5 var(--mono);color:var(--text2);white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto}
 .acts{margin-top:auto;display:flex;gap:10px;flex-wrap:wrap}
 .empty{padding:22px;color:var(--muted);font-size:14px}
-.tblwrap{overflow:auto;border:1px solid var(--line);border-radius:14px;background:var(--panel)}
-table.t{border-collapse:collapse;width:100%;font-size:13px}
-table.t th{position:sticky;top:0;background:#17181d;text-align:left;font:500 10px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--dim);padding:10px 12px;border-bottom:1px solid var(--line2);white-space:nowrap}
-table.t td{padding:9px 12px;border-bottom:1px solid var(--line2);vertical-align:top}
+.tblwrap{overflow:auto;max-height:calc(100vh - 260px);border:1px solid var(--line);border-radius:14px;background:var(--panel)}
+table.t{min-width:760px;border-collapse:separate;border-spacing:0;width:100%;font-size:13px;line-height:1.35}
+table.t th{position:sticky;top:0;z-index:1;background:#15161b;text-align:left;font:500 10px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--dim);padding:11px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+table.t td{padding:12px 14px;border-bottom:1px solid var(--line2);vertical-align:middle}
+table.t th.r,table.t td.r{text-align:right}
+table.t tbody tr:hover td{background:rgba(255,255,255,.025)}
 table.t tr:last-child td{border-bottom:0}
+.two{display:flex;flex-direction:column;gap:2px;min-width:120px}
+.two b{font-weight:600;color:var(--text)}
+.two span{font:400 11px var(--mono);color:var(--dim);overflow-wrap:anywhere}
+.tm{display:flex;flex-direction:column;gap:2px;white-space:nowrap}
+.tm b{font-weight:500;color:var(--text)}
+.tm span{font:400 11px var(--mono);color:var(--dim)}
+.num{font:500 13px var(--mono);white-space:nowrap;color:var(--text)}
+.num.up{color:var(--accent)}
+.dimc{color:var(--dim)}
+.wld{color:var(--text2)}
+.ev{display:inline-flex;align-items:center;gap:8px;font-weight:500}
+.ev i{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.cps{display:flex;flex-wrap:wrap;gap:4px;max-width:340px}
+.cp{display:inline-block;padding:2px 7px;border-radius:6px;background:var(--sunk);border:1px solid var(--line2);font:400 11px var(--mono);color:var(--muted);white-space:nowrap}
+.cp.more{border-style:dashed;color:var(--dim)}
+.meter{height:3px;margin-top:6px;border-radius:2px;background:var(--line2);overflow:hidden;min-width:90px}
+.meter i{display:block;height:100%;background:var(--accent)}
+.kvd{min-width:200px;max-width:380px}
+.kvd summary{display:flex;flex-wrap:wrap;gap:4px;cursor:pointer;list-style:none}
+.kvd summary::-webkit-details-marker{display:none}
+.kvp{display:inline-flex;gap:6px;padding:2px 7px;border-radius:6px;background:var(--sunk);border:1px solid var(--line2);font:400 11px var(--mono);color:var(--text2);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kvp i{font-style:normal;color:var(--dim)}
+.kvm{align-self:center;font:400 11px var(--mono);color:var(--accent)}
+.kvd pre{margin:8px 0 0;padding:10px 12px;border-radius:10px;background:var(--sunk);border:1px solid var(--line2);font:400 11px/1.5 var(--mono);color:var(--text2);white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto}
 .idc{font:400 11px var(--mono);color:var(--muted);word-break:break-all}
 .jsn{font:400 11px var(--mono);color:var(--dim);word-break:break-word}
 .hood{font:400 11px var(--mono);color:var(--dim)}
@@ -270,10 +296,10 @@ const evTone = (t) => { t = String(t); return /fail|crash|denied|revok|paused/.t
 // ---- views -----------------------------------------------------------------------------------
 const VIEWS = {
   "": { title: "Everyone and everything on your Mesh", nav: "Overview", lex: "The Loupe" },
-  grants: { title: "Grants", nav: "Grants", lex: "Warrants", one: "Every capability alive right now, what it may do, and what is left of its budget.", api: "/api/admin/grants?limit=500", key: "grants", cols: ["sub", "tenant", "status", "caps", "remaining", "exp", "id"] },
+  grants: { title: "Grants", nav: "Grants", lex: "Warrants", one: "Every capability alive right now, what it may do, and what is left of its budget.", api: "/api/admin/grants?limit=500", key: "grants", cols: ["sub", "tenant", "status", "caps", "remaining", "exp"] },
   worlds: { title: "Worlds", nav: "Worlds", lex: "Cloisonné", one: "Each world in its own cell: who is on this runtime, and on what tier.", api: "/api/tenants", key: "tenants", cols: ["name", "tier", "status", "deploys_period", "created_at", "id"] },
   receipts: { title: "Receipts", nav: "Receipts", lex: "Hallmarks", one: "Every action the runtime, COG and the agents took, newest first.", api: "/api/admin/events", key: "events", cols: ["ts", "type", "actor", "tenant", "data"] },
-  ledger: { title: "Ledger", nav: "Ledger", lex: "Assay", one: "Every reserve, settle and release: the money trail.", api: "/api/admin/ledger", key: "ledger", cols: ["ts", "kind", "usd_cents", "calls", "deploys", "tenant", "grant_id", "note"] },
+  ledger: { title: "Ledger", nav: "Ledger", lex: "Assay", one: "Every reserve, settle and release: the money trail.", api: "/api/admin/ledger", key: "ledger", cols: ["ts", "kind", "usd_cents", "calls", "tenant", "note"] },
   workers: { title: "Workers", nav: "Workers", lex: "Escapement", one: "What is deployed, planned, or failed.", api: "/api/admin/deploys", key: "deploys", cols: ["name", "template", "status", "executed", "tenant", "created_at"] },
   intake: { title: "Intake", nav: "Intake", lex: "Threshold", one: "What arrived from Stripe, Railway, GitHub, the Brain and the Mesh.", api: "/api/admin/webhooks", key: "webhooks", cols: ["source", "type", "received_at", "handled", "result"] },
   outbox: { title: "Outbox", nav: "Outbox", lex: "Patina", one: "What is on its way to the Brain and the memory bridge.", api: "/api/admin/outbox", key: "outbox", cols: ["kind", "attempts", "next_at", "done", "last_error", "created_at"] },
@@ -456,19 +482,53 @@ async function decide(a, verdict) {
 }
 
 // ---- tables ----------------------------------------------------------------------------------
+const money = (c) => "$" + (Math.abs(+c || 0) / 100).toFixed(2);
+const trunc = (x, n) => { x = String(x); return x.length > n ? x.slice(0, n - 1) + "…" : x; };
+const shortId = (id) => { id = String(id || ""); return id.length > 14 ? id.slice(0, 8) + "…" + id.slice(-4) : id; };
+// "5m ago" / "in 3d": exact time stays one hover away.
+function rel(v) {
+  const t = typeof v === "number" ? (v < 1e12 ? v * 1000 : v) : new Date(v).getTime();
+  if (!t) return "";
+  const d = (t - now()) / 1000, a = Math.abs(d);
+  const u = a < 60 ? "now" : a < 3600 ? Math.floor(a / 60) + "m" : a < 86400 ? Math.floor(a / 3600) + "h" : Math.floor(a / 86400) + "d";
+  return u === "now" ? "just now" : d < 0 ? u + " ago" : "in " + u;
+}
+const stamp = (v) => '<span class="tm" title="' + esc(when(v)) + '"><b>' + esc(rel(v)) + '</b><span>' + esc(when(v)) + '</span></span>';
+const humanType = (t) => String(t).replace(/[._]/g, " ");
+const tone = (s) => /active|settle|success|deployed|true|done|approved|ok|handled/.test(s) ? "ok" : /revok|fail|crash|denied|suspend|error/.test(s) ? "bad" : /pending|plan|dry|expired|reserve|queued/.test(s) ? "gold" : "";
+// An object becomes a few short key/value chips; the full JSON opens on click, never as a wall of text.
+function kvChips(o) {
+  if (o === null || typeof o !== "object") return esc(trunc(o, 80));
+  const ent = Object.entries(o).filter(([, x]) => x !== null && x !== undefined && x !== "");
+  if (!ent.length) return '<span class="dimc">—</span>';
+  const show = ent.slice(0, 3).map(([k, x]) => '<span class="kvp"><i>' + esc(k.replace(/_/g, " ")) + '</i>' + esc(trunc(typeof x === "object" ? JSON.stringify(x) : x, 36)) + '</span>').join("");
+  const full = JSON.stringify(o, null, 2);
+  const more = ent.length > 3 || full.length > 120;
+  return '<details class="kvd"><summary>' + show + (ent.length > 3 ? '<span class="kvm">+' + (ent.length - 3) + ' more</span>' : more ? '<span class="kvm">all</span>' : "") + '</summary><pre>' + esc(full) + '</pre></details>';
+}
 function cell(col, v, r) {
-  if (v === null || v === undefined || v === "") return '<span class="jsn">—</span>';
-  if (col === "sub") { const [n, d] = who(v); return `<b style="font-weight:600">${esc(n)}</b> <span class="dim" style="font-size:12px">${esc(d)}</span>`; }
-  if (col === "tenant") return `<span title="${esc(v)}">${esc(tname(v))}</span>`;
-  if (col === "status" || col === "kind" || col === "tier" || col === "handled" || col === "done" || col === "executed") { const s = String(v); const t = /active|settle|success|deployed|true|done|approved/.test(s) ? "ok" : /revok|fail|crash|denied|suspend/.test(s) ? "bad" : /pending|plan|dry|expired|reserve/.test(s) ? "gold" : ""; return `<span class="pill ${t}">${esc(s)}</span>`; }
-  if (col === "type") return `<span style="color:${evTone(v)}">${esc(v)}</span>`;
-  if (["ts", "created_at", "received_at", "next_at", "exp"].includes(col)) return `<span class="idc">${when(v)}</span>`;
-  if (col === "caps" && Array.isArray(v)) return `<span class="jsn">${esc(v.join(" · "))}</span>`;
-  if (col === "remaining" && typeof v === "object") return `<span style="color:var(--accent)">¢${esc(v.usd_cents)}</span> <span class="jsn">· ${esc(v.calls)} calls · ${esc(v.deploys)} deploys</span>`;
-  if (col === "id" || col.endsWith("_id")) return `<span class="idc">${esc(v)}</span>`;
-  if (typeof v === "object") { const s = JSON.stringify(v); return `<span class="jsn" title="${esc(s)}">${esc(s.length > 140 ? s.slice(0, 140) + "…" : s)}</span>`; }
+  if (col === "sub") { const [n, d] = who(v); return '<div class="two"><b>' + esc(n) + '</b><span title="' + esc(r.id) + '">' + esc(d ? d + " · " : "") + esc(shortId(r.id)) + '</span></div>'; }
+  if (col === "usd_cents") { const c = +v || 0; return '<span class="num ' + (/release|refund|credit/.test(String(r.kind)) ? "up" : "") + '">' + (c ? money(c) : '<span class="dimc">—</span>') + '</span>'; }
+  if (col === "calls" && r && "deploys" in r) { const p = []; if (+v) p.push(v + " call" + (+v === 1 ? "" : "s")); if (+r.deploys) p.push(r.deploys + " deploy" + (+r.deploys === 1 ? "" : "s")); return p.length ? '<span class="num">' + esc(p.join(" · ")) + '</span>' : '<span class="dimc">—</span>'; }
+  if (col === "note" && r && "grant_id" in r) { return '<div class="two"><b>' + (v ? esc(trunc(v, 70)) : '<span class="dimc">—</span>') + '</b>' + (r.grant_id ? '<span title="' + esc(r.grant_id) + '">grant ' + esc(shortId(r.grant_id)) + '</span>' : "") + '</div>'; }
+  if (v === null || v === undefined || v === "") return '<span class="dimc">—</span>';
+  if (col === "tenant") return '<span class="wld" title="' + esc(v) + '">' + esc(tname(v)) + '</span>';
+  if (col === "actor") { const [n, d] = who(v); return d ? '<div class="two"><b>' + esc(n) + '</b><span>' + esc(d) + '</span></div>' : esc(n); }
+  if (["status", "kind", "tier", "handled", "done", "executed"].includes(col)) { const s = String(v); return '<span class="pill ' + tone(s) + '">' + esc(s) + '</span>'; }
+  if (col === "type") return '<span class="ev"><i style="background:' + evTone(v) + '"></i>' + esc(humanType(v)) + '</span>';
+  if (["ts", "created_at", "received_at", "next_at", "exp"].includes(col)) return stamp(v);
+  if (col === "caps" && Array.isArray(v)) { const sh = v.slice(0, 3).map((c) => '<span class="cp">' + esc(c) + '</span>').join(""); return '<span class="cps" title="' + esc(v.join(", ")) + '">' + sh + (v.length > 3 ? '<span class="cp more">+' + (v.length - 3) + '</span>' : "") + '</span>'; }
+  if (col === "remaining" && typeof v === "object") {
+    const u = used(r), pct = Math.round((1 - u) * 100), hasBudget = r.budget && ["usd_cents", "calls", "deploys"].some((k) => +r.budget[k] > 0);
+    return '<div class="two"><b>' + money(v.usd_cents) + '</b><span>' + esc(v.calls) + ' calls · ' + esc(v.deploys) + ' deploys</span></div>' + (hasBudget ? '<div class="meter" title="' + pct + '% left"><i style="width:' + pct + '%"></i></div>' : "");
+  }
+  if (col === "id" || col.endsWith("_id")) return '<span class="idc" title="' + esc(v) + '">' + esc(shortId(v)) + '</span>';
+  if (col === "data" || col === "result" || typeof v === "object") return kvChips(v);
+  if (col === "last_error") return '<span class="err" title="' + esc(v) + '">' + esc(trunc(v, 60)) + '</span>';
   return esc(v);
 }
+const NUMCOL = new Set(["usd_cents"]);
+const HEAD = { sub: "Holder", tenant: "World", caps: "May do", remaining: "Left", exp: "Expires", ts: "When", usd_cents: "Amount", calls: "Used", note: "Note", type: "What happened", actor: "By", data: "Detail", created_at: "Created", received_at: "Arrived", next_at: "Next try", last_error: "Last error", deploys_period: "Deploys" };
 async function table(k) {
   const v = VIEWS[k];
   $("view").innerHTML = `<p class="note" style="margin:0">${esc(v.one)}</p><div class="empty">loading…</div>`;
@@ -480,7 +540,7 @@ async function table(k) {
   const shown = rows.filter((r) => (k === "worlds" ? !S.world || r.id === S.world : inWorld(r))).filter(findOk);
   const canPull = (r) => k === "grants" && r.status === "active" && +r.depth > 0;
   $("view").innerHTML = `<p class="note" style="margin:0">${esc(v.one)}</p>
-    <div class="tblwrap">${shown.length ? `<table class="t"><thead><tr>${v.cols.map((c) => `<th scope="col">${esc(c.replace(/_/g, " "))}</th>`).join("")}${k === "grants" ? '<th scope="col"><span class="sr">Action</span></th>' : ""}</tr></thead><tbody>${shown.map((r) => `<tr>${v.cols.map((c) => `<td>${cell(c, r[c], r)}</td>`).join("")}${k === "grants" ? `<td>${canPull(r) ? `<button class="btn sm bad" type="button" data-rv="${esc(r.id)}">Pull</button>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table>` : '<div class="empty">Nothing here yet.</div>'}</div>
+    <div class="tblwrap">${shown.length ? `<table class="t"><thead><tr>${v.cols.map((c) => `<th scope="col"${NUMCOL.has(c) ? ' class="r"' : ""}>${esc(HEAD[c] || c.replace(/_/g, " "))}</th>`).join("")}${k === "grants" ? '<th scope="col"><span class="sr">Action</span></th>' : ""}</tr></thead><tbody>${shown.map((r) => `<tr>${v.cols.map((c) => `<td${NUMCOL.has(c) ? ' class="r"' : ""}>${cell(c, r[c], r)}</td>`).join("")}${k === "grants" ? `<td>${canPull(r) ? `<button class="btn sm bad" type="button" data-rv="${esc(r.id)}">Pull</button>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table>` : '<div class="empty">Nothing here yet.</div>'}</div>
     <div class="hood">${shown.length} of ${rows.length} rows · newest first${S.world ? " · world " + esc(tname(S.world)) : ""}${S.q ? " · find “" + esc(S.q) + "”" : ""} · source ${esc(v.api.split("?")[0])}</div><div class="msg" id="tMsg"></div>`;
   document.querySelectorAll("[data-rv]").forEach((b) => (b.onclick = async () => {
     if (!confirm("Pull this warrant? The agent loses it right away, and so does everything it handed down.")) return;
