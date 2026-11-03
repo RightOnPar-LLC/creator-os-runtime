@@ -50,7 +50,7 @@
 .lhead .k{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .lhead .act{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
 .secnav{display:flex;gap:2px;border-bottom:1px solid var(--line2);overflow-x:auto;scrollbar-width:none}
-.secnav a{padding:10px 12px;font-size:13px;color:var(--dim);text-decoration:none;white-space:nowrap}
+.secnav a{padding:10px 11px;font-size:13px;color:var(--dim);text-decoration:none;white-space:nowrap}
 .secnav a:hover{color:var(--text)}
 .secnav a[aria-current=page]{color:var(--text);box-shadow:inset 0 -2px 0 var(--accent)}
 .three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
@@ -90,7 +90,21 @@
 pre.intent{margin:0;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:var(--sunk);font:12px/1.5 var(--mono);color:var(--text2);white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto}
 .acts{margin-top:auto;display:flex;gap:10px;flex-wrap:wrap}
 .empty{padding:22px;color:var(--muted);font-size:14px}
-.tblwrap{overflow:auto;max-height:calc(100vh - 260px);border:1px solid var(--line);border-radius:14px;background:var(--panel)}
+.tcard{position:relative;border:1px solid var(--line);border-left:3px solid var(--tc,var(--accent));border-radius:14px;background:var(--panel);overflow:hidden;box-shadow:0 1px 0 rgba(255,255,255,.04) inset,0 10px 30px rgba(0,0,0,.25)}
+.tcard::before,.tcard::after{content:"";position:absolute;width:5px;height:5px;border-radius:50%;background:#2a2b31;box-shadow:0 0 0 1px #3a3b42;top:10px}
+.tcard::before{right:12px}.tcard::after{right:24px}
+.thead{display:flex;align-items:center;gap:12px;padding:12px 56px 12px 14px;background:linear-gradient(180deg,#191a20,#141519)}
+.tico{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font-size:18px;background:#0f1013;border:1px solid var(--line3);box-shadow:0 0 0 2px rgba(255,255,255,.03) inset,0 0 0 1px var(--tc,var(--accent))}
+.tt{display:flex;flex-direction:column;min-width:0}
+.tt b{font-size:15px;font-weight:600}
+.tt span{font:400 10px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+.tline{margin-left:auto;display:flex;align-items:center;gap:6px;font:400 11px var(--mono);color:var(--dim);white-space:nowrap}
+.tline i{font-style:normal;color:var(--line3)}
+.tcard .guill{height:3px}
+.tfoot{padding:9px 14px;border-top:1px solid var(--line2);background:#111216}
+.wm{background:none!important;width:auto;height:auto;font-size:14px;line-height:1}
+.gref{font:400 11px var(--mono);color:var(--muted);white-space:nowrap}
+.tblwrap{overflow:auto;max-height:calc(100vh - 330px);background:var(--panel)}
 table.t{min-width:760px;border-collapse:separate;border-spacing:0;width:100%;font-size:13px;line-height:1.35}
 table.t th{position:sticky;top:0;z-index:1;background:#15161b;text-align:left;font:500 10px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--dim);padding:11px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
 table.t td{padding:12px 14px;border-bottom:1px solid var(--line2);vertical-align:middle}
@@ -106,7 +120,7 @@ table.t tr:last-child td{border-bottom:0}
 .num{font:500 13px var(--mono);white-space:nowrap;color:var(--text)}
 .num.up{color:var(--accent)}
 .dimc{color:var(--dim)}
-.wld{color:var(--text2)}
+.wld{color:var(--text2);white-space:nowrap}
 .ev{display:inline-flex;align-items:center;gap:8px;font-weight:500}
 .ev i{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .cps{display:flex;flex-wrap:wrap;gap:4px;max-width:340px}
@@ -296,15 +310,15 @@ const evTone = (t) => { t = String(t); return /fail|crash|denied|revok|paused/.t
 // ---- views -----------------------------------------------------------------------------------
 const VIEWS = {
   "": { title: "Everyone and everything on your Mesh", nav: "Overview", lex: "The Loupe" },
-  grants: { title: "Grants", nav: "Grants", lex: "Warrants", one: "Every capability alive right now, what it may do, and what is left of its budget.", api: "/api/admin/grants?limit=500", key: "grants", cols: ["sub", "tenant", "status", "caps", "remaining", "exp"] },
-  worlds: { title: "Worlds", nav: "Worlds", lex: "Cloisonné", one: "Each world in its own cell: who is on this runtime, and on what tier.", api: "/api/tenants", key: "tenants", cols: ["name", "tier", "status", "deploys_period", "created_at", "id"] },
-  receipts: { title: "Receipts", nav: "Receipts", lex: "Hallmarks", one: "Every action the runtime, COG and the agents took, newest first.", api: "/api/admin/events", key: "events", cols: ["ts", "type", "actor", "tenant", "data"] },
-  ledger: { title: "Ledger", nav: "Ledger", lex: "Assay", one: "Every reserve, settle and release: the money trail.", api: "/api/admin/ledger", key: "ledger", cols: ["ts", "kind", "usd_cents", "calls", "tenant", "note"] },
-  workers: { title: "Workers", nav: "Workers", lex: "Escapement", one: "What is deployed, planned, or failed.", api: "/api/admin/deploys", key: "deploys", cols: ["name", "template", "status", "executed", "tenant", "created_at"] },
-  intake: { title: "Intake", nav: "Intake", lex: "Threshold", one: "What arrived from Stripe, Railway, GitHub, the Brain and the Mesh.", api: "/api/admin/webhooks", key: "webhooks", cols: ["source", "type", "received_at", "handled", "result"] },
-  outbox: { title: "Outbox", nav: "Outbox", lex: "Patina", one: "What is on its way to the Brain and the memory bridge.", api: "/api/admin/outbox", key: "outbox", cols: ["kind", "attempts", "next_at", "done", "last_error", "created_at"] },
-  memory: { title: "Memory", nav: "Memory", lex: "Patina", one: "What the runtime remembers, in the order it happened." },
-  guardrails: { title: "Guardrails", nav: "Guardrails", lex: "The Bezel", one: "The floors that never move, the Crown, and what is armed." },
+  grants: { ico: "🎫", title: "Grants", nav: "Grants", lex: "Warrants", one: "Every capability alive right now, what it may do, and what is left of its budget.", api: "/api/admin/grants?limit=500", key: "grants", cols: ["sub", "tenant", "status", "caps", "remaining", "exp"] },
+  worlds: { ico: "🏠", title: "Worlds", nav: "Worlds", lex: "Cloisonné", one: "Each world in its own cell: who is on this runtime, and on what tier.", api: "/api/tenants", key: "tenants", cols: ["name", "tier", "status", "deploys_period", "created_at", "id"] },
+  receipts: { ico: "🧾", title: "Receipts", nav: "Receipts", lex: "Hallmarks", one: "Every action the runtime, COG and the agents took, newest first.", api: "/api/admin/events", key: "events", cols: ["ts", "type", "actor", "tenant", "data"] },
+  ledger: { ico: "💰", title: "Ledger", nav: "Ledger", lex: "Assay", one: "Every reserve, settle and release: the money trail.", api: "/api/admin/ledger", key: "ledger", cols: ["ts", "kind", "usd_cents", "calls", "tenant", "note"] },
+  workers: { ico: "⚙️", title: "Workers", nav: "Workers", lex: "Escapement", one: "What is deployed, planned, or failed.", api: "/api/admin/deploys", key: "deploys", cols: ["name", "template", "status", "executed", "tenant", "created_at"] },
+  intake: { ico: "📥", title: "Intake", nav: "Intake", lex: "Threshold", one: "What arrived from Stripe, Railway, GitHub, the Brain and the Mesh.", api: "/api/admin/webhooks", key: "webhooks", cols: ["source", "type", "received_at", "handled", "result"] },
+  outbox: { ico: "📤", title: "Outbox", nav: "Outbox", lex: "Patina", one: "What is on its way to the Brain and the memory bridge.", api: "/api/admin/outbox", key: "outbox", cols: ["kind", "attempts", "next_at", "done", "last_error", "created_at"] },
+  memory: { ico: "🧠", title: "Memory", nav: "Memory", lex: "Patina", one: "What the runtime remembers, in the order it happened." },
+  guardrails: { ico: "🛡️", title: "Guardrails", nav: "Guardrails", lex: "The Bezel", one: "The floors that never move, the Crown, and what is armed." },
 };
 const ALIAS = { tenants: "worlds", events: "receipts", deploys: "workers", webhooks: "intake", hub: "" };
 
@@ -322,7 +336,7 @@ function setHead(k) {
   $("title").textContent = k === "connect" ? "An app wants in" : v.title;
   $("lexKick").textContent = (k === "connect" ? "The Threshold" : v.lex) + " · RightOnPar estate";
   document.title = (k ? (k === "connect" ? "Connect" : v.title) + " · " : "") + "Runtime";
-  $("secnav").innerHTML = Object.entries(VIEWS).map(([key, x]) => `<a href="#/${key}" ${key === k ? 'aria-current="page"' : ""}>${esc(x.nav)}</a>`).join("");
+  $("secnav").innerHTML = Object.entries(VIEWS).map(([key, x]) => `<a href="#/${key}" ${key === k ? 'aria-current="page"' : ""}>${x.ico ? x.ico + " " : ""}${esc(x.nav)}</a>`).join("");
   $("q").value = S.mode === "find" ? S.q : "runtime.meshtool.ai / " + (k || "overview");
   $("headAct").innerHTML = "";
 }
@@ -482,6 +496,9 @@ async function decide(a, verdict) {
 }
 
 // ---- tables ----------------------------------------------------------------------------------
+const WMARK = ["🟦", "🟪", "🟧", "🟩", "🟥", "🟨", "🟫", "⬜"];
+const worldMark = (id) => { const i = S.tenants.findIndex((t) => t.id === id); return i < 0 ? "⬛" : WMARK[i % WMARK.length]; };
+const grantRef = (id) => '<span class="gref" title="' + esc(id) + '">🎫 ' + esc(shortId(id)) + '</span>';
 const money = (c) => "$" + (Math.abs(+c || 0) / 100).toFixed(2);
 const trunc = (x, n) => { x = String(x); return x.length > n ? x.slice(0, n - 1) + "…" : x; };
 const shortId = (id) => { id = String(id || ""); return id.length > 14 ? id.slice(0, 8) + "…" + id.slice(-4) : id; };
@@ -507,26 +524,30 @@ function kvChips(o) {
   return '<details class="kvd"><summary>' + show + (ent.length > 3 ? '<span class="kvm">+' + (ent.length - 3) + ' more</span>' : more ? '<span class="kvm">all</span>' : "") + '</summary><pre>' + esc(full) + '</pre></details>';
 }
 function cell(col, v, r) {
-  if (col === "sub") { const [n, d] = who(v); return '<div class="two"><b>' + esc(n) + '</b><span title="' + esc(r.id) + '">' + esc(d ? d + " · " : "") + esc(shortId(r.id)) + '</span></div>'; }
+  if (col === "sub") { const [n, d] = who(v); return '<div class="two"><b>🎫 ' + esc(n) + '</b><span title="' + esc(r.id) + '">' + esc(d ? d + " · " : "") + esc(shortId(r.id)) + '</span></div>'; }
   if (col === "usd_cents") { const c = +v || 0; return '<span class="num ' + (/release|refund|credit/.test(String(r.kind)) ? "up" : "") + '">' + (c ? money(c) : '<span class="dimc">—</span>') + '</span>'; }
   if (col === "calls" && r && "deploys" in r) { const p = []; if (+v) p.push(v + " call" + (+v === 1 ? "" : "s")); if (+r.deploys) p.push(r.deploys + " deploy" + (+r.deploys === 1 ? "" : "s")); return p.length ? '<span class="num">' + esc(p.join(" · ")) + '</span>' : '<span class="dimc">—</span>'; }
-  if (col === "note" && r && "grant_id" in r) { return '<div class="two"><b>' + (v ? esc(trunc(v, 70)) : '<span class="dimc">—</span>') + '</b>' + (r.grant_id ? '<span title="' + esc(r.grant_id) + '">grant ' + esc(shortId(r.grant_id)) + '</span>' : "") + '</div>'; }
+  if (col === "note" && r && "grant_id" in r) { return '<div class="two"><b>' + (v ? esc(trunc(v, 70)) : '<span class="dimc">—</span>') + '</b>' + (r.grant_id ? '<span title="' + esc(r.grant_id) + '">🎫 ' + esc(shortId(r.grant_id)) + '</span>' : "") + '</div>'; }
   if (v === null || v === undefined || v === "") return '<span class="dimc">—</span>';
-  if (col === "tenant") return '<span class="wld" title="' + esc(v) + '">' + esc(tname(v)) + '</span>';
+  if (col === "tenant") return '<span class="wld" title="' + esc(v) + '">' + worldMark(v) + ' ' + esc(tname(v)) + '</span>';
+  if (col === "name" && r && "tier" in r) return '<span class="wld">' + worldMark(r.id) + ' <b>' + esc(v) + '</b></span>';
   if (col === "actor") { const [n, d] = who(v); return d ? '<div class="two"><b>' + esc(n) + '</b><span>' + esc(d) + '</span></div>' : esc(n); }
   if (["status", "kind", "tier", "handled", "done", "executed"].includes(col)) { const s = String(v); return '<span class="pill ' + tone(s) + '">' + esc(s) + '</span>'; }
-  if (col === "type") return '<span class="ev"><i style="background:' + evTone(v) + '"></i>' + esc(humanType(v)) + '</span>';
+  if (col === "type") return '<span class="ev">🧾<i style="background:' + evTone(v) + '"></i>' + esc(humanType(v)) + '</span>';
   if (["ts", "created_at", "received_at", "next_at", "exp"].includes(col)) return stamp(v);
   if (col === "caps" && Array.isArray(v)) { const sh = v.slice(0, 3).map((c) => '<span class="cp">' + esc(c) + '</span>').join(""); return '<span class="cps" title="' + esc(v.join(", ")) + '">' + sh + (v.length > 3 ? '<span class="cp more">+' + (v.length - 3) + '</span>' : "") + '</span>'; }
   if (col === "remaining" && typeof v === "object") {
     const u = used(r), pct = Math.round((1 - u) * 100), hasBudget = r.budget && ["usd_cents", "calls", "deploys"].some((k) => +r.budget[k] > 0);
     return '<div class="two"><b>' + money(v.usd_cents) + '</b><span>' + esc(v.calls) + ' calls · ' + esc(v.deploys) + ' deploys</span></div>' + (hasBudget ? '<div class="meter" title="' + pct + '% left"><i style="width:' + pct + '%"></i></div>' : "");
   }
+  if (col === "grant_id") return grantRef(v);
   if (col === "id" || col.endsWith("_id")) return '<span class="idc" title="' + esc(v) + '">' + esc(shortId(v)) + '</span>';
   if (col === "data" || col === "result" || typeof v === "object") return kvChips(v);
   if (col === "last_error") return '<span class="err" title="' + esc(v) + '">' + esc(trunc(v, 60)) + '</span>';
   return esc(v);
 }
+const SECCOL = { grants: "var(--gold)", worlds: "var(--blue)", receipts: "var(--accent)", ledger: "var(--gold)", workers: "var(--worker)", intake: "var(--fan)", outbox: "var(--dim)" };
+const LINEAGE = '<span>🏠 world</span><i>→</i><span>🎫 grant</span><i>→</i><span>🧾 receipt</span>';
 const NUMCOL = new Set(["usd_cents"]);
 const HEAD = { sub: "Holder", tenant: "World", caps: "May do", remaining: "Left", exp: "Expires", ts: "When", usd_cents: "Amount", calls: "Used", note: "Note", type: "What happened", actor: "By", data: "Detail", created_at: "Created", received_at: "Arrived", next_at: "Next try", last_error: "Last error", deploys_period: "Deploys" };
 async function table(k) {
@@ -540,8 +561,9 @@ async function table(k) {
   const shown = rows.filter((r) => (k === "worlds" ? !S.world || r.id === S.world : inWorld(r))).filter(findOk);
   const canPull = (r) => k === "grants" && r.status === "active" && +r.depth > 0;
   $("view").innerHTML = `<p class="note" style="margin:0">${esc(v.one)}</p>
+    <div class="tcard" style="--tc:${SECCOL[k] || "var(--accent)"}"><div class="thead"><span class="tico" aria-hidden="true">${v.ico || ""}</span><div class="tt"><b>${esc(v.title)}</b><span>${esc(v.lex || "")} · ${shown.length} shown</span></div><span class="tline" title="how the sections line up">${LINEAGE}</span></div><div class="guill"></div>
     <div class="tblwrap">${shown.length ? `<table class="t"><thead><tr>${v.cols.map((c) => `<th scope="col"${NUMCOL.has(c) ? ' class="r"' : ""}>${esc(HEAD[c] || c.replace(/_/g, " "))}</th>`).join("")}${k === "grants" ? '<th scope="col"><span class="sr">Action</span></th>' : ""}</tr></thead><tbody>${shown.map((r) => `<tr>${v.cols.map((c) => `<td${NUMCOL.has(c) ? ' class="r"' : ""}>${cell(c, r[c], r)}</td>`).join("")}${k === "grants" ? `<td>${canPull(r) ? `<button class="btn sm bad" type="button" data-rv="${esc(r.id)}">Pull</button>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table>` : '<div class="empty">Nothing here yet.</div>'}</div>
-    <div class="hood">${shown.length} of ${rows.length} rows · newest first${S.world ? " · world " + esc(tname(S.world)) : ""}${S.q ? " · find “" + esc(S.q) + "”" : ""} · source ${esc(v.api.split("?")[0])}</div><div class="msg" id="tMsg"></div>`;
+    <div class="hood tfoot">${shown.length} of ${rows.length} rows · newest first${S.world ? " · world " + esc(tname(S.world)) : ""}${S.q ? " · find “" + esc(S.q) + "”" : ""} · source ${esc(v.api.split("?")[0])}</div></div><div class="msg" id="tMsg"></div>`;
   document.querySelectorAll("[data-rv]").forEach((b) => (b.onclick = async () => {
     if (!confirm("Pull this warrant? The agent loses it right away, and so does everything it handed down.")) return;
     b.disabled = true;
@@ -716,7 +738,7 @@ function chrome() {
   else {
     const cnt = (id) => S.grants.filter(live).filter((g) => g.tenant === id).length;
     $("worlds").innerHTML = [`<button class="ws" type="button" data-w="" aria-pressed="${!S.world}"><span class="sw" style="background:var(--accent)"></span>All worlds<span class="n">${S.tenants.length}</span></button>`]
-      .concat(S.tenants.filter((t) => t.status === "active").slice(0, 8).map((t, i) => `<button class="ws" type="button" data-w="${esc(t.id)}" aria-pressed="${S.world === t.id}"><span class="sw" style="background:${SW[(i + 1) % SW.length]}"></span>${esc(t.name)}<span class="n">${cnt(t.id)}</span></button>`)).join("");
+      .concat(S.tenants.filter((t) => t.status === "active").slice(0, 8).map((t, i) => `<button class="ws" type="button" data-w="${esc(t.id)}" aria-pressed="${S.world === t.id}"><span class="sw wm">${worldMark(t.id)}</span>${esc(t.name)}<span class="n">${cnt(t.id)}</span></button>`)).join("");
     document.querySelectorAll("[data-w]").forEach((b) => (b.onclick = () => { S.world = b.dataset.w; chrome(); route(); }));
   }
   // estate tabs, with live probes from /status.json
