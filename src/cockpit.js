@@ -13,7 +13,7 @@ var RAILWAY_VARS_PATH = "Railway \u2192 creator-os-runtime \u2192 runtime \u2192
 var STATUS_CHECKS = [
   ["admin", "core", "Admin key (cockpit unlock + approvals)", "RUNTIME_ADMIN_KEY"],
   ["vault", "core", "Vault (encrypts stored secrets)", "VAULT_KEY (64 hex chars)"],
-  ["anthropic", "core", "COG brain (plans work)", "ANTHROPIC_API_KEY"],
+  ["ollama", "core", "COG brain (plans work)", "OLLAMA_URL"],
   ["railway", "core", "Deploys to Railway", "RAILWAY_API_TOKEN"],
   ["github", "hook", "GitHub webhook", "GITHUB_WEBHOOK_SECRET"],
   ["railwayWebhook", "hook", "Railway webhook", "RAILWAY_WEBHOOK_TOKEN"],
