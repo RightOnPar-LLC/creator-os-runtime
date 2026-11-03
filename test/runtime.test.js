@@ -2747,9 +2747,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
     expect(html.text).toContain("<h1>Hi</h1>");
     expect((await req("GET", "/docs/guide?raw")).text).toBe("# Hi\n\n`code`");
     await admin("PUT", "/api/admin/docs/_cockpit", { raw: "<p>cockpit</p>" });
-    const home = await req("GET", "/");
-    expect(home.text).not.toContain("<p>cockpit</p>");
-    expect(home.text).toContain("THE MESH BROWSER");
+    expect((await req("GET", "/")).text).toBe("<p>cockpit</p>");
     expect((await req("GET", "/docs/_cockpit")).status).toBe(404);
   });
 
