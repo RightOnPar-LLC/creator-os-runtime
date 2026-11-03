@@ -1,0 +1,25 @@
+{
+  "phase": 1,
+  "state": "local-tested-not-deployed",
+  "baseCommit": "77bd369",
+  "date": "2026-11-03",
+  "tests": [
+    {
+      "path": "test-staging-source-retry.log",
+      "sha256": "02b52fdd73610854788717d1d8476f0f5f0a188ec0eabbc2be05994f248540a7",
+      "passed": 350,
+      "failed": 0
+    },
+    {
+      "path": "test-staging-dist.log",
+      "sha256": "c433e971f83dc4e346fe9ab757b182873d3ba02e01245af5d82d37b02be2b72e",
+      "passed": 350,
+      "failed": 0
+    }
+  ],
+  "limitations": [
+    "Initial source and Market-only runs hit Postgres connection-closed/setup timeouts; passing source retry retained.",
+    "No live sandbox grant or receipt proof; targeted isolation check pending.",
+    "Phase 2 signed-bundle agent and phase 3 Workflow engine not implemented."
+  ]
+}
