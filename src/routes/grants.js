@@ -6,6 +6,7 @@ import { normalizeUsage, remainingBudget, TIERS } from "../policy.js";
 import { endedAbove, issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
 import { HOST_DEFAULT_BUDGET, HOST_DEFAULT_CAPS, HOST_DEFAULTS, HOST_TIERS, hostLimits, hostName } from "../hostpolicy.js";
 import { notATourReason } from "../tours.js";
+import { checkIdentity } from "../identity.js";
 import { AUTONOMY_LEVELS, autonomyOf } from "../autonomy.js";
 import { openEscrow, serializeEscrow } from "../escrow.js";
 import { deleteDeploy, deployWorker, refreshDeployStatus, restartDeploy, TEMPLATES } from "../railway.js";
@@ -254,6 +255,13 @@ app.post("/api/approvals/:id", requireGrant(null), async (e) => {
   };
   if (await isKillSwitchOn()) await fail("kill_switch_on");
   if (!g || g.status !== "active" || Number(g.exp) <= nowSec() || (await endedAbove(sql, g.id))) await fail("requesting_grant_not_active");
+  // A frozen or quarantined seat (or blueprint, anywhere above it) stops an already-approved action too (identity.js).
+  try {
+    await checkIdentity(g);
+  } catch (x) {
+    if (x instanceof HttpError) await fail(x.code);
+    throw x;
+  }
   let tenant = await getTenant(g.tenant),
     intent = parseJson(ap.intent),
     result;

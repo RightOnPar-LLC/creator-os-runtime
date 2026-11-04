@@ -26,6 +26,7 @@ import "./routes/oauth.js";
 import "./routes/sso.js";
 import "./routes/a2a.js";
 import "./routes/cockpit.js";
+import "./routes/identity.js";
 import "./routes/meta.js";
 
 try {

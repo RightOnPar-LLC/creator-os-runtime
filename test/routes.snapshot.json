@@ -1,5 +1,5 @@
 {
-  "count": 193,
+  "count": 207,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -192,6 +192,20 @@
     "GET /docs/:name",
     "PUT /api/admin/docs/:name",
     "PUT /api/admin/docs/:name",
+    "GET /api/admin/identity",
+    "GET /api/admin/identity",
+    "POST /api/admin/identity/mode",
+    "POST /api/admin/identity/mode",
+    "PUT /api/admin/identity/agents",
+    "PUT /api/admin/identity/agents",
+    "POST /api/admin/identity/attest",
+    "POST /api/admin/identity/attest",
+    "POST /api/admin/identity/freeze",
+    "POST /api/admin/identity/freeze",
+    "POST /api/admin/identity/unfreeze",
+    "POST /api/admin/identity/unfreeze",
+    "GET /api/identity/me",
+    "GET /api/identity/me",
     "GET /routes",
     "GET /selftest"
   ],
@@ -306,6 +320,13 @@
     "GET /docs :: public",
     "GET /docs/:name :: public",
     "PUT /api/admin/docs/:name :: admin",
+    "GET /api/admin/identity :: admin",
+    "POST /api/admin/identity/mode :: admin",
+    "PUT /api/admin/identity/agents :: admin",
+    "POST /api/admin/identity/attest :: admin",
+    "POST /api/admin/identity/freeze :: admin",
+    "POST /api/admin/identity/unfreeze :: admin",
+    "GET /api/identity/me :: grant",
     "GET /routes :: public",
     "GET /selftest :: public"
   ]
