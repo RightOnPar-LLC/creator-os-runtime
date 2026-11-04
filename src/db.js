@@ -110,6 +110,23 @@ CREATE INDEX IF NOT EXISTS tours_grant ON tours(grant_id);
 -- One tour per agent name per tenant while it is live. This index, not a look before the insert, is what keeps
 -- two opens at the same moment from both winning.
 CREATE UNIQUE INDEX IF NOT EXISTS tours_one_live_per_agent ON tours(tenant, agent) WHERE status IN ('active', 'frozen');
+-- Agent identity (identity.js). A blueprint is a family of agents. Freezing it stops every agent
+-- built from it, and everything those agents delegated to. An agent row is the SEAT behind a grant
+-- subject: who sponsors it (accountable for why it exists), who owns it (keeps it running), what
+-- it is for, and an attestation the sponsor must renew every attest_every_days or the seat lapses.
+CREATE TABLE IF NOT EXISTS blueprints (
+  tenant TEXT NOT NULL REFERENCES tenants(id), id TEXT NOT NULL, purpose TEXT, status TEXT NOT NULL DEFAULT 'active',
+  frozen_reason TEXT, frozen_by TEXT, frozen_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (tenant, id));
+CREATE TABLE IF NOT EXISTS agents (
+  tenant TEXT NOT NULL REFERENCES tenants(id), sub TEXT NOT NULL, blueprint TEXT, sponsor TEXT, owner TEXT, purpose TEXT,
+  status TEXT NOT NULL DEFAULT 'active', frozen_reason TEXT, frozen_by TEXT, frozen_at TIMESTAMPTZ,
+  attest_every_days INT NOT NULL DEFAULT 30, attested_at TIMESTAMPTZ, attested_by TEXT, expires_at TIMESTAMPTZ,
+  strikes INT NOT NULL DEFAULT 0, strikes_window_start BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (tenant, sub));
+CREATE INDEX IF NOT EXISTS agents_blueprint ON agents(tenant, blueprint);
+CREATE INDEX IF NOT EXISTS grants_tenant_sub ON grants(tenant, sub);
 `;
 export async function migrateSchema() {
   for (let e of SCHEMA_SQL.split(";")
