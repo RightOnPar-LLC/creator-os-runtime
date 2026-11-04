@@ -7,6 +7,7 @@ import { parseGrantToken, signGrantToken } from "./tokens.js";
 import { AUTONOMY_LEVELS, DEFAULT_AUTONOMY, autonomyOf, lowerCheck, parseAutonomy } from "./autonomy.js";
 import { hireSub, hireViolation } from "./hostpolicy.js";
 import { TOUR_RENEWED, tourKeyReused } from "./tours.js";
+import { checkIdentity, recordStrike } from "./identity.js";
 import {
   addUsage,
   AGENT_ISSUED_MAX_TTL_SEC,
@@ -696,6 +697,8 @@ async function checkRateLimit(e) {
   return checkNamedRateLimit(e, RATE_LIMIT_MAX_PER_MIN);
 }
 export async function verifyGrant(e, t, a, countRate = !0) {
+  // The grant row once known, so a denial for reaching past its power can count as a strike (identity.js).
+  let seen = null;
   try {
     if (!e) throw new HttpError(401, "missing_grant");
     let n = parseGrantToken(e);
@@ -725,6 +728,9 @@ export async function verifyGrant(e, t, a, countRate = !0) {
     let i = await getTenant(s.tenant);
     if (!i || i.status !== "active") throw new HttpError(403, "tenant_suspended");
     if (await isKillSwitchOn()) throw new HttpError(503, "runtime_paused");
+    // Who this agent is, and whether it (or anything above it) is frozen: identity.js. Root grants pass.
+    await checkIdentity(s);
+    seen = s;
     let o = parseJson(s.caps);
     if (t && !o.includes(t))
       throw new HttpError(403, "missing_cap", {
@@ -755,7 +761,13 @@ export async function verifyGrant(e, t, a, countRate = !0) {
       token: e,
     };
   } catch (n) {
-    if (n instanceof HttpError) throw n;
+    if (n instanceof HttpError) {
+      // Reaching past its power: a strike toward self-quarantine. A strike that fails to record never
+      // changes the answer the caller gets.
+      if (seen && (n.code === "missing_cap" || n.code === "out_of_scope"))
+        await recordStrike(seen, n.code).catch((x) => console.error("[identity] strike", x?.message || x));
+      throw n;
+    }
     throw new HttpError(403, "verification_error");
   }
 }
