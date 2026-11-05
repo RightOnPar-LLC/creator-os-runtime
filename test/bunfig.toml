@@ -1,7 +1,0 @@
-# Never auto-install packages at runtime: every import must come from the pinned
-# test/node_modules (linked to ../node_modules by run.mjs).
-[install]
-auto = "disable"
-
-# The per-test time limit is NOT set here: this bun ignores `timeout` under [test] and
-# applied its own 5 s for as long as the line stood here. run.mjs passes --timeout 30000.
