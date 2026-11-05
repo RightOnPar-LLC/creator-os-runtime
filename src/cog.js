@@ -127,7 +127,7 @@ function buildDeterministicPlan(
     planner: "deterministic",
   };
 }
-async function planWithLlm(e, t, a, n, r) {
+async function planWithOllama(e, t, a, n, r) {
   // Rewired off Anthropic onto the Z-13's own Ollama instance (work order 14:
   // "cog_plan and cog_execute need to hit Ollama, not the Anthropic API").
   // OLLAMA_URL is the Tailscale address of the Z-13's Ollama server (confirmed
@@ -188,12 +188,99 @@ Evidence (prior memory): ${JSON.stringify(r.evidence.map((l) => l.snippet))}`,
       },
       r,
     );
-    return ((o.planner = "llm+deterministic"), (o.rationale = `${i.why || ""} \u2014 ${o.rationale}`), o);
+    return ((o.planner = "llm+deterministic"), (o.llmProvider = "ollama"), (o.rationale = `${i.why || ""} \u2014 ${o.rationale}`), o);
   } catch (l) {
     // Say WHY the deterministic plan answered, so a slow or dead Ollama shows up in
     // the proposal instead of passing silently.
     return { fallback: l?.name === "TimeoutError" || l?.name === "AbortError" ? "timeout" : "error" };
   }
+}
+
+
+async function planWithAnthropic(e, t, a, n, r) {
+  // Hybrid fallback, second provider only: Ollama (own iron, free) is tried
+  // first by planWithLlm. Anthropic is used only when Ollama gives no plan.
+  // Shape mirrors the pre-rewire planner in index.ts: model
+  // claude-sonnet-4-5 unless COG_ANTHROPIC_MODEL is set, max_tokens 300,
+  // anthropic-version 2023-06-01. No key, no call. No secret value is logged.
+  if (!env.ANTHROPIC_API_KEY) return null;
+  try {
+    let res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      signal: AbortSignal.timeout(cogLlmTimeoutMs()),
+      body: JSON.stringify({
+        model: env.COG_ANTHROPIC_MODEL || "claude-sonnet-4-5",
+        max_tokens: 300,
+        system: `You are the COG planner. Choose exactly one template from: ${Object.keys(TEMPLATES).join(", ")}. Reply ONLY with JSON {"template": string, "env": object, "why": string}. Never invent secrets.`,
+        messages: [{ role: "user", content: `Creator intent: ${a}\nHints: ${JSON.stringify(n)}\nEvidence (prior memory): ${JSON.stringify(r.evidence.map((l) => l.snippet))}` }],
+      }),
+    });
+    let j = await res.json();
+    let text = j?.content?.[0]?.text || "";
+    let s = text.match(/\{[\s\S]*\}/);
+    if (!s) return null;
+    let i = JSON.parse(s[0]);
+    if (!TEMPLATES[i.template]) return null;
+    let o = buildDeterministicPlan(e, t, a, { ...n, template: i.template, env: { ...(n.env || {}), ...(i.env || {}) } }, r);
+    return ((o.planner = "llm+deterministic"), (o.llmProvider = "anthropic"), (o.rationale = `${i.why || ""} \u2014 ${o.rationale}`), o);
+  } catch {
+    return null;
+  }
+}
+
+async function planWithOpenAI(e, t, a, n, r) {
+  // Third provider, same fail-closed shape as Anthropic: only tried after
+  // Ollama and Anthropic give no plan. No OpenAI code existed in this repo
+  // before, so both key and model are env-gated — no key or no model means
+  // this provider is skipped, never a hardcoded model or key.
+  if (!env.OPENAI_API_KEY || !env.COG_OPENAI_MODEL) return null;
+  try {
+    let res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      },
+      signal: AbortSignal.timeout(cogLlmTimeoutMs()),
+      body: JSON.stringify({
+        model: env.COG_OPENAI_MODEL,
+        max_tokens: 300,
+        messages: [
+          { role: "system", content: `You are the COG planner. Choose exactly one template from: ${Object.keys(TEMPLATES).join(", ")}. Reply ONLY with JSON {"template": string, "env": object, "why": string}. Never invent secrets.` },
+          { role: "user", content: `Creator intent: ${a}\nHints: ${JSON.stringify(n)}\nEvidence (prior memory): ${JSON.stringify(r.evidence.map((l) => l.snippet))}` },
+        ],
+      }),
+    });
+    let j = await res.json();
+    let text = j?.choices?.[0]?.message?.content || "";
+    let s = text.match(/\{[\s\S]*\}/);
+    if (!s) return null;
+    let i = JSON.parse(s[0]);
+    if (!TEMPLATES[i.template]) return null;
+    let o = buildDeterministicPlan(e, t, a, { ...n, template: i.template, env: { ...(n.env || {}), ...(i.env || {}) } }, r);
+    return ((o.planner = "llm+deterministic"), (o.llmProvider = "openai"), (o.rationale = `${i.why || ""} \u2014 ${o.rationale}`), o);
+  } catch {
+    return null;
+  }
+}
+async function planWithLlm(e, t, a, n, r) {
+  // Hybrid: Ollama first, Anthropic second, OpenAI third, deterministic last (in cogPlan).
+  // A null or {fallback} from Ollama is not a final answer while Anthropic
+  // is configured — it is the trigger to try the second provider. Only if
+  // both give no plan does the Ollama fallback reason surface, so cogPlan
+  // can warn planner_fallback:timeout/error as before.
+  let o = await planWithOllama(e, t, a, n, r);
+  if (o && !o.fallback) return o;
+  let p = await planWithAnthropic(e, t, a, n, r);
+  if (p) return p;
+  let q = await planWithOpenAI(e, t, a, n, r);
+  if (q) return q;
+  return o || null;
 }
 // How long the planner waits for Ollama before falling back. A cold gpt-oss:120b
 // load measured ~2 minutes on the Z-13, so the default leaves room for a warm
