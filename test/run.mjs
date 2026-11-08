@@ -43,4 +43,5 @@ const main = run(["runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "
 // own bun process, after it, and the run fails if either failed.
 const market = run(["market.test.js"]);
 const identity = run(["identity.test.js"]);
-process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1));
+const access = run(["access-view.test.js"]);
+process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1));

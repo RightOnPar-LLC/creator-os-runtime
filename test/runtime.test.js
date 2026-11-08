@@ -5862,7 +5862,7 @@ describe("25. the admin's list of grants: filters and pages (GET /api/admin/gran
       const r = await list(q);
       expect(r.status).toBe(400);
       expect(r.json.error).toBe("query_unknown");
-      expect(r.json.detail.allowed).toEqual(["status", "tenant", "limit", "offset"]);
+      expect(r.json.detail.allowed).toEqual(["status", "tenant", "limit", "offset", "access", "search"]);
     }
     for (const q of [`?tenant=${t0.id}&tenant=t_someoneelse`, "?status=active&status=revoked", "?limit=1&limit=2", "?offset=0&offset=0"]) {
       const r = await list(q);
