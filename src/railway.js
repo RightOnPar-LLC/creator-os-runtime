@@ -6,6 +6,7 @@ import { vaultDecrypt, vaultKey } from "./tokens.js";
 import { remainingBudget, TIERS, usageWithin } from "./policy.js";
 import { recordAutonomyRow, settleGrantUsage, takeLiveAction } from "./grants.js";
 import { autonomyOf, decide } from "./autonomy.js";
+import { pushCheque } from "./notify.js";
 
 // Workers that run the creator-worker codebase are built by Railway straight from
 // the repo (Dockerfile at its root). No registry image, no pull credentials:
@@ -323,6 +324,11 @@ export async function deployWorker(e, t, a, n, opts = {}) {
       e.tenant.id,
       n,
     );
+    // To the owner's phone (notify.js). Fire and forget: a slow or failed push never holds the ask.
+    void pushCheque(
+      { approval: ap, name: c, estCents: r.estCents, link: chequeLink(ap), expiresInSec: CHEQUE_TTL_SEC, asker: e.row.sub },
+      e.tenant.id,
+    ).catch(() => {});
     return {
       id: ap,
       executed: !1,
