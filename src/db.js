@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS guest_fingerprints (
 ALTER TABLE ledger ADD COLUMN IF NOT EXISTS autonomy INT;
 ALTER TABLE ledger ADD COLUMN IF NOT EXISTS decision TEXT;
 ALTER TABLE ledger ADD COLUMN IF NOT EXISTS approver TEXT;
+-- Receipt-before-run (0.3.5). plan_hash binds a dry run to the exact plan a live deploy will run;
+-- plan_consumed_at spends that dry run once, so one sim buys at most one live action.
+-- live_actions counts live Railway mutations taken under a grant, against constraints.maxLiveActions
+-- (absent = unlimited, 1 = a one-use grant). Additive: older rows read as no hash or zero actions.
+ALTER TABLE deploys ADD COLUMN IF NOT EXISTS plan_hash TEXT;
+ALTER TABLE deploys ADD COLUMN IF NOT EXISTS plan_consumed_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS deploys_tenant_plan ON deploys(tenant, plan_hash);
+ALTER TABLE grants ADD COLUMN IF NOT EXISTS live_actions INT NOT NULL DEFAULT 0;
 -- A value action an agent at autonomy "ask" requested: it waits here until the
 -- tenant root grant (the owner credential) approves or denies it.
 CREATE TABLE IF NOT EXISTS approvals (

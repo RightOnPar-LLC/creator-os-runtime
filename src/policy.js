@@ -158,12 +158,25 @@ export function partitionCovers(prefix, candidate) {
   if (/[:/-]$/.test(prefix)) return !0;
   return /^[:/-]/.test(candidate.slice(prefix.length));
 }
+function clampLiveActions(asked, parent) {
+  let p = Number.isInteger(+parent) && +parent >= 1 ? +parent : void 0,
+    a = asked === void 0 || asked === null || asked === "" ? void 0 : Math.floor(+asked);
+  if (a !== void 0 && !(a >= 1)) a = 1;
+  if (p === void 0) return a;
+  return a === void 0 ? p : Math.min(a, p);
+}
 var numberOr = (e, t) => (e === void 0 || e === null || e === "" || Number.isNaN(+e) ? t : +e);
 export var clampConstraints = (e, t) => ({
   maxWorkers: Math.min(t.maxWorkers, Math.max(0, Math.floor(numberOr(e?.maxWorkers, t.maxWorkers)))),
   maxReplicas: Math.min(t.maxReplicas, Math.max(1, Math.floor(numberOr(e?.maxReplicas, t.maxReplicas)))),
   allowDelete: t.allowDelete && e?.allowDelete === !0,
   requireDryRun: e?.requireDryRun === !1 ? t.requireDryRun && !1 : !0,
+  // Receipt-before-run (0.3.5). Once a parent requires a plan receipt, every grant below it does;
+  // a child may turn it on, never off.
+  requirePlanReceipt: t.requirePlanReceipt === !0 || e?.requirePlanReceipt === !0,
+  // How many live actions (deploy, restart, delete) this grant may take; 1 = a one-use grant.
+  // Absent = unlimited. A child never gets more than its parent (counted up the chain, grants.js).
+  maxLiveActions: clampLiveActions(e?.maxLiveActions, t.maxLiveActions),
   // the autonomy dial (autonomy.js): omitted inherits the parent's level; an explicit
   // request is kept as asked so attenuationViolations can REFUSE a widening.
   autonomy: requestedAutonomy(e?.autonomy, t),

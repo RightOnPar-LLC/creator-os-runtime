@@ -58,3 +58,11 @@ Filed: draft PR https://github.com/RightOnPar-LLC/creator-os-runtime/pull/52; im
 - **Evidence:** Chromium desktop1360/phone390: no overflow or JS exceptions. Public health/routes/docs/status checked. Nine dashboard data endpoints correctly return401 while locked. Existing /routes advertises their actual auth. No Pause, Resume, Drain, money or grant action taken.
 - **Approval:** DW explicitly approved live facelift including runtime.meshtool.ai in the owning chat on2026-10-30.
 - **Next step:** restore existing authorized Runtime admin access through its established secure flow; review/merge this static document, then PUT its exact bytes to /api/admin/docs/_cockpit. Verify root hash and /health source unchanged. Rollback is the prior cockpit document, not a backend redeploy.
+
+## 2026-11-10 Receipt-before-run (DevDesk #112)
+
+- **State:** built and tested (347/0 + negative controls). Opt-in grant constraints `requirePlanReceipt` and `maxLiveActions`.
+- **Destination:** runtime.meshtool.ai at 0.3.5. Touches grant rules, so the PR is `needs-human`: DW merges.
+- **Round two:** plan receipts for restart/delete, `planHash` in COG proposals, a one-use child grant button in the cockpit.
+  Spec: [docs/specs/receipt-before-run.md](docs/specs/receipt-before-run.md).
+
