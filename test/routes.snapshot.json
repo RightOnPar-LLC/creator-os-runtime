@@ -1,5 +1,5 @@
 {
-  "count": 207,
+  "count": 209,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -53,6 +53,8 @@
     "GET /api/admin/grants",
     "GET /api/admin/deploys",
     "GET /api/admin/deploys",
+    "GET /api/admin/approvals",
+    "GET /api/admin/approvals",
     "GET /api/admin/ledger",
     "GET /api/admin/ledger",
     "GET /api/admin/webhooks",
@@ -236,6 +238,7 @@
     "GET /api/admin/overview :: admin",
     "GET /api/admin/grants :: admin",
     "GET /api/admin/deploys :: admin",
+    "GET /api/admin/approvals :: admin",
     "GET /api/admin/ledger :: admin",
     "GET /api/admin/webhooks :: admin",
     "GET /api/admin/events :: admin",

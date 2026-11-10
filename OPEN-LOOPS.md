@@ -66,3 +66,9 @@ Filed: draft PR https://github.com/RightOnPar-LLC/creator-os-runtime/pull/52; im
 - **Round two:** plan receipts for restart/delete, `planHash` in COG proposals, a one-use child grant button in the cockpit.
   Spec: [docs/specs/receipt-before-run.md](docs/specs/receipt-before-run.md).
 
+## 2026-11-10 Plan cheques (DevDesk #113)
+
+- **State:** built and tested (352/0 + negative controls). An "ask" deploy now writes a plan cheque the owner signs from a link.
+- **Found and fixed:** the cockpit's approvals list called `GET /api/admin/approvals`, which did not exist (404 live), so pending approvals never showed.
+- **Next step (not built):** push `cheque.issued` to DW's phone. Needs a push channel the runtime can reach (no push integration exists in the runtime today).
+

@@ -99,6 +99,11 @@ CREATE TABLE IF NOT EXISTS approvals (
   autonomy INT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', requested_by TEXT, approver TEXT,
   created_at TIMESTAMPTZ DEFAULT now(), decided_at TIMESTAMPTZ, result JSONB);
 CREATE INDEX IF NOT EXISTS approvals_tenant_status ON approvals(tenant, status);
+-- Plan cheques (0.3.6). A deploy that stops at "ask" now carries the exact plan it would run and that
+-- plan's hash. Signing runs that plan once, and only if it still hashes the same. A cheque expires.
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS plan JSONB;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS plan_hash TEXT;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 -- Tours (tours.js): the record that lets one named agent keep renewing a 24-hour key until its end date.
 -- grant_id is the holding grant (never a credential). current_key is a NOTE of the key the tour handed out
 -- last. The keys themselves are found by parent (every active grant under the holding grant), never by this note.

@@ -21,7 +21,7 @@ describe("1. /health", () => {
     const h = r.json;
     expect(h.ok).toBe(true);
     expect(h.service).toBe("creator-os-runtime");
-    expect(h.version).toBe("0.3.5");
+    expect(h.version).toBe("0.3.6");
     expect(h.policy).toBe("p1");
     expect(h.db).toBe(true);
     expect(h.killSwitch).toBe(false);
@@ -55,7 +55,7 @@ describe("1. /health", () => {
   });
 
   test("exports", () => {
-    expect(mod.VERSION).toBe("0.3.5");
+    expect(mod.VERSION).toBe("0.3.6");
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
@@ -96,7 +96,7 @@ describe("2. route table", () => {
   test("/.well-known/creator-os.json", async () => {
     const r = await req("GET", "/.well-known/creator-os.json");
     expect(r.status).toBe(200);
-    expect(r.json.version).toBe("0.3.5");
+    expect(r.json.version).toBe("0.3.6");
     expect(r.json.caps).toEqual(mod.CAPS);
     expect(r.json.templates.probe).toEqual({ desc: "Tiny HTTP responder that proves the deploy path", needs: [], estCents: 25 });
   });
@@ -305,7 +305,7 @@ describe("4. MCP", () => {
 
   test("initialize + tools/list + ping + unknown method", async () => {
     const i = await mcp(t.token, "initialize", { protocolVersion: "2025-06-18" });
-    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.5" });
+    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.6" });
     expect(i.json.result.protocolVersion).toBe("2025-06-18");
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
@@ -373,7 +373,7 @@ describe("4. MCP", () => {
 
   test("runtime_health + grant_verify tools", async () => {
     const h = await mcp(t.token, "tools/call", { name: "runtime_health" });
-    expect(h.json.result.structuredContent.version).toBe("0.3.5");
+    expect(h.json.result.structuredContent.version).toBe("0.3.6");
     const v = await mcp(t.token, "tools/call", { name: "grant_verify" });
     expect(v.json.result.structuredContent.sub).toBe("tenant:root");
   });
@@ -2787,7 +2787,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("status report runs; every outbound call was blocked and is a known probe", async () => {
     const s = await req("GET", "/status.json");
     expect(s.status).toBe(200);
-    expect(s.json.version).toBe("0.3.5");
+    expect(s.json.version).toBe("0.3.6");
     expect(s.json.bodies.map((b) => b.up)).toEqual([false, false, false]);
     const allowed = new Set([
       "https://devdesk.meshtool.ai/health", "https://market.meshtool.ai/api/health",
@@ -6402,5 +6402,94 @@ describe("27. receipt-before-run (0.3.5): plan receipts and one-use grants", () 
     const l = await mcp(t.token, "tools/list", {});
     const tool = l.json.result.tools.find((x) => x.name === "deploy_worker");
     expect(tool.inputSchema.properties.planHash.type).toBe("string");
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("28. plan cheques (0.3.6): the owner signs the exact plan", () => {
+  const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
+  async function askingAgent(name) {
+    const root = await newTenant(name, "pro");
+    await dbQuery(
+      `UPDATE grants SET scope = jsonb_set(scope, '{railway}', '{"projects":["proj-chq"],"environments":["production"]}'::jsonb) WHERE id = $1`,
+      [root.grantId],
+    );
+    const c = await req("POST", "/api/grants", {
+      token: root.token,
+      body: { sub: "agent:cheque", caps: ["deploy.worker", "grant.read"], ttlSec: 3600, budget: { usd_cents: 2000, calls: 10, deploys: 2 }, constraints: { autonomy: "ask" } },
+    });
+    expect(c.status).toBe(201);
+    return { root, agent: c.json, prefix: (await verify(c.json.token)).scope.workers.namePrefix };
+  }
+  async function withRailway(fn) {
+    const saved = process.env.RAILWAY_API_TOKEN;
+    process.env.RAILWAY_API_TOKEN = "test-house-railway-token";
+    try { return await fn(); } finally { if (saved === undefined) delete process.env.RAILWAY_API_TOKEN; else process.env.RAILWAY_API_TOKEN = saved; }
+  }
+  const railwayCalls = () => blockedFetches.filter((u) => u.includes("railway")).length;
+
+  test("an ask writes a cheque: plan, fingerprint, expiry and a link", async () => {
+    const { agent, prefix } = await askingAgent("chq-write");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "w1", template: "probe" } });
+    expect(d.json.status).toBe("awaiting_approval");
+    expect(d.json.planHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(d.json.plan.name).toBe(prefix + "w1");
+    expect(d.json.approval.link).toContain("#/?cheque=" + d.json.id);
+    const row = (await dbQuery("SELECT * FROM approvals WHERE id = $1", [d.json.id])).rows[0];
+    expect(row.plan_hash).toBe(d.json.planHash);
+    expect(row.intent.planHash).toBe(d.json.planHash);
+    expect(new Date(row.expires_at).getTime()).toBeGreaterThan(Date.now() + 3600e3);
+    const ev = (await dbQuery("SELECT data FROM events WHERE type = 'cheque.issued' AND data->>'approval' = $1", [d.json.id])).rows[0];
+    expect(ev.data.link).toBe(d.json.approval.link);
+  });
+
+  test("the cockpit can list approvals: GET /api/admin/approvals answers, pending first, with the cheque", async () => {
+    const { agent, prefix } = await askingAgent("chq-list");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "l1", template: "probe" } });
+    const r = await admin("GET", "/api/admin/approvals");
+    expect(r.status).toBe(200);
+    const mine = r.json.approvals.find((a) => a.id === d.json.id);
+    expect(mine.status).toBe("pending");
+    expect(mine.plan_hash).toBe(d.json.planHash);
+    expect(r.json.approvals[0].status).toBe("pending");
+    expect((await req("GET", "/api/admin/approvals")).status).toBe(401);
+  });
+
+  test("signing runs the exact plan once, using the cheque as its receipt", async () => {
+    const { root, agent, prefix } = await askingAgent("chq-sign");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "s1", template: "probe" } });
+    const before = railwayCalls();
+    const ok = await withRailway(() => req("POST", `/api/approvals/${d.json.id}`, { token: root.token, body: { decision: "approve" } }));
+    // Railway itself is blocked under test, so it fails after the cheque let it through.
+    expect(railwayCalls()).toBe(before + 1);
+    expect(ok.status).not.toBe(200);
+    expect((await dbQuery("SELECT live_actions FROM grants WHERE id = $1", [agent.id])).rows[0].live_actions).toBe(1);
+    const again = await req("POST", `/api/approvals/${d.json.id}`, { token: root.token, body: { decision: "approve" } });
+    expect(again.status).toBe(404);
+  });
+
+  test("CONTROL: a plan that changed after the cheque was written bounces, nothing runs", async () => {
+    const { root, agent, prefix } = await askingAgent("chq-bounce");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "b1", template: "probe" } });
+    await dbQuery(`UPDATE approvals SET intent = jsonb_set(intent, '{replicas}', '2'::jsonb) WHERE id = $1`, [d.json.id]);
+    await dbQuery(`UPDATE tenants SET tier = 'studio' WHERE id = $1`, [root.id]);
+    await dbQuery(`UPDATE grants SET constraints = jsonb_set(constraints, '{maxReplicas}', '4'::jsonb) WHERE id = $1 OR id = $2`, [root.grantId, agent.id]);
+    const before = railwayCalls();
+    const ok = await withRailway(() => req("POST", `/api/approvals/${d.json.id}`, { token: root.token, body: { decision: "approve" } }));
+    expect(ok.status).toBe(200);
+    expect(ok.json.status).toBe("approved_not_run");
+    expect(ok.json.result.reason).toBe("plan_receipt_mismatch");
+    expect(railwayCalls()).toBe(before);
+  });
+
+  test("CONTROL: an expired cheque cannot be signed", async () => {
+    const { root, agent, prefix } = await askingAgent("chq-expired");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "e1", template: "probe" } });
+    await dbQuery("UPDATE approvals SET expires_at = now() - interval '1 minute' WHERE id = $1", [d.json.id]);
+    const before = railwayCalls();
+    const ok = await withRailway(() => req("POST", `/api/approvals/${d.json.id}`, { token: root.token, body: { decision: "approve" } }));
+    expect(ok.status).toBe(409);
+    expect(ok.json.error).toBe("cheque_expired");
+    expect(railwayCalls()).toBe(before);
   });
 });
