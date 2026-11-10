@@ -1,10 +1,10 @@
 // Worker templates and Railway deploy/status/restart/delete via GraphQL.
 import { env, POLICY_VERSION } from "./config.js";
-import { HttpError, newId, parseJson } from "./util.js";
+import { HttpError, newId, parseJson, sha256Hex } from "./util.js";
 import { recordEvent, sql } from "./db.js";
 import { vaultDecrypt, vaultKey } from "./tokens.js";
 import { remainingBudget, TIERS, usageWithin } from "./policy.js";
-import { recordAutonomyRow, settleGrantUsage } from "./grants.js";
+import { recordAutonomyRow, settleGrantUsage, takeLiveAction } from "./grants.js";
 import { autonomyOf, decide } from "./autonomy.js";
 
 // Workers that run the creator-worker codebase are built by Railway straight from
@@ -23,6 +23,42 @@ var REPO_OWNERS = String(env.DEPLOY_REPO_OWNERS || "RightOnPar-LLC,think-zone")
 // Unset it to put the dry-run gate back without a code change.
 export var autonomousDeploys = () => env.AUTONOMOUS_DEPLOYS === "1";
 
+// Receipt-before-run (0.3.5). A dry run returns planHash: the sha256 of the exact plan a live deploy
+// would run (target, name, source, replicas, every env value, price, policy). A live deploy that
+// carries planHash — or any deploy under a grant with constraints.requirePlanReceipt — runs only if
+// the plan it would run hashes the same AND an unspent dry run of that plan exists in the tenant,
+// made in the last PLAN_RECEIPT_TTL_SEC. Running spends that dry run. confirm:true and
+// AUTONOMOUS_DEPLOYS do not skip this. COS_GRANT is left out of the hash so a parent can sim and
+// a one-use child (constraints.maxLiveActions: 1) can run the same plan.
+export var PLAN_RECEIPT_TTL_SEC = Math.max(60, Math.floor(+env.PLAN_RECEIPT_TTL_SEC || 900));
+export function planHashOf(tenantId, plan, envVars) {
+  let vars = Object.keys(envVars)
+    .filter((k) => k !== "COS_GRANT")
+    .sort()
+    .map((k) => [k, String(envVars[k])]);
+  return sha256Hex(
+    JSON.stringify({
+      v: 1,
+      tenant: tenantId,
+      action: plan.action,
+      project: plan.project,
+      environment: plan.environment,
+      name: plan.name,
+      template: plan.template,
+      source: plan.source,
+      replicas: plan.replicas,
+      env: vars,
+      estCents: plan.estCents,
+      policy: plan.policy,
+    }),
+  );
+}
+class PlanRefused extends Error {
+  constructor(reason) {
+    super(reason);
+    this.reason = reason;
+  }
+}
 export var TEMPLATES = {
   probe: {
     image: "traefik/whoami:latest",
@@ -270,6 +306,7 @@ export async function deployWorker(e, t, a, n, opts = {}) {
     B = r.needs.filter((ft) => !(ft in S)),
     $ = {
       action: "railway.serviceCreate",
+      template: t.template,
       project: o,
       environment: l,
       name: c,
@@ -281,6 +318,8 @@ export async function deployWorker(e, t, a, n, opts = {}) {
       autonomous: autonomousDeploys(),
       policy: POLICY_VERSION,
     },
+    planHash = planHashOf(e.tenant.id, $, S),
+    needPlan = s.requirePlanReceipt === !0 || (t.planHash !== void 0 && t.planHash !== null),
     C = newId("dp"),
     pe =
       await sql`SELECT 1 FROM deploys WHERE tenant = ${e.tenant.id} AND name = ${c} AND executed = true LIMIT 1`,
@@ -292,10 +331,33 @@ export async function deployWorker(e, t, a, n, opts = {}) {
     J = null,
     Le = null;
   if (H) J = "dry_run";
+  else if (needPlan && !t.planHash) J = "plan_receipt_required";
+  else if (needPlan && String(t.planHash) !== planHash) J = "plan_receipt_mismatch";
   else if (!P) J = "unarmed:RAILWAY_API_TOKEN";
   else if (!o) J = "no_target_project";
   else if (B.length) J = "missing_env:" + B.join(",");
   else {
+    // Spend the receipt and the live action together, or neither (0.3.5).
+    try {
+      await sql.begin(async (tx) => {
+        await takeLiveAction(tx, e.row.id);
+        if (needPlan) {
+          let spent = await tx`UPDATE deploys SET plan_consumed_at = now()
+            WHERE id = (SELECT id FROM deploys WHERE tenant = ${e.tenant.id} AND plan_hash = ${planHash}
+                          AND executed = false AND plan_consumed_at IS NULL
+                          AND created_at > now() - make_interval(secs => ${PLAN_RECEIPT_TTL_SEC})
+                        ORDER BY created_at DESC LIMIT 1)
+              AND plan_consumed_at IS NULL RETURNING id`;
+          if (spent.length !== 1) throw new PlanRefused("plan_receipt_missing");
+        }
+      });
+    } catch (x) {
+      if (x instanceof PlanRefused) J = x.reason;
+      else if (x instanceof HttpError && x.code === "live_actions_used_up") J = "live_actions_used_up";
+      else throw x;
+    }
+  }
+  if (!J && !H) {
     let input = {
       projectId: o,
       name: c,
@@ -329,12 +391,12 @@ export async function deployWorker(e, t, a, n, opts = {}) {
     await sql`UPDATE tenants SET deploys_period = deploys_period + 1, updated_at = now() WHERE id = ${e.tenant.id}`;
   }
   return (
-    await sql`INSERT INTO deploys (id, tenant, grant_id, name, template, intent, plan, status, executed, railway_service_id, target, result)
+    await sql`INSERT INTO deploys (id, tenant, grant_id, name, template, intent, plan, status, executed, railway_service_id, target, result, plan_hash)
     VALUES (${C}, ${e.tenant.id}, ${e.row.id}, ${c}, ${t.template}, ${t}::jsonb, ${$}::jsonb, ${ee}, ${te}, ${Le},
             ${{
               project: o,
               environment: l,
-            }}::jsonb, ${ke}::jsonb)`,
+            }}::jsonb, ${ke}::jsonb, ${planHash})`,
     await recordEvent(
       te ? "deploy.requested" : "deploy.planned",
       {
@@ -353,6 +415,7 @@ export async function deployWorker(e, t, a, n, opts = {}) {
       status: ee,
       reason: J,
       plan: $,
+      planHash,
       result: ke,
     }
   );
@@ -410,6 +473,7 @@ export async function deleteDeploy(e, t, a) {
       throw new HttpError(503, "unarmed", {
         needs: "RAILWAY_API_TOKEN",
       });
+    await takeLiveAction(sql, e.row.id);
     (await railwayGraphql(r.token, "mutation($id: String!) { serviceDelete(id: $id) }", {
       id: n.railway_service_id,
     }),
@@ -450,6 +514,7 @@ export async function restartDeploy(e, t, a) {
     throw new HttpError(503, "unarmed", {
       needs: "RAILWAY_API_TOKEN",
     });
+  await takeLiveAction(sql, e.row.id);
   return (
     await railwayGraphql(r.token, "mutation($id: String!) { deploymentRestart(id: $id) }", {
       id: n.railway_deployment_id,

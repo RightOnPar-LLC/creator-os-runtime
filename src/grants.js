@@ -529,6 +529,22 @@ export async function settleGrantUsage(e, t, a, n, k = "settle", m = {}) {
 }
 // The nearest agent-host at or above a grant (the grant whose constraints carry
 // `host`), or null. Walks up the parent chain.
+// Receipt-before-run (0.3.5): take one live action under a grant. Counts on the grant AND every grant
+// above it, so a parent with maxLiveActions cannot be multiplied by minting many children. One UPDATE,
+// so the rows stay locked until the caller's transaction ends; any grant in the chain over its limit
+// refuses the whole action (the caller rolls back, nothing is counted).
+export async function takeLiveAction(q, grantId) {
+  let rows = await q`
+    WITH RECURSIVE chain AS (
+      SELECT id, parent FROM grants WHERE id = ${grantId}
+      UNION ALL SELECT g.id, g.parent FROM grants g JOIN chain c ON g.id = c.parent)
+    UPDATE grants SET live_actions = live_actions + 1 WHERE id IN (SELECT id FROM chain)
+    RETURNING id, live_actions, constraints->>'maxLiveActions' AS max_live`;
+  if (rows.length === 0) throw new HttpError(401, "grant_revoked");
+  let over = rows.find((r) => r.max_live !== null && r.max_live !== void 0 && Number(r.live_actions) > Number(r.max_live));
+  if (over) throw new HttpError(403, "live_actions_used_up", { grant: over.id, max: Number(over.max_live) });
+  return rows.find((r) => r.id === grantId)?.live_actions ?? null;
+}
 export async function hostAbove(grantId) {
   return (
     await sql`WITH RECURSIVE up AS (SELECT * FROM grants WHERE id = ${grantId}
