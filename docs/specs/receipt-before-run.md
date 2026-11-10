@@ -43,3 +43,18 @@ If Railway then fails, both stay spent. Nothing is retried on a spent receipt. S
 - `cog_execute` deploys go through the same `deployWorker`, but the COG proposal format does not carry a `planHash` yet.
 - Cloudflare and other platforms: the runtime does not execute on them, so there is nothing to gate here.
   GitHub changes already have their receipt: PR + CI.
+
+## Plan cheques (0.3.6)
+
+When an agent at autonomy `ask` wants to deploy, the approval it waits on is now a **plan cheque**:
+
+- It stores the exact plan, the plan's hash (`plan_hash`) and an expiry (`expires_at`, default 24 h, `CHEQUE_TTL_SEC`).
+  The intent it will run is pinned to that hash.
+- The answer to the agent and a `cheque.issued` event both carry a link: `https://runtime.meshtool.ai/#/?cheque=<id>`.
+  The link opens the cockpit on that cheque: what will happen in plain words, the fingerprint, the time left, Sign or Decline.
+- Signing runs that plan once. The signed approval is its own receipt (it is claimed atomically), and it counts as a live action.
+- If anything in the plan changed between asking and signing, it bounces: `approved_not_run` with `plan_receipt_mismatch`, nothing runs.
+- An expired cheque cannot be signed: `409 cheque_expired`.
+- `GET /api/admin/approvals` now exists. The cockpit asked for it before 0.3.6 and got a 404, so pending approvals never showed there.
+
+Next: deliver `cheque.issued` to the owner's phone (push), and score each agent's sims against what actually ran.

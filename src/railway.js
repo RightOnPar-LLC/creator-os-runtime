@@ -53,6 +53,9 @@ export function planHashOf(tenantId, plan, envVars) {
     }),
   );
 }
+// A plan cheque stays signable this long (default 24 h), then it is void and the agent asks again.
+export var CHEQUE_TTL_SEC = Math.max(60, Math.floor(+env.CHEQUE_TTL_SEC || 86400));
+export var chequeLink = (id) => `${String(env.PUBLIC_URL || "https://runtime.meshtool.ai").replace(/\/+$/, "")}/#/?cheque=${encodeURIComponent(id)}`;
 class PlanRefused extends Error {
   constructor(reason) {
     super(reason);
@@ -268,34 +271,6 @@ export async function deployWorker(e, t, a, n, opts = {}) {
       need: R,
       remaining: remainingBudget(e.row),
     });
-  // The autonomy dial (autonomy.js), checked only after scope + budget pass so a
-  // human is never asked to approve a deploy that could not run anyway.
-  let dial = decide(autonomyOf(s), "deploy", { approvedBy: opts.approvedBy || null });
-  if (dial.decision === "refuse") {
-    await recordAutonomyRow(e.row, "autonomy-refused", c, `deploy ${c} refused at autonomy ${dial.levelName}`, {
-      autonomy: dial.level,
-      decision: "refuse",
-    });
-    await recordEvent("autonomy.refused", { action: "deploy", name: c, level: dial.levelName }, e.tenant.id, n);
-    throw new HttpError(403, dial.reason, { autonomy: dial.levelName });
-  }
-  if (dial.decision === "ask") {
-    let ap = newId("ap");
-    await sql`INSERT INTO approvals (id, tenant, grant_id, action, intent, autonomy, requested_by)
-      VALUES (${ap}, ${e.tenant.id}, ${e.row.id}, 'deploy', ${t}::jsonb, ${dial.level}, ${n})`;
-    await recordAutonomyRow(e.row, "autonomy-ask", ap, `deploy ${c} awaits the owner's approval`, {
-      autonomy: dial.level,
-      decision: "ask",
-    });
-    await recordEvent("autonomy.ask", { action: "deploy", name: c, approval: ap, level: dial.levelName }, e.tenant.id, n);
-    return {
-      id: ap,
-      executed: !1,
-      status: "awaiting_approval",
-      reason: dial.reason,
-      approval: { id: ap, action: "deploy", name: c, approve: `POST /api/approvals/${ap}` },
-    };
-  }
   let S = {
       ...r.env,
       ...(t.env || {}),
@@ -318,8 +293,47 @@ export async function deployWorker(e, t, a, n, opts = {}) {
       autonomous: autonomousDeploys(),
       policy: POLICY_VERSION,
     },
-    planHash = planHashOf(e.tenant.id, $, S),
-    needPlan = s.requirePlanReceipt === !0 || (t.planHash !== void 0 && t.planHash !== null),
+    planHash = planHashOf(e.tenant.id, $, S);
+  // The autonomy dial (autonomy.js), checked only after scope + budget pass so a
+  // human is never asked to approve a deploy that could not run anyway.
+  let dial = decide(autonomyOf(s), "deploy", { approvedBy: opts.approvedBy || null });
+  if (dial.decision === "refuse") {
+    await recordAutonomyRow(e.row, "autonomy-refused", c, `deploy ${c} refused at autonomy ${dial.levelName}`, {
+      autonomy: dial.level,
+      decision: "refuse",
+    });
+    await recordEvent("autonomy.refused", { action: "deploy", name: c, level: dial.levelName }, e.tenant.id, n);
+    throw new HttpError(403, dial.reason, { autonomy: dial.levelName });
+  }
+  if (dial.decision === "ask") {
+    let ap = newId("ap");
+    // A plan cheque (0.3.6): the approval carries the exact plan and its hash, and the intent it will
+    // run is pinned to that hash, so signing runs this plan or nothing.
+    await sql`INSERT INTO approvals (id, tenant, grant_id, action, intent, autonomy, requested_by, plan, plan_hash, expires_at)
+      VALUES (${ap}, ${e.tenant.id}, ${e.row.id}, 'deploy', ${{ ...t, planHash }}::jsonb, ${dial.level}, ${n},
+              ${$}::jsonb, ${planHash}, now() + make_interval(secs => ${CHEQUE_TTL_SEC}))`;
+    await recordAutonomyRow(e.row, "autonomy-ask", ap, `deploy ${c} awaits the owner's approval`, {
+      autonomy: dial.level,
+      decision: "ask",
+    });
+    await recordEvent("autonomy.ask", { action: "deploy", name: c, approval: ap, level: dial.levelName }, e.tenant.id, n);
+    await recordEvent(
+      "cheque.issued",
+      { approval: ap, name: c, planHash, estCents: r.estCents, link: chequeLink(ap), expiresInSec: CHEQUE_TTL_SEC },
+      e.tenant.id,
+      n,
+    );
+    return {
+      id: ap,
+      executed: !1,
+      status: "awaiting_approval",
+      reason: dial.reason,
+      planHash,
+      plan: $,
+      approval: { id: ap, action: "deploy", name: c, approve: `POST /api/approvals/${ap}`, link: chequeLink(ap) },
+    };
+  }
+  let needPlan = s.requirePlanReceipt === !0 || (t.planHash !== void 0 && t.planHash !== null),
     C = newId("dp"),
     pe =
       await sql`SELECT 1 FROM deploys WHERE tenant = ${e.tenant.id} AND name = ${c} AND executed = true LIMIT 1`,
@@ -341,7 +355,8 @@ export async function deployWorker(e, t, a, n, opts = {}) {
     try {
       await sql.begin(async (tx) => {
         await takeLiveAction(tx, e.row.id);
-        if (needPlan) {
+        // A signed cheque is its own receipt: the approval was claimed once, atomically, when it was signed.
+        if (needPlan && !opts.cheque) {
           let spent = await tx`UPDATE deploys SET plan_consumed_at = now()
             WHERE id = (SELECT id FROM deploys WHERE tenant = ${e.tenant.id} AND plan_hash = ${planHash}
                           AND executed = false AND plan_consumed_at IS NULL
