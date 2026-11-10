@@ -25,6 +25,11 @@ describe("pages: the repo's pages, not the database's", () => {
     expect((await req("GET", "/loop")).text).toContain("function readMesh"); // kit.js was inlined
   });
 
+  test("/ says in plain words what the runtime is and who it is for", async () => {
+    const home = (await req("GET", "/")).text;
+    expect(home).toContain("control room for Dw's Mesh");
+  });
+
   test("a _cockpit doc in the database no longer takes over /", async () => {
     await admin("PUT", "/api/admin/docs/_cockpit", { raw: "<p>old cockpit</p>" });
     const home = await req("GET", "/");
