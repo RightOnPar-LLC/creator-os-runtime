@@ -57,4 +57,17 @@ When an agent at autonomy `ask` wants to deploy, the approval it waits on is now
 - An expired cheque cannot be signed: `409 cheque_expired`.
 - `GET /api/admin/approvals` now exists. The cockpit asked for it before 0.3.6 and got a 404, so pending approvals never showed there.
 
-Next: deliver `cheque.issued` to the owner's phone (push), and score each agent's sims against what actually ran.
+Next: score each agent's sims against what actually ran.
+
+## Cheque push (0.3.7)
+
+Every new plan cheque is pushed to the owner's phone through ntfy (`src/notify.js`), with a button that opens
+that cheque in the cockpit.
+
+- `NTFY_URL`: the full topic URL, `https://<ntfy host>/<topic>`. It must be https, and the topic must be 8 to 64
+  letters, digits, `-` or `_`, or the push stays off. Use an unguessable topic: anyone who knows it can read the summaries.
+- `NTFY_TOKEN` (optional): a bearer token for a reserved or protected topic.
+- The push holds a summary and a link, never a secret. Signing still needs the owner signed in.
+- It never blocks the ask. A failed push is recorded as a `cheque.push_failed` event and the cheque stands.
+  `/health` shows `armed.ntfy`.
+

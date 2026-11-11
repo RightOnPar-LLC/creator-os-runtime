@@ -21,14 +21,14 @@ describe("1. /health", () => {
     const h = r.json;
     expect(h.ok).toBe(true);
     expect(h.service).toBe("creator-os-runtime");
-    expect(h.version).toBe("0.3.6");
+    expect(h.version).toBe("0.3.7");
     expect(h.policy).toBe("p1");
     expect(h.db).toBe(true);
     expect(h.killSwitch).toBe(false);
     expect(h.armed).toEqual({
       admin: true, vault: true, railway: false, railwayOAuth: false, stripe: false,
       railwayWebhook: true, github: true, brain: true, mesh: true, ollama: false,
-      brainOut: false, cognitiveBridge: false, sync: false, lspMcp: true,
+      brainOut: false, cognitiveBridge: false, sync: false, lspMcp: true, ntfy: false,
     });
     // 2026-09-25: fingerprints are no longer public.
     expect(h.fingerprints).toBeUndefined();
@@ -55,7 +55,7 @@ describe("1. /health", () => {
   });
 
   test("exports", () => {
-    expect(mod.VERSION).toBe("0.3.6");
+    expect(mod.VERSION).toBe("0.3.7");
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
@@ -96,7 +96,7 @@ describe("2. route table", () => {
   test("/.well-known/creator-os.json", async () => {
     const r = await req("GET", "/.well-known/creator-os.json");
     expect(r.status).toBe(200);
-    expect(r.json.version).toBe("0.3.6");
+    expect(r.json.version).toBe("0.3.7");
     expect(r.json.caps).toEqual(mod.CAPS);
     expect(r.json.templates.probe).toEqual({ desc: "Tiny HTTP responder that proves the deploy path", needs: [], estCents: 25 });
   });
@@ -305,7 +305,7 @@ describe("4. MCP", () => {
 
   test("initialize + tools/list + ping + unknown method", async () => {
     const i = await mcp(t.token, "initialize", { protocolVersion: "2025-06-18" });
-    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.6" });
+    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.7" });
     expect(i.json.result.protocolVersion).toBe("2025-06-18");
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
@@ -373,7 +373,7 @@ describe("4. MCP", () => {
 
   test("runtime_health + grant_verify tools", async () => {
     const h = await mcp(t.token, "tools/call", { name: "runtime_health" });
-    expect(h.json.result.structuredContent.version).toBe("0.3.6");
+    expect(h.json.result.structuredContent.version).toBe("0.3.7");
     const v = await mcp(t.token, "tools/call", { name: "grant_verify" });
     expect(v.json.result.structuredContent.sub).toBe("tenant:root");
   });
@@ -2787,7 +2787,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
   test("status report runs; every outbound call was blocked and is a known probe", async () => {
     const s = await req("GET", "/status.json");
     expect(s.status).toBe(200);
-    expect(s.json.version).toBe("0.3.6");
+    expect(s.json.version).toBe("0.3.7");
     expect(s.json.bodies.map((b) => b.up)).toEqual([false, false, false]);
     const allowed = new Set([
       "https://devdesk.meshtool.ai/health", "https://market.meshtool.ai/api/health",
@@ -6491,5 +6491,70 @@ describe("28. plan cheques (0.3.6): the owner signs the exact plan", () => {
     expect(ok.status).toBe(409);
     expect(ok.json.error).toBe("cheque_expired");
     expect(railwayCalls()).toBe(before);
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("29. cheque push to the owner's phone (0.3.7, ntfy)", () => {
+  const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
+  const TOPIC_URL = "https://ntfy.sh/rbr-test-topic-0123456789";
+  async function askingAgent(name) {
+    const root = await newTenant(name, "pro");
+    const c = await req("POST", "/api/grants", {
+      token: root.token,
+      body: { sub: "agent:pusher", caps: ["deploy.worker", "grant.read"], ttlSec: 3600, budget: { usd_cents: 2000, calls: 10, deploys: 2 }, constraints: { autonomy: "ask" } },
+    });
+    return { agent: c.json, prefix: (await verify(c.json.token)).scope.workers.namePrefix };
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 150));
+  const events = async (type, approval) =>
+    (await dbQuery("SELECT data FROM events WHERE type = $1 AND data->>'approval' = $2", [type, approval])).rows;
+
+  test("unarmed: no push is tried, and /health says ntfy:false", async () => {
+    const { agent, prefix } = await askingAgent("push-off");
+    const before = blockedFetches.filter((u) => u.includes("ntfy")).length;
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "p0", template: "probe" } });
+    expect(d.json.status).toBe("awaiting_approval");
+    await settle();
+    expect(blockedFetches.filter((u) => u.includes("ntfy")).length).toBe(before);
+    expect((await req("GET", "/health")).json.armed.ntfy).toBe(false);
+  });
+
+  test("armed: the cheque is pushed to the topic, and a failed push never fails the ask", async () => {
+    process.env.NTFY_URL = TOPIC_URL;
+    try {
+      expect((await req("GET", "/health")).json.armed.ntfy).toBe(true);
+      const { agent, prefix } = await askingAgent("push-on");
+      const before = blockedFetches.filter((u) => u === TOPIC_URL).length;
+      const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "p1", template: "probe" } });
+      expect(d.status).toBe(201);
+      expect(d.json.status).toBe("awaiting_approval");
+      await settle();
+      expect(blockedFetches.filter((u) => u === TOPIC_URL).length).toBe(before + 1);
+      // the harness blocks the network, so the push is recorded as failed, and the cheque still stands
+      expect((await events("cheque.push_failed", d.json.id)).length).toBe(1);
+      expect((await dbQuery("SELECT status FROM approvals WHERE id = $1", [d.json.id])).rows[0].status).toBe("pending");
+    } finally {
+      delete process.env.NTFY_URL;
+    }
+  });
+
+  test("the push carries the link to that cheque and no plan secrets", async () => {
+    const { chequePush } = await import("../src/notify.js");
+    const p = chequePush({ approval: "ap_x", name: "t-abc-w1", estCents: 60, link: "https://runtime.meshtool.ai/#/?cheque=ap_x", expiresInSec: 86400, asker: "agent:scout" });
+    expect(p.headers.Click).toBe("https://runtime.meshtool.ai/#/?cheque=ap_x");
+    expect(p.headers.Actions).toContain("https://runtime.meshtool.ai/#/?cheque=ap_x");
+    expect(p.body).toContain("$0.60");
+    expect(p.body).toContain("24h");
+    for (const v of Object.values(p.headers)) expect(/^[\x20-\x7e]*$/.test(v)).toBe(true);
+  });
+
+  test("CONTROL: a topic URL that is not https or has a guessable topic does not arm", async () => {
+    const { ntfyArmed } = await import("../src/notify.js");
+    for (const bad of ["http://ntfy.sh/rbr-test-topic-0123456789", "https://ntfy.sh/abc", "https://ntfy.sh/", "not a url"]) {
+      process.env.NTFY_URL = bad;
+      expect(ntfyArmed()).toBe(false);
+    }
+    delete process.env.NTFY_URL;
   });
 });
