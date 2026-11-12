@@ -1,5 +1,5 @@
 {
-  "count": 209,
+  "count": 213,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -208,6 +208,10 @@
     "POST /api/admin/identity/unfreeze",
     "GET /api/identity/me",
     "GET /api/identity/me",
+    "GET /.well-known/openid-configuration",
+    "GET /.well-known/jwks.json",
+    "POST /api/admin/identity/oidc-token",
+    "POST /api/admin/identity/oidc-token",
     "GET /routes",
     "GET /selftest"
   ],
@@ -330,6 +334,9 @@
     "POST /api/admin/identity/freeze :: admin",
     "POST /api/admin/identity/unfreeze :: admin",
     "GET /api/identity/me :: grant",
+    "GET /.well-known/openid-configuration :: public",
+    "GET /.well-known/jwks.json :: public",
+    "POST /api/admin/identity/oidc-token :: admin",
     "GET /routes :: public",
     "GET /selftest :: public"
   ]
