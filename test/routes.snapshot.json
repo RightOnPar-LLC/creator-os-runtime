@@ -1,5 +1,5 @@
 {
-  "count": 209,
+  "count": 213,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -208,6 +208,10 @@
     "POST /api/admin/identity/unfreeze",
     "GET /api/identity/me",
     "GET /api/identity/me",
+    "POST /api/admin/seats/mint",
+    "POST /api/admin/seats/mint",
+    "GET /api/admin/seats/mints",
+    "GET /api/admin/seats/mints",
     "GET /routes",
     "GET /selftest"
   ],
@@ -330,6 +334,8 @@
     "POST /api/admin/identity/freeze :: admin",
     "POST /api/admin/identity/unfreeze :: admin",
     "GET /api/identity/me :: grant",
+    "POST /api/admin/seats/mint :: admin",
+    "GET /api/admin/seats/mints :: admin",
     "GET /routes :: public",
     "GET /selftest :: public"
   ]

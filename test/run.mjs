@@ -44,4 +44,5 @@ const main = run(["runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "
 const market = run(["market.test.js"]);
 const identity = run(["identity.test.js"]);
 const access = run(["access-view.test.js"]);
-process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1));
+const seats = run(["seats.test.js"]);
+process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1));

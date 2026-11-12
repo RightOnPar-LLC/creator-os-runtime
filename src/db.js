@@ -140,6 +140,15 @@ CREATE TABLE IF NOT EXISTS agents (
   PRIMARY KEY (tenant, sub));
 CREATE INDEX IF NOT EXISTS agents_blueprint ON agents(tenant, blueprint);
 CREATE INDEX IF NOT EXISTS grants_tenant_sub ON grants(tenant, sub);
+-- Seat mints (seats.js). One row per mint attempt of a paid (or house) seat. The partial unique index is
+-- what makes a retried payment webhook safe: one (tenant, rail, payment_ref) makes one seat, ever.
+-- status: minting -> minted | failed (a failed one may be tried again with the same payment).
+CREATE TABLE IF NOT EXISTS seat_mints (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES tenants(id), agent TEXT NOT NULL, rail TEXT NOT NULL,
+  payment_ref TEXT, paid_cents INT, status TEXT NOT NULL DEFAULT 'minting', tour_id TEXT, error TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
+CREATE UNIQUE INDEX IF NOT EXISTS seat_mints_payment ON seat_mints(tenant, rail, payment_ref) WHERE payment_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS seat_mints_tenant ON seat_mints(tenant, created_at);
 `;
 export async function migrateSchema() {
   for (let e of SCHEMA_SQL.split(";")

@@ -156,3 +156,26 @@ export async function unseatedAgents(limit = 200) {
     WHERE g.depth > 0 AND g.status = 'active' AND g.exp > ${Math.floor(Date.now() / 1000)} AND a.sub IS NULL
     GROUP BY g.tenant, g.sub ORDER BY live_keys DESC, g.sub LIMIT ${limit}`;
 }
+
+// Seat (or re-seat) one agent: the ONE place a seat row is written. Used by the admin seat route
+// (routes/identity.js) and by the seat mint (seats.js), so the two can never disagree on what a
+// seat is. Re-seating never lifts a freeze: `status` is not touched here; only unfreeze does that.
+// `b`: sponsor (required, checked by the caller), owner?, purpose?, blueprint? (already validated),
+// attestEveryDays? (default 30, 0-365, 0 = never lapses), expiresAt?. `q` is what to write with.
+export async function upsertSeat(tenant, sub, b, q = sql) {
+  let every = b.attestEveryDays == null ? 30 : Number(b.attestEveryDays);
+  if (!Number.isInteger(every) || every < 0 || every > 365) throw new HttpError(400, "bad_attest_every_days", { range: "0-365, 0 = never lapses" });
+  let expires = b.expiresAt ? new Date(b.expiresAt) : null;
+  if (expires && isNaN(expires.getTime())) throw new HttpError(400, "bad_expires_at");
+  let text = (v, max) => (v == null || v === "" ? null : String(v).slice(0, max));
+  let blueprint = b.blueprint || null;
+  if (blueprint) await q`INSERT INTO blueprints (tenant, id) VALUES (${tenant}, ${blueprint}) ON CONFLICT DO NOTHING`;
+  let [row] = await q`
+    INSERT INTO agents (tenant, sub, blueprint, sponsor, owner, purpose, attest_every_days, attested_at, attested_by, expires_at)
+    VALUES (${tenant}, ${sub}, ${blueprint}, ${b.sponsor}, ${text(b.owner, 120)}, ${text(b.purpose, 500)}, ${every}, now(), ${b.sponsor}, ${expires})
+    ON CONFLICT (tenant, sub) DO UPDATE SET blueprint = EXCLUDED.blueprint, sponsor = EXCLUDED.sponsor, owner = EXCLUDED.owner,
+      purpose = EXCLUDED.purpose, attest_every_days = EXCLUDED.attest_every_days, attested_at = now(), attested_by = EXCLUDED.sponsor,
+      expires_at = EXCLUDED.expires_at, updated_at = now()
+    RETURNING *, (xmax = 0) AS created`;
+  return row;
+}
