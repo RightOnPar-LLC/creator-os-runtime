@@ -260,3 +260,7 @@ refused. It has no custom domain. `mcp-gate`'s `RUNTIME_URL` is confirmed as `ht
 
 From here, `runtime-production-9d95.up.railway.app` is dead. Any old note in this file that
 names it is history, not a live address.
+
+## Current source reproduction verified — 2026-11-01
+
+Planning audit rebuilt master491e7c8845bd5be99826279a6c7b56ff0489c006 from src/index.js using Bun1.4.2 and the production Dockerfile flags. Output181657bytes, SHA25635f18ea8d499064db78c66f7c5a6c43960671470440a8d505d079f46b719c269, exactly matching the fresh production and staging health-reported artifact. The older live/runtime-0.3.4.bundle.js archive is95845bytes/560c0099; it is not the current Dockerfile input. Do not infer current source drift solely from that historical archive. No backend service, grant or configuration was changed. Evidence and remaining integration limits: docs/specs/platform-realignment-review-2026-11-01.md and runtime-source-reproduction-2026-11-01.json.

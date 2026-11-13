@@ -120,7 +120,8 @@ export var MCP_TOOLS = [
   },
   {
     name: "deploy_worker",
-    description: "Direct deploy intent (needs deploy.worker)",
+    description:
+      "Direct deploy intent (needs deploy.worker). Receipt-before-run: send it once without planHash to get a dry run and its planHash, then again with that planHash to run exactly that plan (each dry run buys one live run, for 15 minutes). Required when the grant has requirePlanReceipt; checked whenever planHash is sent.",
     inputSchema: {
       type: "object",
       properties: {
@@ -135,6 +136,10 @@ export var MCP_TOOLS = [
         },
         confirm: {
           type: "boolean",
+        },
+        planHash: {
+          type: "string",
+          description: "planHash from a dry run of this exact plan",
         },
       },
       required: ["name", "template"],

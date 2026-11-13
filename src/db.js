@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS guest_fingerprints (
 ALTER TABLE ledger ADD COLUMN IF NOT EXISTS autonomy INT;
 ALTER TABLE ledger ADD COLUMN IF NOT EXISTS decision TEXT;
 ALTER TABLE ledger ADD COLUMN IF NOT EXISTS approver TEXT;
+-- Receipt-before-run (0.3.5). plan_hash binds a dry run to the exact plan a live deploy will run;
+-- plan_consumed_at spends that dry run once, so one sim buys at most one live action.
+-- live_actions counts live Railway mutations taken under a grant, against constraints.maxLiveActions
+-- (absent = unlimited, 1 = a one-use grant). Additive: older rows read as no hash or zero actions.
+ALTER TABLE deploys ADD COLUMN IF NOT EXISTS plan_hash TEXT;
+ALTER TABLE deploys ADD COLUMN IF NOT EXISTS plan_consumed_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS deploys_tenant_plan ON deploys(tenant, plan_hash);
+ALTER TABLE grants ADD COLUMN IF NOT EXISTS live_actions INT NOT NULL DEFAULT 0;
 -- A value action an agent at autonomy "ask" requested: it waits here until the
 -- tenant root grant (the owner credential) approves or denies it.
 CREATE TABLE IF NOT EXISTS approvals (
@@ -91,6 +99,11 @@ CREATE TABLE IF NOT EXISTS approvals (
   autonomy INT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', requested_by TEXT, approver TEXT,
   created_at TIMESTAMPTZ DEFAULT now(), decided_at TIMESTAMPTZ, result JSONB);
 CREATE INDEX IF NOT EXISTS approvals_tenant_status ON approvals(tenant, status);
+-- Plan cheques (0.3.6). A deploy that stops at "ask" now carries the exact plan it would run and that
+-- plan's hash. Signing runs that plan once, and only if it still hashes the same. A cheque expires.
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS plan JSONB;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS plan_hash TEXT;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 -- Tours (tours.js): the record that lets one named agent keep renewing a 24-hour key until its end date.
 -- grant_id is the holding grant (never a credential). current_key is a NOTE of the key the tour handed out
 -- last. The keys themselves are found by parent (every active grant under the holding grant), never by this note.
@@ -110,6 +123,32 @@ CREATE INDEX IF NOT EXISTS tours_grant ON tours(grant_id);
 -- One tour per agent name per tenant while it is live. This index, not a look before the insert, is what keeps
 -- two opens at the same moment from both winning.
 CREATE UNIQUE INDEX IF NOT EXISTS tours_one_live_per_agent ON tours(tenant, agent) WHERE status IN ('active', 'frozen');
+-- Agent identity (identity.js). A blueprint is a family of agents. Freezing it stops every agent
+-- built from it, and everything those agents delegated to. An agent row is the SEAT behind a grant
+-- subject: who sponsors it (accountable for why it exists), who owns it (keeps it running), what
+-- it is for, and an attestation the sponsor must renew every attest_every_days or the seat lapses.
+CREATE TABLE IF NOT EXISTS blueprints (
+  tenant TEXT NOT NULL REFERENCES tenants(id), id TEXT NOT NULL, purpose TEXT, status TEXT NOT NULL DEFAULT 'active',
+  frozen_reason TEXT, frozen_by TEXT, frozen_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (tenant, id));
+CREATE TABLE IF NOT EXISTS agents (
+  tenant TEXT NOT NULL REFERENCES tenants(id), sub TEXT NOT NULL, blueprint TEXT, sponsor TEXT, owner TEXT, purpose TEXT,
+  status TEXT NOT NULL DEFAULT 'active', frozen_reason TEXT, frozen_by TEXT, frozen_at TIMESTAMPTZ,
+  attest_every_days INT NOT NULL DEFAULT 30, attested_at TIMESTAMPTZ, attested_by TEXT, expires_at TIMESTAMPTZ,
+  strikes INT NOT NULL DEFAULT 0, strikes_window_start BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (tenant, sub));
+CREATE INDEX IF NOT EXISTS agents_blueprint ON agents(tenant, blueprint);
+CREATE INDEX IF NOT EXISTS grants_tenant_sub ON grants(tenant, sub);
+-- Seat mints (seats.js). One row per mint attempt of a paid (or house) seat. The partial unique index is
+-- what makes a retried payment webhook safe: one (tenant, rail, payment_ref) makes one seat, ever.
+-- status: minting -> minted | failed (a failed one may be tried again with the same payment).
+CREATE TABLE IF NOT EXISTS seat_mints (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES tenants(id), agent TEXT NOT NULL, rail TEXT NOT NULL,
+  payment_ref TEXT, paid_cents INT, status TEXT NOT NULL DEFAULT 'minting', tour_id TEXT, error TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
+CREATE UNIQUE INDEX IF NOT EXISTS seat_mints_payment ON seat_mints(tenant, rail, payment_ref) WHERE payment_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS seat_mints_tenant ON seat_mints(tenant, created_at);
 `;
 export async function migrateSchema() {
   for (let e of SCHEMA_SQL.split(";")

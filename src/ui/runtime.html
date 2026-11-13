@@ -124,6 +124,17 @@ table.t tr:last-child td{border-bottom:0}
 .idc{font:400 11px var(--mono);color:var(--muted);word-break:break-all}
 .jsn{font:400 11px var(--mono);color:var(--dim);word-break:break-word}
 .hood{font:400 11px var(--mono);color:var(--dim)}
+
+.access-section{margin-top:12px}.access-section h2,.access-group h3,.access-card h4{margin:0}
+.access-section>summary{font-size:18px;font-weight:650;cursor:pointer}
+.access-group{margin:14px 0}.access-group h3{margin-bottom:8px;font-size:15px;color:var(--muted)}
+.access-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,290px),1fr));gap:10px}
+.access-card{display:grid;gap:8px;align-content:start;min-width:0}.access-card .note{margin:0}
+.access-facts{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.5fr);gap:5px 12px;margin:0;font-size:13px}
+.access-facts dt{color:var(--muted)}.access-facts dd{margin:0;overflow-wrap:anywhere}
+.access-caps{margin:4px 0;padding-left:20px}.access-card summary{cursor:pointer}
+.access-bottom{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.runtime-guide{margin-bottom:14px}.runtime-guide h2{margin:0}.runtime-guide ul{margin:0;padding-left:20px}
 .signin{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:14px}
 .signin .card{display:flex;flex-direction:column;gap:12px;padding:20px}
 .signin h2{margin:0;font-size:22px}
@@ -165,7 +176,7 @@ table.t tr:last-child td{border-bottom:0}
   <div class="ring tr" aria-hidden="true">Movement № 0001 · Estate of Dw</div>
   <div class="ring bl" aria-hidden="true"><span>Bezel</span><span>·</span><span>Warrant</span><span>·</span><span>Crown</span><span>·</span><span>Cloisonné</span><span>·</span><span>Jewels</span><span>·</span><span>Provenance</span></div>
   <div class="ring br" aria-hidden="true">every arrow leaves a hallmark · you only touch the seal</div>
-  <div class="ring vl" aria-hidden="true">Cloisonné · worlds in their own cells</div>
+  <div class="ring vl" aria-hidden="true">Workspaces in their own cells</div>
   <div class="ring vr" aria-hidden="true">the Loupe · look closely</div>
   <div class="tick a" aria-hidden="true"></div><div class="tick b" aria-hidden="true"></div><div class="tick c" aria-hidden="true"></div><div class="tick d" aria-hidden="true"></div>
 
@@ -187,14 +198,14 @@ table.t tr:last-child td{border-bottom:0}
         </span>
       </form>
       <span class="on-pill" id="onPill"><span class="dot" id="onDot"></span><span id="onTxt">RUNTIME</span></span>
-      <button class="crownb" type="button" id="crown" aria-label="The Crown: pull it and every agent halts" title="The Crown"><svg class="turn" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="7"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg></button>
+      <button class="crownb" type="button" id="crown" aria-label="Emergency stop all agents" title="Emergency stop all agents"><svg class="turn" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="7"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg></button>
       <button class="who out" type="button" id="who">Sign in</button>
     </header>
     <div class="guill" aria-hidden="true"></div>
 
     <div class="body">
       <aside class="rail" aria-label="Worlds and tabs">
-        <div class="grp"><span class="kick">Cloisonné · worlds</span><div id="worlds"></div></div>
+        <div class="grp"><span class="kick">Workspaces</span><div id="worlds"></div></div>
         <div class="grp"><span class="kick">Tabs · estate</span><div id="tabs"></div></div>
         <div class="grp"><span class="kick">Pages</span>
           <a class="tab" href="/loop"><span class="ini">LP</span><span class="t"><b>The loop</b><span>a world, live</span></span></a>
@@ -204,7 +215,7 @@ table.t tr:last-child td{border-bottom:0}
         <div class="cell-private">
           <span class="kick">The private cell · agents never see</span>
           <span class="note" style="font-size:12px">Keys, passwords and banking stay off this runtime. Agents only ever hold grants.</span>
-          <button class="btn crown" type="button" id="crown2">Pull the Crown · halt every agent</button>
+          <button class="btn crown" type="button" id="crown2">Emergency stop all agents</button>
         </div>
       </aside>
 
@@ -213,6 +224,7 @@ table.t tr:last-child td{border-bottom:0}
           <div style="display:flex;flex-direction:column;gap:4px">
             <span class="k"><span class="kick" id="lexKick">The Loupe · RightOnPar estate</span><span class="stamp" id="hall"><i></i>Hallmarked</span></span>
             <h1 id="title">Everyone and everything on your Mesh</h1>
+            <p style="margin:0;font-size:14px;color:var(--text2);line-height:1.45">This is the control room for Dw's Mesh — the place where he watches his agents, hands out access, and signs off on what they do.</p>
           </div>
           <div class="act" id="headAct"></div>
         </div>
@@ -296,8 +308,8 @@ const evTone = (t) => { t = String(t); return /fail|crash|denied|revok|paused/.t
 // ---- views -----------------------------------------------------------------------------------
 const VIEWS = {
   "": { title: "Everyone and everything on your Mesh", nav: "Overview", lex: "The Loupe" },
-  grants: { title: "Grants", nav: "Grants", lex: "Warrants", one: "Every capability alive right now, what it may do, and what is left of its budget.", api: "/api/admin/grants?limit=500", key: "grants", cols: ["sub", "tenant", "status", "caps", "remaining", "exp"] },
-  worlds: { title: "Worlds", nav: "Worlds", lex: "Cloisonné", one: "Each world in its own cell: who is on this runtime, and on what tier.", api: "/api/tenants", key: "tenants", cols: ["name", "tier", "status", "deploys_period", "created_at", "id"] },
+  grants: { title: "Who has access?", nav: "Access", lex: "Permissions" },
+  worlds: { title: "Workspaces", nav: "Workspaces", lex: "Workspaces", one: "See the workspaces on this Runtime and their current status.", api: "/api/tenants", key: "tenants", cols: ["name", "tier", "status", "deploys_period", "created_at", "id"] },
   receipts: { title: "Receipts", nav: "Receipts", lex: "Hallmarks", one: "Every action the runtime, COG and the agents took, newest first.", api: "/api/admin/events", key: "events", cols: ["ts", "type", "actor", "tenant", "data"] },
   ledger: { title: "Ledger", nav: "Ledger", lex: "Assay", one: "Every reserve, settle and release: the money trail.", api: "/api/admin/ledger", key: "ledger", cols: ["ts", "kind", "usd_cents", "calls", "tenant", "note"] },
   workers: { title: "Workers", nav: "Workers", lex: "Escapement", one: "What is deployed, planned, or failed.", api: "/api/admin/deploys", key: "deploys", cols: ["name", "template", "status", "executed", "tenant", "created_at"] },
@@ -306,7 +318,7 @@ const VIEWS = {
   memory: { title: "Memory", nav: "Memory", lex: "Patina", one: "What the runtime remembers, in the order it happened." },
   guardrails: { title: "Guardrails", nav: "Guardrails", lex: "The Bezel", one: "The floors that never move, the Crown, and what is armed." },
 };
-const ALIAS = { tenants: "worlds", events: "receipts", deploys: "workers", webhooks: "intake", hub: "" };
+const ALIAS = { access: "grants", workspaces: "worlds", tenants: "worlds", events: "receipts", deploys: "workers", webhooks: "intake", hub: "" };
 
 function parseRoute() {
   const sp = new URLSearchParams(location.search);
@@ -333,7 +345,9 @@ async function route() {
   setHead(k);
   if (k === "connect") return connect(qs);
   if (!S.signed) return signin();
-  if (k === "") return overview();
+  if (k === "") { const ch = new URLSearchParams(qs).get("cheque"); if (ch) S.sel = ch; return overview(); }
+  if (k === "grants") return accessView();
+  if (k === "receipts" && new URLSearchParams(qs).has("toolReceipt")) return toolReceiptView(new URLSearchParams(qs).get("toolReceipt"));
   if (k === "memory") return memory();
   if (k === "guardrails") return guardrails();
   return table(k);
@@ -344,11 +358,17 @@ function signin(note) {
   const h = S.health || {};
   const sso = new URLSearchParams(location.search).get("sso");
   const why = sso === "refused" ? "That sign-in pass was refused. Try again." : sso === "off" ? "Face ID sign-in is not switched on here yet; use the key once." : note || "";
-  $("view").innerHTML = `<div class="signin">
+  $("view").innerHTML = `<section class="card runtime-guide" aria-labelledby="runtime-guide-title">
+    <h2 id="runtime-guide-title">How Runtime works</h2>
+    <p class="note">Runtime checks what an app or agent is allowed to do and records activity you can review.</p>
+    <ul><li><b>Workspaces</b> keep each team's activity together.</li><li><b>Grants</b> give specific permissions for a limited time.</li><li><b>Receipts</b> show recorded actions and their outcomes.</li></ul>
+    <p class="note"><b>Example grant</b> A scheduling assistant can read its workspace for one hour.</p>
+    <p class="note"><a href="/status">Check public service status</a></p>
+  </section><div class="signin">
     <div class="card">
       <span class="kick">The Seal · owner only</span>
-      <h2>Sign in to look closely</h2>
-      <p class="note" style="margin:0">Grants, receipts, the ledger and anything waiting on your sign-off live behind this door. Agents never sign in here: they only ever hold grants.</p>
+      <h2>Sign in to manage access</h2>
+      <p class="note" style="margin:0">Sign in as the owner to see your workspaces, access grants, receipts and pending approvals.</p>
       <a class="btn go" href="/sso/start?return=${encodeURIComponent(location.pathname + location.search)}">Sign in with MeshTool (Face ID)</a>
       <form id="keyForm" style="display:flex;flex-direction:column;gap:8px">
         <label for="k" class="note">Or the admin key, once. This browser stays signed in for 30 days; the key is not kept.</label>
@@ -357,7 +377,7 @@ function signin(note) {
       <div class="msg" id="sMsg">${why ? `<span class="err">${esc(why)}</span>` : ""}</div>
     </div>
     <div class="card">
-      <span class="kick">Public · anyone can see this</span>
+      <span class="kick">Public service status</span>
       <div class="kv">
         <span>runtime</span><b>${h.ok ? (h.killSwitch ? "paused" : "online") : "checking"}</b>
         <span>version</span><b>${esc(h.version || "—")} · policy ${esc(h.policy || "—")}</b>
@@ -396,7 +416,7 @@ function overview() {
   const seats = [...bySub.values()].sort((a, b) => (a.depth === 0) - (b.depth === 0) || b.at - a.at);
   const warrants = g.filter((x) => +x.depth > 0).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 5);
   const pulled = !!(S.health && S.health.killSwitch);
-  const pend = S.approvals.filter(inWorld);
+  const pend = S.approvals.filter(inWorld).filter((a) => (a.status || "pending") === "pending");
   if (S.sel && !pend.find((a) => a.id === S.sel)) S.sel = null;
   if (!S.sel && pend[0]) S.sel = pend[0].id;
   const worldsOn = [...new Set(g.map((x) => x.tenant))];
@@ -448,16 +468,41 @@ function pane() {
   $("pane").innerHTML = `
     <div style="display:flex;align-items:center;gap:10px"><span class="badge" style="width:34px;height:34px;border-radius:10px;background:#22332f;color:var(--accent);display:grid;place-items:center;font:600 11px var(--mono)">COG</span>
       <div style="display:flex;flex-direction:column"><span class="note">${esc(asker(a))} · ${esc(tname(a.tenant))}</span><h3>${esc(actionLabel(a))}</h3></div></div>
-    <pre class="intent" aria-label="What it wants to do">${esc(JSON.stringify(a.intent, null, 2))}</pre>
+    ${a.plan ? chequeHtml(a) : `<pre class="intent" aria-label="What it wants to do">${esc(JSON.stringify(a.intent, null, 2))}</pre>`}
     <div class="prov"><span style="padding-bottom:8px;color:var(--dim);letter-spacing:.12em;display:flex;align-items:center;gap:10px">PROVENANCE<span class="stamp"><i></i>Assayed</span></span>
       <div class="r"><span style="color:var(--accent)">●</span><span>grant</span><span>${esc(g ? who(g.sub).join(" · ") : a.grant_id)} · ${esc(a.grant_id)}</span></div>
       <div class="r"><span style="color:var(--accent)">●</span><span>asked</span><span>${esc(a.action)} · ${when(a.created_at)}</span></div>
       <div class="r"><span style="color:var(--accent)">●</span><span>stopped</span><span>at the seal · autonomy ${esc(lvl(a.autonomy))}</span></div>
       <div class="r"><span style="color:var(--gold)">●</span><span style="color:var(--gold)">sign-off</span><span style="color:var(--text)">waiting on you</span></div></div>
-    <div class="acts"><button class="btn seal" type="button" id="apOk">Approve</button><button class="btn" type="button" id="apNo">Deny</button></div>
+    <div class="acts"><button class="btn seal" type="button" id="apOk">${a.plan ? "Sign cheque" : "Approve"}</button><button class="btn" type="button" id="apNo">${a.plan ? "Decline" : "Deny"}</button></div>
     <div class="msg" id="apMsg"></div>`;
   $("apOk").onclick = () => decide(a, "approve");
   $("apNo").onclick = () => decide(a, "deny");
+}
+// A plan cheque (0.3.6): what will happen, in plain words, with the plan's fingerprint. Signing runs
+// exactly this plan once; if the plan changes before it runs, the cheque bounces and nothing runs.
+function chequeLeft(a) {
+  const ms = new Date(a.expires_at).getTime() - now();
+  if (!a.expires_at) return "";
+  if (ms <= 0) return "Expired";
+  const m = Math.floor(ms / 60000);
+  return m >= 120 ? Math.floor(m / 60) + "h left" : m + "m left";
+}
+function chequeHtml(a) {
+  const p = a.plan || {}, h = String(a.plan_hash || "");
+  const secrets = (p.env || []).filter((k) => !/^COS_/.test(k) && !/^WORKER_KIND$/.test(k));
+  const rows = [
+    ["New Railway service", `${p.name} · ${p.replicas || 1} replica${(p.replicas || 1) > 1 ? "s" : ""} · ${p.environment || "production"}`],
+    ["Builds from", p.source || "?"],
+    ["Costs about", money(p.estCents)],
+    ["Secrets it gets", secrets.length ? secrets.join(", ") : "none"],
+  ];
+  if ((p.missingEnv || []).length) rows.push(["Missing, will not start", p.missingEnv.join(", ")]);
+  return `<div class="cheque" aria-label="Plan cheque">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 6px"><span class="stamp"><i></i>Plan cheque · one use</span><span class="note">${esc(chequeLeft(a))}</span></div>
+    ${rows.map(([k, v]) => `<div class="r" style="display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid var(--line, rgba(255,255,255,.08))"><span class="note">${esc(k)}</span><span style="text-align:right">${esc(v)}</span></div>`).join("")}
+    <div style="display:flex;justify-content:space-between;padding:8px 0 2px"><span class="note">Fingerprint</span><span class="mono" title="${esc(h)}">${esc(h.slice(0, 4) + "…" + h.slice(-4))}</span></div>
+    <p class="note" style="margin:4px 0 0">If anything in this plan changes before it runs, the cheque bounces and nothing runs.</p></div>`;
 }
 // The owner decides with the world's ROOT grant (the runtime refuses any other): sign a token for it
 // from this session, use it once, drop it.
@@ -476,7 +521,8 @@ async function decide(a, verdict) {
     t = null;
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || "http " + r.status);
-    $("apMsg").textContent = verdict === "approve" ? "Sealed. It's running." : "Denied. The agent was told.";
+    const bounced = j.result?.reason === "plan_receipt_mismatch";
+    $("apMsg").textContent = verdict !== "approve" ? "Declined. The agent was told." : bounced ? "Cheque bounced: the plan changed after it was written. Nothing ran." : j.status === "approved_not_run" ? "Signed, but it could not run: " + (j.result?.reason || "unknown") : "Signed. It's running.";
     await refresh();
   } catch (e) { $("apMsg").innerHTML = `<span class="err">Couldn't ${verdict}: ${esc(e.message)}</span>`; $("apOk").disabled = $("apNo").disabled = false; }
 }
@@ -529,6 +575,137 @@ function cell(col, v, r) {
 }
 const NUMCOL = new Set(["usd_cents"]);
 const HEAD = { sub: "Holder", tenant: "World", caps: "May do", remaining: "Left", exp: "Expires", ts: "When", usd_cents: "Amount", calls: "Used", note: "Note", type: "What happened", actor: "By", data: "Detail", created_at: "Created", received_at: "Arrived", next_at: "Next try", last_error: "Last error", deploys_period: "Deploys" };
+
+const ACCESS_CAPS = {
+  "grant.issue": "Give others access", "grant.read": "Read grants",
+  "cog.plan": "Ask COG for a plan", "cog.execute": "Run a COG plan",
+  "deploy.worker": "Deploy workers", "worker.status": "Check worker status", "worker.logs.read": "Read worker logs",
+  "worker.restart": "Restart workers", "worker.delete": "Delete workers",
+  "tenant.read": "Read workspace details", "ledger.read": "Read the spending log", "webhook.emit": "Send webhook events",
+  "memory.read": "Read saved memory", "memory.write": "Save to memory", "escrow.hold": "Hold funds in escrow",
+  "store.clips.read": "Read store clips", "store.clips.link": "Link store clips", "store.clips.edit": "Edit store clips",
+  "store.clips.price": "Set clip prices", "store.ingest": "Import store media", "store.clips.publish": "Publish store clips",
+  "code.write": "Write code", "lsp.diagnose": "Check code for problems", "lsp.hover": "Read code hints",
+  "lsp.definition": "Find code definitions", "lsp.references": "Find code references",
+  "repo.read": "Read repositories", "repo.diff": "Compare repository changes", "repo.pr": "Open pull requests",
+};
+const ACCESS_PAGE = 50;
+let accessRequest = 0;
+let accessHistoryOpen = false;
+const accessOffset = { active: 0, history: 0 };
+let accessFilter = "";
+function accessCard(g, active) {
+  const [holder] = who(g.sub);
+  const role = +g.depth === 0 ? "Owner access" : String(g.sub).startsWith("guest:") ? "Guest access" :
+    /^(agent|connector):/.test(g.sub) || g.seat_owner || g.seat_sponsor ? "Agent access" : "Delegated access";
+  const state = active ? "Active" : g.status === "active" ? "Expired" : cap(g.status);
+  const caps = Array.isArray(g.caps) ? g.caps : [];
+  const capList = (items) => items.map((c) => `<li title="${esc(c)}">${esc(Object.hasOwn(ACCESS_CAPS, c) ? ACCESS_CAPS[c] : c)}</li>`).join("");
+  const issuer = g.issued_by === "admin" ? "Runtime administrator" : g.issued_by === "tenant:root" ? "Workspace owner grant" : g.issued_by;
+  return `<article class="card access-card">
+    <div class="ch"><h4>${esc(holder === "World root" ? "Workspace owner grant" : holder)}</h4><span class="pill ${tone(state.toLowerCase())}">${esc(state)}</span></div>
+    <p class="note">${role}${g.workspace_status !== "active" ? " · Workspace " + esc(g.workspace_status) : ""}</p>
+    <dl class="access-facts">
+      <dt>Workspace owner</dt><dd>Ownership unverified</dd>
+      <dt>Access holder</dt><dd>${esc(g.sub)}</dd>
+      <dt>Granted by</dt><dd>${esc(issuer || "Issuer unavailable")}</dd>
+      ${g.seat_owner ? `<dt>Recorded seat owner</dt><dd>${esc(g.seat_owner)}</dd>` : ""}
+      ${g.seat_sponsor ? `<dt>Recorded seat sponsor</dt><dd>${esc(g.seat_sponsor)}</dd>` : ""}
+      ${+g.depth > 0 ? "<dt>Connected account</dt><dd>Account unverified</dd>" : ""}
+      <dt>Last used</dt><dd>${g.last_receipt_id ? `<a href="#/receipts?toolReceipt=${encodeURIComponent(g.last_receipt_id)}">${esc(when(g.last_used_at))} · View receipt</a>` : "No authorized receipt recorded"}</dd>
+      ${active ? `<dt>Remaining limits</dt><dd>${cell("remaining", g.remaining, g)}</dd>` : ""}
+      <dt>${active ? "Expires" : "Scheduled expiry"}</dt><dd>${esc(when(g.exp))}</dd>
+    </dl>
+    <div><b>What ${active ? "they can" : "it could"} do</b>${caps.length ? `<ul class="access-caps">${capList(caps.slice(0, 3))}</ul>` : '<p class="note">No permissions listed</p>'}
+      ${caps.length > 3 ? `<details><summary>Show ${caps.length - 3} more permissions</summary><ul class="access-caps">${capList(caps.slice(3))}</ul></details>` : ""}</div>
+    <div class="access-bottom"><span class="note" title="${esc(g.id)}">Grant ${esc(shortId(g.id))}</span>
+      ${active && +g.depth > 0 ? `<button class="btn sm bad" type="button" aria-label="Revoke access for ${esc(holder)}" data-rv="${esc(g.id)}">Revoke access</button>` : ""}</div>
+  </article>`;
+}
+function accessGroup({ grants, total, offset }, section) {
+  const groups = new Map();
+  for (const g of grants) {
+    if (!groups.has(g.tenant)) groups.set(g.tenant, []);
+    groups.get(g.tenant).push(g);
+  }
+  const groupsHtml = [...groups.values()].map((rows) => `<section class="access-group">
+    <h3>${esc(rows[0].workspace_name)}</h3><div class="access-grid">${rows.map((g) => accessCard(g, section === "active")).join("")}</div></section>`).join("");
+  return (groupsHtml || '<p class="empty">No grants match this view.</p>') + (total > ACCESS_PAGE ? `<div class="access-bottom">
+    <span class="note">Showing ${offset + 1}–${offset + grants.length} of ${total}</span>
+    <div class="acts"><button type="button" class="btn" data-access-page="${section}" data-offset="${offset - ACCESS_PAGE}" ${offset === 0 ? "disabled" : ""}>Previous</button>
+    <button type="button" class="btn" data-access-page="${section}" data-offset="${offset + ACCESS_PAGE}" ${offset + grants.length >= total ? "disabled" : ""}>Next</button></div></div>` : "");
+}
+async function accessView() {
+  const request = ++accessRequest;
+  const filter = JSON.stringify([S.world, S.q]);
+  if (filter !== accessFilter) {
+    accessFilter = filter;
+    accessOffset.active = accessOffset.history = 0;
+  }
+  const path = (section) => "/api/admin/grants?" + new URLSearchParams({
+    access: section, limit: ACCESS_PAGE, offset: accessOffset[section], ...(S.world ? { tenant: S.world } : {}), ...(S.q ? { search: S.q.slice(0, 200) } : {}),
+  });
+  const view = $("view");
+  view.innerHTML = '<p class="empty" role="status">Loading access…</p>';
+  try {
+    const [active, history] = await Promise.all([api(path("active")), api(path("history"))]);
+    if (request !== accessRequest || S.view !== "grants") return;
+    if (!S.signed) { chrome(); return signin(); }
+    if ((active.offset && !active.grants.length) || (history.offset && !history.grants.length)) {
+      if (!active.grants.length) accessOffset.active = 0;
+      if (!history.grants.length) accessOffset.history = 0;
+      return accessView();
+    }
+    view.innerHTML = `<p class="note">A grant gives a person, app, or agent permission to act in a workspace.</p>
+      <p class="note">Active grants are current and within their expiry time. Runtime also checks workspace and agent restrictions before each action.</p>
+      ${S.world || S.q ? `<p class="note">Showing ${S.world ? esc(tname(S.world)) : "all workspaces"}${S.q ? " · Matching “" + esc(S.q) + "”" : ""}</p>` : ""}
+      <section class="access-section" aria-labelledby="active-access"><h2 id="active-access" tabindex="-1">Active access (${active.total})</h2>${accessGroup(active, "active")}</section>
+      <details class="card access-section" id="access-history" ${accessHistoryOpen ? "open" : ""}><summary>Access history (${history.total})</summary>
+        <p class="note">Expired, revoked, and completed grants.</p>${accessGroup(history, "history")}</details>
+      <p class="msg" id="tMsg" role="status"></p>`;
+    $("access-history").ontoggle = (e) => { accessHistoryOpen = e.currentTarget.open; };
+    view.querySelectorAll("[data-access-page]").forEach((b) => (b.onclick = async () => {
+      const section = b.dataset.accessPage;
+      accessOffset[section] = Number(b.dataset.offset);
+      await accessView();
+      (section === "active" ? $("active-access") : $("access-history")?.querySelector("summary"))?.focus();
+    }));
+    view.querySelectorAll("[data-rv]").forEach((b) => (b.onclick = async () => {
+      if (!confirm("Revoke this grant? Access ends immediately, including any grants it issued.")) return;
+      b.disabled = true;
+      try {
+        await api(`/api/admin/grants/${encodeURIComponent(b.dataset.rv)}/revoke`, { method: "POST", body: JSON.stringify({ reason: "owner pulled it in the runtime browser" }) });
+        accessOffset.active = accessOffset.history = 0;
+        await refresh();
+      } catch (e) {
+        b.disabled = false;
+        if ($("tMsg")) $("tMsg").textContent = "Could not revoke access. " + e.message;
+      }
+    }));
+  } catch (e) {
+    if (request !== accessRequest || S.view !== "grants") return;
+    if (!S.signed) { chrome(); return signin(); }
+    view.innerHTML = '<p class="err" role="alert">Could not load access. Reload to try again.</p>';
+  }
+}
+async function toolReceiptView(id) {
+  const view = $("view");
+  view.innerHTML = '<p class="empty" role="status">Loading receipt…</p>';
+  try {
+    const { receipts } = await api("/api/admin/tool-receipts?id=" + encodeURIComponent(id));
+    if (new URLSearchParams(parseRoute().qs).get("toolReceipt") !== id || !S.signed) return;
+    const r = receipts[0];
+    view.innerHTML = `<a href="#/grants">Back to access</a>${r ? `<article class="card access-card"><h2>Tool receipt</h2>
+      <dl class="access-facts"><dt>Receipt</dt><dd>${esc(r.id)}</dd><dt>Workspace</dt><dd>${esc(tname(r.tenant))}</dd>
+      <dt>Operation</dt><dd>${esc(r.tool)}</dd><dt>Started</dt><dd>${esc(when(r.started_at))}</dd>
+      <dt>Outcome</dt><dd>${esc(humanType(r.outcome))}</dd></dl></article>` : '<p class="empty">Receipt unavailable.</p>'}`;
+  } catch {
+    if (new URLSearchParams(parseRoute().qs).get("toolReceipt") !== id) return;
+    if (!S.signed) { chrome(); return signin(); }
+    view.innerHTML = '<p class="err" role="alert">Could not load this receipt.</p><a href="#/grants">Back to access</a>';
+  }
+}
+
 async function table(k) {
   const v = VIEWS[k];
   $("view").innerHTML = `<p class="note" style="margin:0">${esc(v.one)}</p><div class="empty">loading…</div>`;
@@ -536,18 +713,10 @@ async function table(k) {
   let rows = [];
   try { rows = (await api(v.api))[v.key] || []; } catch (e) { if (!S.signed) return signin(); $("view").innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
   if (S.view !== k) return;
-  if (k === "grants") rows.forEach((r) => { if (r.status === "active" && +r.exp * 1000 < now()) r.status = "expired"; });
   const shown = rows.filter((r) => (k === "worlds" ? !S.world || r.id === S.world : inWorld(r))).filter(findOk);
-  const canPull = (r) => k === "grants" && r.status === "active" && +r.depth > 0;
   $("view").innerHTML = `<p class="note" style="margin:0">${esc(v.one)}</p>
-    <div class="tblwrap">${shown.length ? `<table class="t"><thead><tr>${v.cols.map((c) => `<th scope="col"${NUMCOL.has(c) ? ' class="r"' : ""}>${esc(HEAD[c] || c.replace(/_/g, " "))}</th>`).join("")}${k === "grants" ? '<th scope="col"><span class="sr">Action</span></th>' : ""}</tr></thead><tbody>${shown.map((r) => `<tr>${v.cols.map((c) => `<td${NUMCOL.has(c) ? ' class="r"' : ""}>${cell(c, r[c], r)}</td>`).join("")}${k === "grants" ? `<td>${canPull(r) ? `<button class="btn sm bad" type="button" data-rv="${esc(r.id)}">Pull</button>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table>` : '<div class="empty">Nothing here yet.</div>'}</div>
+    <div class="tblwrap">${shown.length ? `<table class="t"><thead><tr>${v.cols.map((c) => `<th scope="col"${NUMCOL.has(c) ? ' class="r"' : ""}>${esc(HEAD[c] || c.replace(/_/g, " "))}</th>`).join("")}</tr></thead><tbody>${shown.map((r) => `<tr>${v.cols.map((c) => `<td${NUMCOL.has(c) ? ' class="r"' : ""}>${cell(c, r[c], r)}</td>`).join("")}</tr>`).join("")}</tbody></table>` : '<div class="empty">Nothing here yet.</div>'}</div>
     <div class="hood">${shown.length} of ${rows.length} rows · newest first${S.world ? " · world " + esc(tname(S.world)) : ""}${S.q ? " · find “" + esc(S.q) + "”" : ""} · source ${esc(v.api.split("?")[0])}</div><div class="msg" id="tMsg"></div>`;
-  document.querySelectorAll("[data-rv]").forEach((b) => (b.onclick = async () => {
-    if (!confirm("Pull this warrant? The agent loses it right away, and so does everything it handed down.")) return;
-    b.disabled = true;
-    try { await api(`/api/admin/grants/${encodeURIComponent(b.dataset.rv)}/revoke`, { method: "POST", body: JSON.stringify({ reason: "owner pulled it in the runtime browser" }) }); await refresh(); }
-    catch (e) { b.disabled = false; $("tMsg").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
-  }));
   if ($("drain")) $("drain").onclick = async () => { $("drain").disabled = true; try { const j = await api("/api/admin/outbox/drain", { method: "POST" }); $("tMsg").textContent = "Drained: " + JSON.stringify(j); table("outbox"); } catch (e) { $("tMsg").innerHTML = `<span class="err">${esc(e.message)}</span>`; $("drain").disabled = false; } };
 }
 
@@ -682,7 +851,7 @@ function connect(qs) {
     <p class="note" style="margin:0">It talks to this runtime through your gate, with its own grant, never your key.</p>
     <div style="display:flex;align-items:center;gap:10px"><span class="kick">Grant · connector:claude</span><span class="pill ok">30 days</span></div>
     ${row(1, "MEMORY", "read + write · tenant, agent:claude")}${row(1, "COG", "ask for plans, never executes")}${row(0, "DEPLOY", "no workers, restarts or deletes")}${row(0, "MONEY", "no spend, no ledger")}${row(0, "GRANTS", "can't mint more power")}
-    <p class="note" style="margin:0">Sends you back to ${esc(to)}. Pull it anytime on the Grants page.</p>
+    <p class="note" style="margin:0">Returns you to ${esc(to)}. Revoke it anytime on the Access page.</p>
     <div class="acts">${S.signed ? `<button class="btn seal" type="button" id="cOk">Approve</button>` : `<a class="btn seal" href="/sso/start?return=${encodeURIComponent(back)}">Sign in with Face ID to approve</a>`}<button class="btn" type="button" id="cNo">Deny</button></div>
     ${S.signed ? "" : `<form id="cKey" style="display:flex;gap:8px"><label class="sr" for="ck">Admin key</label><input id="ck" class="field" type="password" placeholder="or the admin key, once" autocomplete="off"><button class="btn" type="submit">Unlock</button></form>`}
     <div class="msg" id="cMsg"></div></div>`;
@@ -700,8 +869,9 @@ function chrome() {
   $("onTxt").textContent = !h.ok ? "RUNTIME DOWN" : pulled ? "CROWN PULLED" : S.signed ? subs.size + " AGENT" + (subs.size === 1 ? "" : "S") + " ON" : "ONLINE";
   $("onDot").className = "dot " + (!h.ok || pulled ? "gold" : "pulse");
   $("crown").className = "crownb" + (pulled ? " pulled" : "");
-  $("crown").setAttribute("aria-label", pulled ? "The Crown is pulled: resume every agent" : "The Crown: pull it and every agent halts");
-  $("crown2").textContent = pulled ? "Crown pulled · resume the movement" : "Pull the Crown · halt every agent";
+  $("crown").title = pulled ? "Resume agents" : "Emergency stop all agents";
+  $("crown").setAttribute("aria-label", $("crown").title);
+  $("crown2").textContent = pulled ? "Agents stopped · Resume agents" : "Emergency stop all agents";
   $("crown2").className = "btn " + (pulled ? "seal" : "crown");
   $("who").textContent = S.signed ? "DW" : "Sign in";
   $("who").className = "who" + (S.signed ? "" : " out");
@@ -712,10 +882,10 @@ function chrome() {
   $("footVer").textContent = `v${h.version || "?"} · source ${String((h.source || {}).sha256 || "").slice(0, 12)} · runtime.meshtool.ai`;
   $("footCell").textContent = "cell · " + (S.world ? tname(S.world) : "all worlds");
   // worlds
-  if (!S.signed) $("worlds").innerHTML = '<span class="note" style="padding:0 8px;font-size:12px">Sign in to see each world.</span>';
+  if (!S.signed) $("worlds").innerHTML = '<span class="note" style="padding:0 8px;font-size:12px">Sign in to see workspaces.</span>';
   else {
     const cnt = (id) => S.grants.filter(live).filter((g) => g.tenant === id).length;
-    $("worlds").innerHTML = [`<button class="ws" type="button" data-w="" aria-pressed="${!S.world}"><span class="sw" style="background:var(--accent)"></span>All worlds<span class="n">${S.tenants.length}</span></button>`]
+    $("worlds").innerHTML = [`<button class="ws" type="button" data-w="" aria-pressed="${!S.world}"><span class="sw" style="background:var(--accent)"></span>All workspaces<span class="n">${S.tenants.length}</span></button>`]
       .concat(S.tenants.filter((t) => t.status === "active").slice(0, 8).map((t, i) => `<button class="ws" type="button" data-w="${esc(t.id)}" aria-pressed="${S.world === t.id}"><span class="sw" style="background:${SW[(i + 1) % SW.length]}"></span>${esc(t.name)}<span class="n">${cnt(t.id)}</span></button>`)).join("");
     document.querySelectorAll("[data-w]").forEach((b) => (b.onclick = () => { S.world = b.dataset.w; chrome(); route(); }));
   }
@@ -746,7 +916,7 @@ function chrome() {
 async function crown() {
   if (!S.signed) { location.hash = "#/"; return signin("Sign in first: only the owner holds the Crown."); }
   const pulled = !!(S.health && S.health.killSwitch);
-  if (!pulled && !confirm("Pull the Crown? Every agent halts and every grant fails closed until you resume.")) return;
+  if (!pulled && !confirm("Stop all agents? Runtime blocks every grant until you resume.")) return;
   try { await api(pulled ? "/api/admin/resume" : "/api/admin/kill", { method: "POST" }); } catch (e) { alert("Couldn't: " + e.message); }
   await refresh();
 }

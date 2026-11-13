@@ -296,7 +296,7 @@ app.get("/api/admin/overview", requireAdmin, async (e) => {
 // offset is how this list once answered every question with the same newest 200, and two live keys older than those
 // could not be seen.
 const GRANT_STATUSES = ["active", "revoked", "expired", "captured"];
-const GRANT_LIST_KEYS = ["status", "tenant", "limit", "offset"];
+const GRANT_LIST_KEYS = ["status", "tenant", "limit", "offset", "access", "search"];
 const wholeParam = (raw, name, min, max, unset) => {
   if (raw === undefined) return unset;
   if (!/^[0-9]{1,10}$/.test(raw) || Number(raw) < min || Number(raw) > max) throw new HttpError(400, `${name}_invalid`, { min, max });
@@ -315,6 +315,31 @@ app.get("/api/admin/grants", requireAdmin, async (e) => {
     offset = wholeParam(e.req.query("offset"), "offset", 0, 1e9, 0),
     st = status ?? null,
     tn = tenant ?? null;
+  const access = e.req.query("access");
+  const search = e.req.query("search");
+  if (access !== undefined && (!["active", "history"].includes(access) || status !== undefined)) throw new HttpError(400, "access_invalid");
+  if (search !== undefined && (!access || search.length > 200)) throw new HttpError(400, "search_invalid");
+  if (access) {
+    const active = access === "active";
+    const [rows, total] = await sql.begin(async (tx) => {
+      await tx`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`;
+      const match = tx`FROM grants g JOIN tenants t ON t.id = g.tenant
+        LEFT JOIN agents a ON a.tenant = g.tenant AND a.sub = g.sub
+        WHERE (g.status = 'active' AND g.exp > extract(epoch FROM now())) = ${active}
+          AND (${tn}::text IS NULL OR g.tenant = ${tn})
+          AND strpos(lower(concat_ws(' ', g.id, g.sub, t.name, g.issued_by, a.owner, a.sponsor, g.caps::text)), ${(search || "").toLowerCase()}) > 0`;
+      const page = await tx`SELECT selected.*, r.id AS last_receipt_id, r.started_at AS last_used_at
+        FROM (SELECT g.id, g.tenant, g.parent, g.depth, g.sub, g.status, g.caps, g.budget, g.reserved, g.settled, g.exp,
+          g.created_at, g.issued_by, t.name AS workspace_name, t.status AS workspace_status, a.owner AS seat_owner, a.sponsor AS seat_sponsor
+          ${match} ORDER BY g.created_at DESC, g.id DESC LIMIT ${limit} OFFSET ${offset}) selected
+        LEFT JOIN LATERAL (SELECT id, started_at FROM tool_receipts WHERE grant_id = selected.id AND tenant = selected.tenant
+          AND auth_decision = 'authorized' ORDER BY started_at DESC, id DESC LIMIT 1) r ON true
+        ORDER BY selected.created_at DESC, selected.id DESC`;
+      const [{ n }] = await tx`SELECT count(*)::int AS n ${match}`;
+      return [page, n];
+    });
+    return e.json({ grants: rows.map((row) => ({ ...row, exp: Number(row.exp), remaining: remainingBudget(row) })), total, limit, offset });
+  }
   // One snapshot for the page and the count (REPEATABLE READ, READ ONLY): read apart, a grant ended between the two
   // could leave the page and the count telling different stories, and the rule above would miss a skip.
   let [rows, total] = await sql.begin(async (tx) => {
@@ -344,6 +369,16 @@ app.get("/api/admin/deploys", requireAdmin, async (e) =>
       await sql`SELECT id, tenant, grant_id, name, template, status, executed, railway_service_id, target, created_at FROM deploys ORDER BY created_at DESC LIMIT 200`,
   }),
 );
+// The owner's seal (0.3.6): approvals across every world, newest first, with each plan cheque's plan,
+// hash and expiry. The cockpit and the card page read this; before 0.3.6 they asked for it and got a 404,
+// so a pending approval never showed in the cockpit.
+app.get("/api/admin/approvals", requireAdmin, async (e) =>
+  e.json({
+    approvals:
+      await sql`SELECT id, tenant, grant_id, action, intent, autonomy, status, requested_by, approver, created_at, decided_at, result, plan, plan_hash, expires_at
+        FROM approvals ORDER BY (status = 'pending') DESC, created_at DESC LIMIT 200`,
+  }),
+);
 app.get("/api/admin/ledger", requireAdmin, async (e) =>
   e.json({
     ledger: await sql`SELECT * FROM ledger ORDER BY id DESC LIMIT 300`,
@@ -361,5 +396,11 @@ app.get("/api/admin/events", requireAdmin, async (e) =>
   }),
 );
 
-app.get("/api/admin/tool-receipts", requireAdmin, async (e) =>
-  e.json({ receipts: await sql`SELECT * FROM tool_receipts ORDER BY started_at DESC, id DESC LIMIT 200` }));
+app.get("/api/admin/tool-receipts", requireAdmin, async (e) => {
+  const id = e.req.query("id");
+  if (id !== undefined && !/^tr_[A-Za-z0-9_-]{1,64}$/.test(id)) throw new HttpError(400, "receipt_id_invalid");
+  const receipts = id
+    ? await sql`SELECT * FROM tool_receipts WHERE id = ${id}`
+    : await sql`SELECT * FROM tool_receipts ORDER BY started_at DESC, id DESC LIMIT 200`;
+  return e.json({ receipts });
+});

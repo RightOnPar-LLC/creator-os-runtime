@@ -5,6 +5,7 @@
 import { armedIntegrations, env, POLICY_VERSION, SERVICE_NAME, VERSION } from "./config.js";
 import { getSetting, migrateSchema, setSetting } from "./db.js";
 import { loadGrantSigningKey } from "./tokens.js";
+import { loadOidcSigningKey } from "./oidc.js";
 import { reapExpiredGrants } from "./grants.js";
 import { sweepTours } from "./tours.js";
 import { attenuationViolations, CAPS, gatehouseEvaluate, TIERS } from "./policy.js";
@@ -26,6 +27,9 @@ import "./routes/oauth.js";
 import "./routes/sso.js";
 import "./routes/a2a.js";
 import "./routes/cockpit.js";
+import "./routes/identity.js";
+import "./routes/seats.js";
+import "./routes/oidc.js";
 import "./routes/meta.js";
 
 try {
@@ -33,10 +37,11 @@ try {
 } catch {}
 await migrateSchema();
 var signingKeySource = await loadGrantSigningKey();
+var oidcKeySource = await loadOidcSigningKey();
 if (!(await getSetting("kill_switch"))) await setSetting("kill_switch", "off");
 if (!(await getSetting("operator_lsp_caps"))) await setSetting("operator_lsp_caps", "off");
 console.log(
-  `[${SERVICE_NAME} v${VERSION}] policy=${POLICY_VERSION} signingKey=${signingKeySource} armed=${JSON.stringify(armedIntegrations())}`,
+  `[${SERVICE_NAME} v${VERSION}] policy=${POLICY_VERSION} signingKey=${signingKeySource} oidcKey=${oidcKeySource} armed=${JSON.stringify(armedIntegrations())}`,
 );
 // The reservation reaper: releases the unspent reservation of any EXPIRED grant
 // back to its parent (grants.js), so a pooling parent's budget stops draining to a

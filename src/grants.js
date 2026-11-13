@@ -7,6 +7,7 @@ import { parseGrantToken, signGrantToken } from "./tokens.js";
 import { AUTONOMY_LEVELS, DEFAULT_AUTONOMY, autonomyOf, lowerCheck, parseAutonomy } from "./autonomy.js";
 import { hireSub, hireViolation } from "./hostpolicy.js";
 import { TOUR_RENEWED, tourKeyReused } from "./tours.js";
+import { checkIdentity, recordStrike } from "./identity.js";
 import {
   addUsage,
   AGENT_ISSUED_MAX_TTL_SEC,
@@ -528,6 +529,22 @@ export async function settleGrantUsage(e, t, a, n, k = "settle", m = {}) {
 }
 // The nearest agent-host at or above a grant (the grant whose constraints carry
 // `host`), or null. Walks up the parent chain.
+// Receipt-before-run (0.3.5): take one live action under a grant. Counts on the grant AND every grant
+// above it, so a parent with maxLiveActions cannot be multiplied by minting many children. One UPDATE,
+// so the rows stay locked until the caller's transaction ends; any grant in the chain over its limit
+// refuses the whole action (the caller rolls back, nothing is counted).
+export async function takeLiveAction(q, grantId) {
+  let rows = await q`
+    WITH RECURSIVE chain AS (
+      SELECT id, parent FROM grants WHERE id = ${grantId}
+      UNION ALL SELECT g.id, g.parent FROM grants g JOIN chain c ON g.id = c.parent)
+    UPDATE grants SET live_actions = live_actions + 1 WHERE id IN (SELECT id FROM chain)
+    RETURNING id, live_actions, constraints->>'maxLiveActions' AS max_live`;
+  if (rows.length === 0) throw new HttpError(401, "grant_revoked");
+  let over = rows.find((r) => r.max_live !== null && r.max_live !== void 0 && Number(r.live_actions) > Number(r.max_live));
+  if (over) throw new HttpError(403, "live_actions_used_up", { grant: over.id, max: Number(over.max_live) });
+  return rows.find((r) => r.id === grantId)?.live_actions ?? null;
+}
 export async function hostAbove(grantId) {
   return (
     await sql`WITH RECURSIVE up AS (SELECT * FROM grants WHERE id = ${grantId}
@@ -696,6 +713,8 @@ async function checkRateLimit(e) {
   return checkNamedRateLimit(e, RATE_LIMIT_MAX_PER_MIN);
 }
 export async function verifyGrant(e, t, a, countRate = !0) {
+  // The grant row once known, so a denial for reaching past its power can count as a strike (identity.js).
+  let seen = null;
   try {
     if (!e) throw new HttpError(401, "missing_grant");
     let n = parseGrantToken(e);
@@ -725,6 +744,9 @@ export async function verifyGrant(e, t, a, countRate = !0) {
     let i = await getTenant(s.tenant);
     if (!i || i.status !== "active") throw new HttpError(403, "tenant_suspended");
     if (await isKillSwitchOn()) throw new HttpError(503, "runtime_paused");
+    // Who this agent is, and whether it (or anything above it) is frozen: identity.js. Root grants pass.
+    await checkIdentity(s);
+    seen = s;
     let o = parseJson(s.caps);
     if (t && !o.includes(t))
       throw new HttpError(403, "missing_cap", {
@@ -755,7 +777,13 @@ export async function verifyGrant(e, t, a, countRate = !0) {
       token: e,
     };
   } catch (n) {
-    if (n instanceof HttpError) throw n;
+    if (n instanceof HttpError) {
+      // Reaching past its power: a strike toward self-quarantine. A strike that fails to record never
+      // changes the answer the caller gets.
+      if (seen && (n.code === "missing_cap" || n.code === "out_of_scope"))
+        await recordStrike(seen, n.code).catch((x) => console.error("[identity] strike", x?.message || x));
+      throw n;
+    }
     throw new HttpError(403, "verification_error");
   }
 }

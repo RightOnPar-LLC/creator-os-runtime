@@ -6,6 +6,7 @@ import { normalizeUsage, remainingBudget, TIERS } from "../policy.js";
 import { endedAbove, issueChildGrant, lowerGrantAutonomy, recordAutonomyRow, revokeGrantTree, settleGrantUsage } from "../grants.js";
 import { HOST_DEFAULT_BUDGET, HOST_DEFAULT_CAPS, HOST_DEFAULTS, HOST_TIERS, hostLimits, hostName } from "../hostpolicy.js";
 import { notATourReason } from "../tours.js";
+import { checkIdentity } from "../identity.js";
 import { AUTONOMY_LEVELS, autonomyOf } from "../autonomy.js";
 import { openEscrow, serializeEscrow } from "../escrow.js";
 import { deleteDeploy, deployWorker, refreshDeployStatus, restartDeploy, TEMPLATES } from "../railway.js";
@@ -253,12 +254,22 @@ app.post("/api/approvals/:id", requireGrant(null), async (e) => {
     throw new HttpError(409, reason);
   };
   if (await isKillSwitchOn()) await fail("kill_switch_on");
+  // A plan cheque past its date is void (0.3.6): the agent has to ask again with a fresh plan.
+  if (verdict === "approve" && ap.expires_at && new Date(ap.expires_at).getTime() <= Date.now()) await fail("cheque_expired");
   if (!g || g.status !== "active" || Number(g.exp) <= nowSec() || (await endedAbove(sql, g.id))) await fail("requesting_grant_not_active");
+  // A frozen or quarantined seat (or blueprint, anywhere above it) stops an already-approved action too (identity.js).
+  try {
+    await checkIdentity(g);
+  } catch (x) {
+    if (x instanceof HttpError) await fail(x.code);
+    throw x;
+  }
   let tenant = await getTenant(g.tenant),
     intent = parseJson(ap.intent),
     result;
   try {
-    if (ap.action === "deploy") result = await deployWorker({ row: g, tenant }, intent, !0, ap.requested_by, { approvedBy: t.row.id });
+    if (ap.action === "deploy")
+      result = await deployWorker({ row: g, tenant }, intent, !0, ap.requested_by, { approvedBy: t.row.id, cheque: !!ap.plan_hash });
     else if (ap.action === "escrow.open") {
       let r = await openEscrow(g, intent, ap.requested_by);
       await recordAutonomyRow(g, "autonomy-approved", ap.id, "escrow open approved by the owner", { autonomy: ap.autonomy, decision: "approved", approver: t.row.id });
