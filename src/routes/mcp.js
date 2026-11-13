@@ -1,11 +1,12 @@
+import { stagingProfile, assertStagingGrant, stagingTools, assertStagingTool } from "../staging-gateway.js";
 // Routes: MCP streamable-http endpoint. Registration order is significant.
 import { toolReceiptMiddleware, bindToolReceipt, bindPublicToolReceipt, readToolReceipts } from "../tool-receipts.js";
-import { armedIntegrations, SERVICE_NAME, VERSION } from "../config.js";
+import { env, armedIntegrations, SERVICE_NAME, VERSION } from "../config.js";
 import { HttpError, parseJson } from "../util.js";
 import { notATourReason } from "../tours.js";
 import { isKillSwitchOn, sql } from "../db.js";
 import { memoryPartitions, remainingBudget } from "../policy.js";
-import { issueChildGrant, revokeGrantTree, verifyGrant } from "../grants.js";
+import { issueChildGrant, revokeGrantTree, verifyGrant, settleGrantUsage } from "../grants.js";
 import { assertMemoryScope, forgetMemory, searchMemories, writeMemory } from "../memory.js";
 import { deployWorker, refreshDeployStatus } from "../railway.js";
 import { cogExecute, cogPlan } from "../cog.js";
@@ -31,7 +32,7 @@ app.get("/mcp", (e) =>
     : e.json({
     transport: "streamable-http",
     methods: ["initialize", "tools/list", "tools/call", "ping"],
-    tools: MCP_TOOLS.map((t) => t.name),
+    tools: stagingProfile(env) ? [] : MCP_TOOLS.map((t) => t.name),
     auth: "Bearer <grant>",
   }),
 );
@@ -44,6 +45,9 @@ app.post("/mcp", async (e) => {
         content: [{ type: "text", text: JSON.stringify(l) }],
         structuredContent: l,
       });
+  const staging = stagingProfile(env);
+  if (staging && n.method === "tools/call" && n.params?.name === "guest_welcome")
+    throw new HttpError(403, "staging_tool_denied");
   // THE ONE pre-grant door: keyless guest_welcome mints the SAME guest grant as the
   // public POST /api/guest — same sybil gate, same GUEST_CAPS envelope, same pool
   // breaker — and returns the welcome package. It never calls verifyGrant and always
@@ -68,9 +72,12 @@ app.post("/mcp", async (e) => {
         },
       );
   if (!t) return a("missing_grant");
+  let verifiedAuth;
   try {
     const verified = await verifyGrant(t, null);
+    verifiedAuth = verified;
     await bindToolReceipt(e, verified);
+    assertStagingGrant(verified, env);
   } catch (l) {
     if (l instanceof HttpError) {
       // 401 (missing/bad/expired/revoked grant) carries the OAuth discovery
@@ -111,7 +118,7 @@ app.post("/mcp", async (e) => {
   if (n.method === "tools/list")
     return e.json(
       jsonRpcResponse(r, {
-        tools: MCP_TOOLS,
+        tools: stagingTools(MCP_TOOLS, verifiedAuth, env),
       }),
     );
   if (n.method !== "tools/call")
@@ -124,6 +131,17 @@ app.post("/mcp", async (e) => {
   let s = n.params?.name,
     i = n.params?.arguments || {};
   try {
+    assertStagingTool(s, e.get("toolReceiptAuth"), env);
+    if (staging) {
+      const auth = e.get("toolReceiptAuth");
+      const cap = { tool_receipts: "ledger.read", ledger_query: "ledger.read", memory_search: "memory.read" }[s] || null;
+      await verifyGrant(t, cap, null, false);
+      try {
+        await settleGrantUsage(auth.row.id, { usd_cents: 0, calls: 1, deploys: 0 }, e.get("toolReceiptId"), "staging MCP invocation");
+      } catch (error) {
+        throw new HttpError(error.status === 402 ? 402 : 503, error.status === 402 ? "budget_exhausted" : "staging_meter_unavailable");
+      }
+    }
     if (s === "runtime_health") {
       await bindToolReceipt(e, e.get("toolReceiptAuth"), true);
       let E = !1;

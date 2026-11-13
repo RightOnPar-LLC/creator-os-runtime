@@ -120,3 +120,37 @@ Filed: draft PR https://github.com/RightOnPar-LLC/creator-os-runtime/pull/52; im
   Start page "Take a seat" button (DevDesk #120) calls the dry run, then the cheque.
 - **Merge note:** #89 also moves the route snapshot to 213 and edits `src/index.js` + `test/run.mjs`;
   whichever lands second rebases (snapshot regenerates with `UPDATE_SNAPSHOT=1 node test/run.mjs`).
+
+## 2026-11-03 — ordered staging rails build (codex, claim 651)
+
+User outcome: reuse Runtime grants/ledger/MESH/receipts, Market, DevDesk, Tower,
+cognitive-mcp and model-router. Build gateway, then evidence audit, then tap workflow.
+
+Phase 1 branch: codex/staging-capability-gateway-20261103, based on origin/master
+77bd369. Extends /mcp with an opt-in read-only staging envelope and transactional
+call charging. No Cloudflare dependencies, new memory or gateway service.
+See docs/specs/staging-capability-gateway.md for configuration and ordered acceptance.
+
+Validation: source retry 350 passed/0 failed; bundled artifact 350 passed/0 failed.
+First source run and isolated Market retry hit Windows Postgres connection-closed/setup
+timeouts; retained local logs test-staging-source.log and test-staging-market-retry.log.
+Successful runs: test-staging-source-retry.log and test-staging-dist.log.
+No production changes, live rollout, live grant issuance or live proof.
+
+Existing Railway sandbox confirmed: project 9225d746-82e5-4880-85d2-c646cde3e2e3,
+environment f4b7d936-5813-4558-bf0a-dbd9bb9997ad (display name production),
+runtime-staging service 254e1f91-1aa7-463a-9f95-76445fccaba5.
+Last observed deployment c6c67cc4-f010-4c21-902b-3181fc03eecd SUCCESS.
+Do not infer DB isolation from these names.
+
+BLOCKER: automatic review rejected bulk Railway variable-value retrieval to compare
+DB targets / check staging admin presence: unnecessary access to all secrets.
+No credential values were retrieved by that rejected action. Do not repeat or indirectly
+bypass it. Name-only OAuth read succeeded. Need a targeted approved isolation check
+and existing staging operator authority before provisioning a narrow test grant.
+No money/credential rotation, token creation, deploy or ACL change attempted.
+
+Next: inspect PR/CI, resolve the targeted staging check, deploy only isolated staging,
+capture live receipt IDs, then phase 2 signed audit bundle, then phase 3 durable tap engine.
+Do not build phases 2/3 in parallel or claim any phase live from local test results.
+Compounding: reusable lesson retained in spec; no new skill/listing until live proof.

@@ -7,7 +7,7 @@ import { checkNamedRateLimit } from "./grants.js";
 
 const DENIALS = new Set(["missing_grant", "bad_grant", "grant_expired", "grant_revoked",
   "tenant_suspended", "runtime_paused", "missing_cap", "out_of_scope", "rate_limited",
-  "verification_error", "gatehouse_denied", "autonomy_observe", "owner_approval_required"]);
+  "staging_grant_required", "staging_tool_denied", "budget_exhausted", "verification_error", "gatehouse_denied", "autonomy_observe", "owner_approval_required"]);
 // Persist only a closed vocabulary: an upstream error string can contain a secret.
 export function receiptOutcome(status, body, toolErrorStatus = status) {
   let failure = body?.error != null || body?.result?.isError === true || status >= 400;
