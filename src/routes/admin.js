@@ -369,6 +369,16 @@ app.get("/api/admin/deploys", requireAdmin, async (e) =>
       await sql`SELECT id, tenant, grant_id, name, template, status, executed, railway_service_id, target, created_at FROM deploys ORDER BY created_at DESC LIMIT 200`,
   }),
 );
+// The owner's seal (0.3.6): approvals across every world, newest first, with each plan cheque's plan,
+// hash and expiry. The cockpit and the card page read this; before 0.3.6 they asked for it and got a 404,
+// so a pending approval never showed in the cockpit.
+app.get("/api/admin/approvals", requireAdmin, async (e) =>
+  e.json({
+    approvals:
+      await sql`SELECT id, tenant, grant_id, action, intent, autonomy, status, requested_by, approver, created_at, decided_at, result, plan, plan_hash, expires_at
+        FROM approvals ORDER BY (status = 'pending') DESC, created_at DESC LIMIT 200`,
+  }),
+);
 app.get("/api/admin/ledger", requireAdmin, async (e) =>
   e.json({
     ledger: await sql`SELECT * FROM ledger ORDER BY id DESC LIMIT 300`,

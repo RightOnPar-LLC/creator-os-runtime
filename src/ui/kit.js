@@ -40,6 +40,6 @@ async function readMesh() {
   const D = { signed: false, health: await pub("/health"), tenants: [], grants: [], approvals: [], events: [] };
   try { await get("/api/admin/overview"); D.signed = true; } catch { return D; }
   const [t, g, a, e] = await Promise.all([get("/api/tenants").catch(() => ({})), get("/api/admin/grants?status=active&limit=1000").catch(() => ({})), get("/api/admin/approvals").catch(() => ({})), get("/api/admin/events").catch(() => ({}))]);
-  D.tenants = t.tenants || []; D.grants = (g.grants || []).filter(live); D.approvals = a.approvals || []; D.events = e.events || [];
+  D.tenants = t.tenants || []; D.grants = (g.grants || []).filter(live); D.approvals = (a.approvals || []).filter((x) => (x.status || "pending") === "pending"); D.events = e.events || [];
   return D;
 }

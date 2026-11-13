@@ -224,6 +224,7 @@ table.t tr:last-child td{border-bottom:0}
           <div style="display:flex;flex-direction:column;gap:4px">
             <span class="k"><span class="kick" id="lexKick">The Loupe · RightOnPar estate</span><span class="stamp" id="hall"><i></i>Hallmarked</span></span>
             <h1 id="title">Everyone and everything on your Mesh</h1>
+            <p style="margin:0;font-size:14px;color:var(--text2);line-height:1.45">This is the control room for Dw's Mesh — the place where he watches his agents, hands out access, and signs off on what they do.</p>
           </div>
           <div class="act" id="headAct"></div>
         </div>
@@ -344,7 +345,7 @@ async function route() {
   setHead(k);
   if (k === "connect") return connect(qs);
   if (!S.signed) return signin();
-  if (k === "") return overview();
+  if (k === "") { const ch = new URLSearchParams(qs).get("cheque"); if (ch) S.sel = ch; return overview(); }
   if (k === "grants") return accessView();
   if (k === "receipts" && new URLSearchParams(qs).has("toolReceipt")) return toolReceiptView(new URLSearchParams(qs).get("toolReceipt"));
   if (k === "memory") return memory();
@@ -415,7 +416,7 @@ function overview() {
   const seats = [...bySub.values()].sort((a, b) => (a.depth === 0) - (b.depth === 0) || b.at - a.at);
   const warrants = g.filter((x) => +x.depth > 0).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 5);
   const pulled = !!(S.health && S.health.killSwitch);
-  const pend = S.approvals.filter(inWorld);
+  const pend = S.approvals.filter(inWorld).filter((a) => (a.status || "pending") === "pending");
   if (S.sel && !pend.find((a) => a.id === S.sel)) S.sel = null;
   if (!S.sel && pend[0]) S.sel = pend[0].id;
   const worldsOn = [...new Set(g.map((x) => x.tenant))];
@@ -467,16 +468,41 @@ function pane() {
   $("pane").innerHTML = `
     <div style="display:flex;align-items:center;gap:10px"><span class="badge" style="width:34px;height:34px;border-radius:10px;background:#22332f;color:var(--accent);display:grid;place-items:center;font:600 11px var(--mono)">COG</span>
       <div style="display:flex;flex-direction:column"><span class="note">${esc(asker(a))} · ${esc(tname(a.tenant))}</span><h3>${esc(actionLabel(a))}</h3></div></div>
-    <pre class="intent" aria-label="What it wants to do">${esc(JSON.stringify(a.intent, null, 2))}</pre>
+    ${a.plan ? chequeHtml(a) : `<pre class="intent" aria-label="What it wants to do">${esc(JSON.stringify(a.intent, null, 2))}</pre>`}
     <div class="prov"><span style="padding-bottom:8px;color:var(--dim);letter-spacing:.12em;display:flex;align-items:center;gap:10px">PROVENANCE<span class="stamp"><i></i>Assayed</span></span>
       <div class="r"><span style="color:var(--accent)">●</span><span>grant</span><span>${esc(g ? who(g.sub).join(" · ") : a.grant_id)} · ${esc(a.grant_id)}</span></div>
       <div class="r"><span style="color:var(--accent)">●</span><span>asked</span><span>${esc(a.action)} · ${when(a.created_at)}</span></div>
       <div class="r"><span style="color:var(--accent)">●</span><span>stopped</span><span>at the seal · autonomy ${esc(lvl(a.autonomy))}</span></div>
       <div class="r"><span style="color:var(--gold)">●</span><span style="color:var(--gold)">sign-off</span><span style="color:var(--text)">waiting on you</span></div></div>
-    <div class="acts"><button class="btn seal" type="button" id="apOk">Approve</button><button class="btn" type="button" id="apNo">Deny</button></div>
+    <div class="acts"><button class="btn seal" type="button" id="apOk">${a.plan ? "Sign cheque" : "Approve"}</button><button class="btn" type="button" id="apNo">${a.plan ? "Decline" : "Deny"}</button></div>
     <div class="msg" id="apMsg"></div>`;
   $("apOk").onclick = () => decide(a, "approve");
   $("apNo").onclick = () => decide(a, "deny");
+}
+// A plan cheque (0.3.6): what will happen, in plain words, with the plan's fingerprint. Signing runs
+// exactly this plan once; if the plan changes before it runs, the cheque bounces and nothing runs.
+function chequeLeft(a) {
+  const ms = new Date(a.expires_at).getTime() - now();
+  if (!a.expires_at) return "";
+  if (ms <= 0) return "Expired";
+  const m = Math.floor(ms / 60000);
+  return m >= 120 ? Math.floor(m / 60) + "h left" : m + "m left";
+}
+function chequeHtml(a) {
+  const p = a.plan || {}, h = String(a.plan_hash || "");
+  const secrets = (p.env || []).filter((k) => !/^COS_/.test(k) && !/^WORKER_KIND$/.test(k));
+  const rows = [
+    ["New Railway service", `${p.name} · ${p.replicas || 1} replica${(p.replicas || 1) > 1 ? "s" : ""} · ${p.environment || "production"}`],
+    ["Builds from", p.source || "?"],
+    ["Costs about", money(p.estCents)],
+    ["Secrets it gets", secrets.length ? secrets.join(", ") : "none"],
+  ];
+  if ((p.missingEnv || []).length) rows.push(["Missing, will not start", p.missingEnv.join(", ")]);
+  return `<div class="cheque" aria-label="Plan cheque">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 6px"><span class="stamp"><i></i>Plan cheque · one use</span><span class="note">${esc(chequeLeft(a))}</span></div>
+    ${rows.map(([k, v]) => `<div class="r" style="display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid var(--line, rgba(255,255,255,.08))"><span class="note">${esc(k)}</span><span style="text-align:right">${esc(v)}</span></div>`).join("")}
+    <div style="display:flex;justify-content:space-between;padding:8px 0 2px"><span class="note">Fingerprint</span><span class="mono" title="${esc(h)}">${esc(h.slice(0, 4) + "…" + h.slice(-4))}</span></div>
+    <p class="note" style="margin:4px 0 0">If anything in this plan changes before it runs, the cheque bounces and nothing runs.</p></div>`;
 }
 // The owner decides with the world's ROOT grant (the runtime refuses any other): sign a token for it
 // from this session, use it once, drop it.
@@ -495,7 +521,8 @@ async function decide(a, verdict) {
     t = null;
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || "http " + r.status);
-    $("apMsg").textContent = verdict === "approve" ? "Sealed. It's running." : "Denied. The agent was told.";
+    const bounced = j.result?.reason === "plan_receipt_mismatch";
+    $("apMsg").textContent = verdict !== "approve" ? "Declined. The agent was told." : bounced ? "Cheque bounced: the plan changed after it was written. Nothing ran." : j.status === "approved_not_run" ? "Signed, but it could not run: " + (j.result?.reason || "unknown") : "Signed. It's running.";
     await refresh();
   } catch (e) { $("apMsg").innerHTML = `<span class="err">Couldn't ${verdict}: ${esc(e.message)}</span>`; $("apOk").disabled = $("apNo").disabled = false; }
 }

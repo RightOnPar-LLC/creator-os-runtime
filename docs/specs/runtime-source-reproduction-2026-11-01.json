@@ -1,0 +1,15 @@
+{
+  "at": "2026-11-01T16:45:01.847090+00:00",
+  "host": "meshtool",
+  "repo": "RightOnPar-LLC/creator-os-runtime",
+  "commit": "491e7c8845bd5be99826279a6c7b56ff0489c006",
+  "source": "src/index.js",
+  "builder": "Bun1.4.2",
+  "command": "bun build src/index.js --target=bun --minify --external hono --outfile <audit-artifact>",
+  "bytes": 181657,
+  "sha256": "35f18ea8d499064db78c66f7c5a6c43960671470440a8d505d079f46b719c269",
+  "productionReportedSha256": "35f18ea8d499064db78c66f7c5a6c43960671470440a8d505d079f46b719c269",
+  "matchesProductionAndStaging": true,
+  "archiveComparison": "live/runtime-0.3.4.bundle.js is a95845byte historical snapshot, not the current Dockerfile input",
+  "scope": "Read-only probes and offline audit build; no production configuration, credentials, deployment, grants, clients or spending changed"
+}

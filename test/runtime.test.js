@@ -21,14 +21,14 @@ describe("1. /health", () => {
     const h = r.json;
     expect(h.ok).toBe(true);
     expect(h.service).toBe("creator-os-runtime");
-    expect(h.version).toBe("0.3.4");
+    expect(h.version).toBe("0.3.7");
     expect(h.policy).toBe("p1");
     expect(h.db).toBe(true);
     expect(h.killSwitch).toBe(false);
     expect(h.armed).toEqual({
       admin: true, vault: true, railway: false, railwayOAuth: false, stripe: false,
       railwayWebhook: true, github: true, brain: true, mesh: true, ollama: false,
-      brainOut: false, cognitiveBridge: false, sync: false, lspMcp: true,
+      brainOut: false, cognitiveBridge: false, sync: false, lspMcp: true, ntfy: false,
     });
     // 2026-09-25: fingerprints are no longer public.
     expect(h.fingerprints).toBeUndefined();
@@ -55,7 +55,7 @@ describe("1. /health", () => {
   });
 
   test("exports", () => {
-    expect(mod.VERSION).toBe("0.3.4");
+    expect(mod.VERSION).toBe("0.3.7");
     expect(typeof mod.app.fetch).toBe("function");
     expect(typeof mod.gatehouseEvaluate).toBe("function");
     expect(typeof mod.attenuationViolations).toBe("function");
@@ -96,7 +96,7 @@ describe("2. route table", () => {
   test("/.well-known/creator-os.json", async () => {
     const r = await req("GET", "/.well-known/creator-os.json");
     expect(r.status).toBe(200);
-    expect(r.json.version).toBe("0.3.4");
+    expect(r.json.version).toBe("0.3.7");
     expect(r.json.caps).toEqual(mod.CAPS);
     expect(r.json.templates.probe).toEqual({ desc: "Tiny HTTP responder that proves the deploy path", needs: [], estCents: 25 });
   });
@@ -307,7 +307,7 @@ describe("4. MCP", () => {
 
   test("initialize + tools/list + ping + unknown method", async () => {
     const i = await mcp(t.token, "initialize", { protocolVersion: "2025-06-18" });
-    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.4" });
+    expect(i.json.result.serverInfo).toEqual({ name: "creator-os-runtime", version: "0.3.7" });
     expect(i.json.result.protocolVersion).toBe("2025-06-18");
     const l = await mcp(t.token, "tools/list", {}, 2);
     expect(l.json.id).toBe(2);
@@ -375,7 +375,7 @@ describe("4. MCP", () => {
 
   test("runtime_health + grant_verify tools", async () => {
     const h = await mcp(t.token, "tools/call", { name: "runtime_health" });
-    expect(h.json.result.structuredContent.version).toBe("0.3.4");
+    expect(h.json.result.structuredContent.version).toBe("0.3.7");
     const v = await mcp(t.token, "tools/call", { name: "grant_verify" });
     expect(v.json.result.structuredContent.sub).toBe("tenant:root");
   });
@@ -2797,7 +2797,7 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
       else process.env.ANTHROPIC_API_KEY = originalKey;
     }
     expect(s.status).toBe(200);
-    expect(s.json.version).toBe("0.3.4");
+    expect(s.json.version).toBe("0.3.7");
     expect(s.json.checks.find((check) => check.key === "cogPlanner")).toMatchObject({
       ok: true, providers: expect.arrayContaining(["Anthropic"]),
     });
@@ -6224,5 +6224,361 @@ describe("tool invocation receipts", () => {
     expect(r.status).toBe(200);
     expect(r.headers.get("x-runtime-receipt")).toBeNull();
     expect((await dbQuery("SELECT id FROM tool_receipts WHERE grant_id = $1", [t.grantId])).rows.length).toBe(0);
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("27. receipt-before-run (0.3.5): plan receipts and one-use grants", () => {
+  const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
+  const HEX64 = /^[0-9a-f]{64}$/;
+  // A pro tenant whose root grant may target one Railway project, so a deploy can get as far as Railway.
+  async function armedTenant(name) {
+    const t = await newTenant(name, "pro");
+    await dbQuery(
+      `UPDATE grants SET scope = jsonb_set(scope, '{railway}', '{"projects":["proj-rbr"],"environments":["production"]}'::jsonb) WHERE id = $1`,
+      [t.grantId],
+    );
+    return { ...t, prefix: (await verify(t.token)).scope.workers.namePrefix };
+  }
+  const child = (token, constraints = {}, extra = {}) =>
+    req("POST", "/api/grants", {
+      token,
+      body: {
+        sub: "agent:rbr",
+        caps: ["grant.issue", "grant.read", "deploy.worker", "worker.status"],
+        ttlSec: 3600,
+        budget: { usd_cents: 2000, calls: 20, deploys: 5 },
+        constraints,
+        ...extra,
+      },
+    });
+  // Arm the house Railway token for one block; every call to Railway is still blocked by the harness.
+  async function withRailway(fn) {
+    const saved = process.env.RAILWAY_API_TOKEN;
+    process.env.RAILWAY_API_TOKEN = "test-house-railway-token";
+    try {
+      return await fn();
+    } finally {
+      if (saved === undefined) delete process.env.RAILWAY_API_TOKEN;
+      else process.env.RAILWAY_API_TOKEN = saved;
+    }
+  }
+  const railwayCalls = () => blockedFetches.filter((u) => u.includes("railway")).length;
+  const deployRow = async (id) => (await dbQuery("SELECT * FROM deploys WHERE id = $1", [id])).rows[0];
+  const liveActions = async (id) => (await dbQuery("SELECT live_actions FROM grants WHERE id = $1", [id])).rows[0].live_actions;
+
+  test("every deploy answer carries a planHash, and the dry-run row stores it", async () => {
+    const t = await armedTenant("rbr-hash");
+    const d = await req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "h1", template: "probe" } });
+    expect(d.status).toBe(201);
+    expect(d.json.planHash).toMatch(HEX64);
+    expect((await deployRow(d.json.id)).plan_hash).toBe(d.json.planHash);
+  });
+
+  test("the plan hash leaves out the grant id, so a parent's sim is a valid receipt for its child", async () => {
+    const t = await armedTenant("rbr-same");
+    const c = await child(t.token);
+    const a = await req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "s1", template: "probe" } });
+    const b = await req("POST", "/api/deploys", { token: c.json.token, body: { name: t.prefix + "s1", template: "probe" } });
+    expect(a.json.planHash).toBe(b.json.planHash);
+    const other = await req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "s2", template: "probe" } });
+    expect(other.json.planHash).not.toBe(a.json.planHash);
+  });
+
+  test("CONTROL: requirePlanReceipt — confirm:true alone does not run; it is a dry run that hands back the receipt", async () => {
+    const t = await armedTenant("rbr-req");
+    const c = await child(t.token, { requirePlanReceipt: true });
+    expect(c.status).toBe(201);
+    const before = railwayCalls();
+    const d = await withRailway(() =>
+      req("POST", "/api/deploys", { token: c.json.token, body: { name: t.prefix + "r1", template: "probe", confirm: true } }),
+    );
+    expect(d.status).toBe(201);
+    expect(d.json.executed).toBe(false);
+    expect(d.json.status).toBe("dry_run");
+    expect(d.json.reason).toBe("plan_receipt_required");
+    expect(d.json.planHash).toMatch(HEX64);
+    expect(railwayCalls()).toBe(before);
+    expect(await liveActions(c.json.id)).toBe(0);
+  });
+
+  test("CONTROL: AUTONOMOUS_DEPLOYS does not skip a required plan receipt", async () => {
+    const t = await armedTenant("rbr-auto");
+    const c = await child(t.token, { requirePlanReceipt: true });
+    const saved = process.env.AUTONOMOUS_DEPLOYS;
+    process.env.AUTONOMOUS_DEPLOYS = "1";
+    try {
+      const before = railwayCalls();
+      const d = await withRailway(() => req("POST", "/api/deploys", { token: c.json.token, body: { name: t.prefix + "a1", template: "probe" } }));
+      expect(d.json.reason).toBe("plan_receipt_required");
+      expect(railwayCalls()).toBe(before);
+    } finally {
+      if (saved === undefined) delete process.env.AUTONOMOUS_DEPLOYS;
+      else process.env.AUTONOMOUS_DEPLOYS = saved;
+    }
+  });
+
+  test("CONTROL: a planHash for a different plan is refused as plan_receipt_mismatch, nothing runs", async () => {
+    const t = await armedTenant("rbr-mismatch");
+    const sim = await req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "m1", template: "probe" } });
+    const before = railwayCalls();
+    const d = await withRailway(() =>
+      req("POST", "/api/deploys", {
+        token: t.token,
+        body: { name: t.prefix + "m1", template: "probe", replicas: 1, env: { EXTRA: "changed" }, confirm: true, planHash: sim.json.planHash },
+      }),
+    );
+    expect(d.json.executed).toBe(false);
+    expect(d.json.reason).toBe("plan_receipt_mismatch");
+    expect(railwayCalls()).toBe(before);
+    expect((await deployRow(sim.json.id)).plan_consumed_at).toBeNull();
+  });
+
+  test("a matching receipt runs once: the sim is spent, the live action is counted, a second run needs a new sim", async () => {
+    const t = await armedTenant("rbr-once");
+    const c = await child(t.token, { requirePlanReceipt: true });
+    const sim = await req("POST", "/api/deploys", { token: c.json.token, body: { name: t.prefix + "o1", template: "probe" } });
+    expect(sim.json.status).toBe("dry_run"); // a first run with no confirm is the requireDryRun sim
+    const before = railwayCalls();
+    const live = await withRailway(() =>
+      req("POST", "/api/deploys", { token: c.json.token, body: { name: t.prefix + "o1", template: "probe", confirm: true, planHash: sim.json.planHash } }),
+    );
+    // Railway itself is blocked under test, so the call fails AFTER the gate let it through.
+    expect(railwayCalls()).toBe(before + 1);
+    expect(live.status).not.toBe(201);
+    expect((await deployRow(sim.json.id)).plan_consumed_at).not.toBeNull();
+    expect(await liveActions(c.json.id)).toBe(1);
+    // the same receipt again: already spent
+    const again = await withRailway(() =>
+      req("POST", "/api/deploys", { token: c.json.token, body: { name: t.prefix + "o1", template: "probe", confirm: true, planHash: sim.json.planHash } }),
+    );
+    expect(again.json.executed).toBe(false);
+    expect(again.json.reason).toBe("plan_receipt_missing");
+    expect(railwayCalls()).toBe(before + 1);
+  });
+
+  test("CONTROL: a receipt older than PLAN_RECEIPT_TTL_SEC is not accepted", async () => {
+    const t = await armedTenant("rbr-old");
+    const sim = await req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "x1", template: "probe" } });
+    await dbQuery("UPDATE deploys SET created_at = now() - interval '20 minutes' WHERE id = $1", [sim.json.id]);
+    const before = railwayCalls();
+    const d = await withRailway(() =>
+      req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "x1", template: "probe", confirm: true, planHash: sim.json.planHash } }),
+    );
+    expect(d.json.reason).toBe("plan_receipt_missing");
+    expect(railwayCalls()).toBe(before);
+  });
+
+  test("CONTROL: a child cannot turn requirePlanReceipt off", async () => {
+    const t = await armedTenant("rbr-loosen");
+    const c = await child(t.token, { requirePlanReceipt: true });
+    const gc = await child(c.json.token, { requirePlanReceipt: false }, { budget: { usd_cents: 100, calls: 5, deploys: 1 } });
+    expect(gc.status).toBe(201);
+    expect((await verify(gc.json.token)).constraints.requirePlanReceipt).toBe(true);
+  });
+
+  test("one-use grant: the parent sims, a maxLiveActions:1 child runs it, and its second live action is refused", async () => {
+    const t = await armedTenant("rbr-oneuse");
+    const one = await child(t.token, { maxLiveActions: 1 });
+    expect(one.status).toBe(201);
+    expect((await verify(one.json.token)).constraints.maxLiveActions).toBe(1);
+    const sim1 = await req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "u1", template: "probe" } });
+    await withRailway(() =>
+      req("POST", "/api/deploys", { token: one.json.token, body: { name: t.prefix + "u1", template: "probe", confirm: true, planHash: sim1.json.planHash } }),
+    );
+    expect(await liveActions(one.json.id)).toBe(1);
+    const sim2 = await req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "u2", template: "probe" } });
+    const before = railwayCalls();
+    const second = await withRailway(() =>
+      req("POST", "/api/deploys", { token: one.json.token, body: { name: t.prefix + "u2", template: "probe", confirm: true, planHash: sim2.json.planHash } }),
+    );
+    expect(second.json.executed).toBe(false);
+    expect(second.json.reason).toBe("live_actions_used_up");
+    expect(railwayCalls()).toBe(before);
+    // refused together: the receipt was not spent by the refused action
+    expect((await deployRow(sim2.json.id)).plan_consumed_at).toBeNull();
+    expect(await liveActions(one.json.id)).toBe(1);
+  });
+
+  test("CONTROL: a one-use parent cannot be multiplied by minting children — the count is up the chain", async () => {
+    const t = await armedTenant("rbr-chain");
+    const p = await child(t.token, { maxLiveActions: 1 });
+    const c1 = await child(p.json.token, { maxLiveActions: 5 }, { budget: { usd_cents: 500, calls: 5, deploys: 2 } });
+    const c2 = await child(p.json.token, {}, { budget: { usd_cents: 500, calls: 5, deploys: 2 } });
+    expect((await verify(c1.json.token)).constraints.maxLiveActions).toBe(1); // clamped to the parent
+    expect((await verify(c2.json.token)).constraints.maxLiveActions).toBe(1); // inherited
+    const sim1 = await req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "c1", template: "probe" } });
+    await withRailway(() =>
+      req("POST", "/api/deploys", { token: c1.json.token, body: { name: t.prefix + "c1", template: "probe", confirm: true, planHash: sim1.json.planHash } }),
+    );
+    const sim2 = await req("POST", "/api/deploys", { token: t.token, body: { name: t.prefix + "c2", template: "probe" } });
+    const before = railwayCalls();
+    const d = await withRailway(() =>
+      req("POST", "/api/deploys", { token: c2.json.token, body: { name: t.prefix + "c2", template: "probe", confirm: true, planHash: sim2.json.planHash } }),
+    );
+    expect(d.json.reason).toBe("live_actions_used_up");
+    expect(railwayCalls()).toBe(before);
+    expect(await liveActions(p.json.id)).toBe(1);
+  });
+
+  test("deploy_worker over MCP advertises planHash", async () => {
+    const t = await newTenant("rbr-mcp");
+    const l = await mcp(t.token, "tools/list", {});
+    const tool = l.json.result.tools.find((x) => x.name === "deploy_worker");
+    expect(tool.inputSchema.properties.planHash.type).toBe("string");
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("28. plan cheques (0.3.6): the owner signs the exact plan", () => {
+  const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
+  async function askingAgent(name) {
+    const root = await newTenant(name, "pro");
+    await dbQuery(
+      `UPDATE grants SET scope = jsonb_set(scope, '{railway}', '{"projects":["proj-chq"],"environments":["production"]}'::jsonb) WHERE id = $1`,
+      [root.grantId],
+    );
+    const c = await req("POST", "/api/grants", {
+      token: root.token,
+      body: { sub: "agent:cheque", caps: ["deploy.worker", "grant.read"], ttlSec: 3600, budget: { usd_cents: 2000, calls: 10, deploys: 2 }, constraints: { autonomy: "ask" } },
+    });
+    expect(c.status).toBe(201);
+    return { root, agent: c.json, prefix: (await verify(c.json.token)).scope.workers.namePrefix };
+  }
+  async function withRailway(fn) {
+    const saved = process.env.RAILWAY_API_TOKEN;
+    process.env.RAILWAY_API_TOKEN = "test-house-railway-token";
+    try { return await fn(); } finally { if (saved === undefined) delete process.env.RAILWAY_API_TOKEN; else process.env.RAILWAY_API_TOKEN = saved; }
+  }
+  const railwayCalls = () => blockedFetches.filter((u) => u.includes("railway")).length;
+
+  test("an ask writes a cheque: plan, fingerprint, expiry and a link", async () => {
+    const { agent, prefix } = await askingAgent("chq-write");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "w1", template: "probe" } });
+    expect(d.json.status).toBe("awaiting_approval");
+    expect(d.json.planHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(d.json.plan.name).toBe(prefix + "w1");
+    expect(d.json.approval.link).toContain("#/?cheque=" + d.json.id);
+    const row = (await dbQuery("SELECT * FROM approvals WHERE id = $1", [d.json.id])).rows[0];
+    expect(row.plan_hash).toBe(d.json.planHash);
+    expect(row.intent.planHash).toBe(d.json.planHash);
+    expect(new Date(row.expires_at).getTime()).toBeGreaterThan(Date.now() + 3600e3);
+    const ev = (await dbQuery("SELECT data FROM events WHERE type = 'cheque.issued' AND data->>'approval' = $1", [d.json.id])).rows[0];
+    expect(ev.data.link).toBe(d.json.approval.link);
+  });
+
+  test("the cockpit can list approvals: GET /api/admin/approvals answers, pending first, with the cheque", async () => {
+    const { agent, prefix } = await askingAgent("chq-list");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "l1", template: "probe" } });
+    const r = await admin("GET", "/api/admin/approvals");
+    expect(r.status).toBe(200);
+    const mine = r.json.approvals.find((a) => a.id === d.json.id);
+    expect(mine.status).toBe("pending");
+    expect(mine.plan_hash).toBe(d.json.planHash);
+    expect(r.json.approvals[0].status).toBe("pending");
+    expect((await req("GET", "/api/admin/approvals")).status).toBe(401);
+  });
+
+  test("signing runs the exact plan once, using the cheque as its receipt", async () => {
+    const { root, agent, prefix } = await askingAgent("chq-sign");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "s1", template: "probe" } });
+    const before = railwayCalls();
+    const ok = await withRailway(() => req("POST", `/api/approvals/${d.json.id}`, { token: root.token, body: { decision: "approve" } }));
+    // Railway itself is blocked under test, so it fails after the cheque let it through.
+    expect(railwayCalls()).toBe(before + 1);
+    expect(ok.status).not.toBe(200);
+    expect((await dbQuery("SELECT live_actions FROM grants WHERE id = $1", [agent.id])).rows[0].live_actions).toBe(1);
+    const again = await req("POST", `/api/approvals/${d.json.id}`, { token: root.token, body: { decision: "approve" } });
+    expect(again.status).toBe(404);
+  });
+
+  test("CONTROL: a plan that changed after the cheque was written bounces, nothing runs", async () => {
+    const { root, agent, prefix } = await askingAgent("chq-bounce");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "b1", template: "probe" } });
+    await dbQuery(`UPDATE approvals SET intent = jsonb_set(intent, '{replicas}', '2'::jsonb) WHERE id = $1`, [d.json.id]);
+    await dbQuery(`UPDATE tenants SET tier = 'studio' WHERE id = $1`, [root.id]);
+    await dbQuery(`UPDATE grants SET constraints = jsonb_set(constraints, '{maxReplicas}', '4'::jsonb) WHERE id = $1 OR id = $2`, [root.grantId, agent.id]);
+    const before = railwayCalls();
+    const ok = await withRailway(() => req("POST", `/api/approvals/${d.json.id}`, { token: root.token, body: { decision: "approve" } }));
+    expect(ok.status).toBe(200);
+    expect(ok.json.status).toBe("approved_not_run");
+    expect(ok.json.result.reason).toBe("plan_receipt_mismatch");
+    expect(railwayCalls()).toBe(before);
+  });
+
+  test("CONTROL: an expired cheque cannot be signed", async () => {
+    const { root, agent, prefix } = await askingAgent("chq-expired");
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "e1", template: "probe" } });
+    await dbQuery("UPDATE approvals SET expires_at = now() - interval '1 minute' WHERE id = $1", [d.json.id]);
+    const before = railwayCalls();
+    const ok = await withRailway(() => req("POST", `/api/approvals/${d.json.id}`, { token: root.token, body: { decision: "approve" } }));
+    expect(ok.status).toBe(409);
+    expect(ok.json.error).toBe("cheque_expired");
+    expect(railwayCalls()).toBe(before);
+  });
+});
+
+// ------------------------------------------------------------------------------------
+describe("29. cheque push to the owner's phone (0.3.7, ntfy)", () => {
+  const verify = async (token) => (await req("GET", "/api/grants/verify", { token })).json;
+  const TOPIC_URL = "https://ntfy.sh/rbr-test-topic-0123456789";
+  async function askingAgent(name) {
+    const root = await newTenant(name, "pro");
+    const c = await req("POST", "/api/grants", {
+      token: root.token,
+      body: { sub: "agent:pusher", caps: ["deploy.worker", "grant.read"], ttlSec: 3600, budget: { usd_cents: 2000, calls: 10, deploys: 2 }, constraints: { autonomy: "ask" } },
+    });
+    return { agent: c.json, prefix: (await verify(c.json.token)).scope.workers.namePrefix };
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 150));
+  const events = async (type, approval) =>
+    (await dbQuery("SELECT data FROM events WHERE type = $1 AND data->>'approval' = $2", [type, approval])).rows;
+
+  test("unarmed: no push is tried, and /health says ntfy:false", async () => {
+    const { agent, prefix } = await askingAgent("push-off");
+    const before = blockedFetches.filter((u) => u.includes("ntfy")).length;
+    const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "p0", template: "probe" } });
+    expect(d.json.status).toBe("awaiting_approval");
+    await settle();
+    expect(blockedFetches.filter((u) => u.includes("ntfy")).length).toBe(before);
+    expect((await req("GET", "/health")).json.armed.ntfy).toBe(false);
+  });
+
+  test("armed: the cheque is pushed to the topic, and a failed push never fails the ask", async () => {
+    process.env.NTFY_URL = TOPIC_URL;
+    try {
+      expect((await req("GET", "/health")).json.armed.ntfy).toBe(true);
+      const { agent, prefix } = await askingAgent("push-on");
+      const before = blockedFetches.filter((u) => u === TOPIC_URL).length;
+      const d = await req("POST", "/api/deploys", { token: agent.token, body: { name: prefix + "p1", template: "probe" } });
+      expect(d.status).toBe(201);
+      expect(d.json.status).toBe("awaiting_approval");
+      await settle();
+      expect(blockedFetches.filter((u) => u === TOPIC_URL).length).toBe(before + 1);
+      // the harness blocks the network, so the push is recorded as failed, and the cheque still stands
+      expect((await events("cheque.push_failed", d.json.id)).length).toBe(1);
+      expect((await dbQuery("SELECT status FROM approvals WHERE id = $1", [d.json.id])).rows[0].status).toBe("pending");
+    } finally {
+      delete process.env.NTFY_URL;
+    }
+  });
+
+  test("the push carries the link to that cheque and no plan secrets", async () => {
+    const { chequePush } = await import("../src/notify.js");
+    const p = chequePush({ approval: "ap_x", name: "t-abc-w1", estCents: 60, link: "https://runtime.meshtool.ai/#/?cheque=ap_x", expiresInSec: 86400, asker: "agent:scout" });
+    expect(p.headers.Click).toBe("https://runtime.meshtool.ai/#/?cheque=ap_x");
+    expect(p.headers.Actions).toContain("https://runtime.meshtool.ai/#/?cheque=ap_x");
+    expect(p.body).toContain("$0.60");
+    expect(p.body).toContain("24h");
+    for (const v of Object.values(p.headers)) expect(/^[\x20-\x7e]*$/.test(v)).toBe(true);
+  });
+
+  test("CONTROL: a topic URL that is not https or has a guessable topic does not arm", async () => {
+    const { ntfyArmed } = await import("../src/notify.js");
+    for (const bad of ["http://ntfy.sh/rbr-test-topic-0123456789", "https://ntfy.sh/abc", "https://ntfy.sh/", "not a url"]) {
+      process.env.NTFY_URL = bad;
+      expect(ntfyArmed()).toBe(false);
+    }
+    delete process.env.NTFY_URL;
   });
 });

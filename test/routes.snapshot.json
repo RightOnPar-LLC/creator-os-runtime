@@ -1,5 +1,5 @@
 {
-  "count": 207,
+  "count": 217,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -53,6 +53,8 @@
     "GET /api/admin/grants",
     "GET /api/admin/deploys",
     "GET /api/admin/deploys",
+    "GET /api/admin/approvals",
+    "GET /api/admin/approvals",
     "GET /api/admin/ledger",
     "GET /api/admin/ledger",
     "GET /api/admin/webhooks",
@@ -206,6 +208,14 @@
     "POST /api/admin/identity/unfreeze",
     "GET /api/identity/me",
     "GET /api/identity/me",
+    "POST /api/admin/seats/mint",
+    "POST /api/admin/seats/mint",
+    "GET /api/admin/seats/mints",
+    "GET /api/admin/seats/mints",
+    "GET /.well-known/openid-configuration",
+    "GET /.well-known/jwks.json",
+    "POST /api/admin/identity/oidc-token",
+    "POST /api/admin/identity/oidc-token",
     "GET /routes",
     "GET /selftest"
   ],
@@ -236,6 +246,7 @@
     "GET /api/admin/overview :: admin",
     "GET /api/admin/grants :: admin",
     "GET /api/admin/deploys :: admin",
+    "GET /api/admin/approvals :: admin",
     "GET /api/admin/ledger :: admin",
     "GET /api/admin/webhooks :: admin",
     "GET /api/admin/events :: admin",
@@ -327,6 +338,11 @@
     "POST /api/admin/identity/freeze :: admin",
     "POST /api/admin/identity/unfreeze :: admin",
     "GET /api/identity/me :: grant",
+    "POST /api/admin/seats/mint :: admin",
+    "GET /api/admin/seats/mints :: admin",
+    "GET /.well-known/openid-configuration :: public",
+    "GET /.well-known/jwks.json :: public",
+    "POST /api/admin/identity/oidc-token :: admin",
     "GET /routes :: public",
     "GET /selftest :: public"
   ]
