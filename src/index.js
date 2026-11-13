@@ -28,6 +28,7 @@ import "./routes/sso.js";
 import "./routes/a2a.js";
 import "./routes/cockpit.js";
 import "./routes/identity.js";
+import "./routes/seats.js";
 import "./routes/oidc.js";
 import "./routes/meta.js";
 

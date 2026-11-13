@@ -11,7 +11,7 @@
 // Re-seating an agent never lifts a freeze; only unfreeze does. Every change writes an identity.* event.
 import { HttpError } from "../util.js";
 import { getTenant, recordEvent, sql } from "../db.js";
-import { blastRadius, identityMode, paperworkProblem, setIdentityMode, strikeLimit, unseatedAgents } from "../identity.js";
+import { blastRadius, identityMode, paperworkProblem, setIdentityMode, strikeLimit, unseatedAgents, upsertSeat } from "../identity.js";
 import { app, readJsonBody, requireAdmin, requireGrant } from "../http.js";
 
 var BLUEPRINT_ID = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
@@ -43,7 +43,7 @@ function targetOf(b) {
 async function subsInBlueprint(tenant, blueprint) {
   return (await sql`SELECT sub FROM agents WHERE tenant = ${tenant} AND blueprint = ${blueprint} ORDER BY sub`).map((r) => r.sub);
 }
-var seatView = (a) => ({
+export var seatView = (a) => ({
   tenant: a.tenant,
   sub: a.sub,
   blueprint: a.blueprint,
@@ -89,20 +89,8 @@ app.put("/api/admin/identity/agents", requireAdmin, async (e) => {
     sub = subOf(b),
     sponsor = text(b.sponsor, 120);
   if (!sponsor) throw new HttpError(400, "sponsor_required", { hint: "the human accountable for why this agent exists" });
-  let blueprint = blueprintOf(b),
-    every = b.attestEveryDays == null ? 30 : Number(b.attestEveryDays);
-  if (!Number.isInteger(every) || every < 0 || every > 365) throw new HttpError(400, "bad_attest_every_days", { range: "0-365, 0 = never lapses" });
-  let expires = b.expiresAt ? new Date(b.expiresAt) : null;
-  if (expires && isNaN(expires.getTime())) throw new HttpError(400, "bad_expires_at");
-  if (blueprint) await sql`INSERT INTO blueprints (tenant, id) VALUES (${t.id}, ${blueprint}) ON CONFLICT DO NOTHING`;
-  let [row] = await sql`
-    INSERT INTO agents (tenant, sub, blueprint, sponsor, owner, purpose, attest_every_days, attested_at, attested_by, expires_at)
-    VALUES (${t.id}, ${sub}, ${blueprint}, ${sponsor}, ${text(b.owner, 120)}, ${text(b.purpose, 500)}, ${every}, now(), ${sponsor}, ${expires})
-    ON CONFLICT (tenant, sub) DO UPDATE SET blueprint = EXCLUDED.blueprint, sponsor = EXCLUDED.sponsor, owner = EXCLUDED.owner,
-      purpose = EXCLUDED.purpose, attest_every_days = EXCLUDED.attest_every_days, attested_at = now(), attested_by = EXCLUDED.sponsor,
-      expires_at = EXCLUDED.expires_at, updated_at = now()
-    RETURNING *, (xmax = 0) AS created`;
-  await recordEvent(row.created ? "identity.seated" : "identity.reseated", { sub, blueprint, sponsor, owner: row.owner }, t.id, "admin");
+  let row = await upsertSeat(t.id, sub, { ...b, sponsor, blueprint: blueprintOf(b) });
+  await recordEvent(row.created ? "identity.seated" : "identity.reseated", { sub, blueprint: row.blueprint, sponsor, owner: row.owner }, t.id, "admin");
   return e.json(seatView(row), row.created ? 201 : 200);
 });
 

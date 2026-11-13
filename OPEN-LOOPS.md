@@ -98,3 +98,25 @@ Filed: draft PR https://github.com/RightOnPar-LLC/creator-os-runtime/pull/52; im
   get tagged `tag:mainstream`/`tag:adult` directly or a new `tag:agent-seat` is added so agent
   identities are distinguishable from device identities in the tailwall ACL (recommended: the new
   tag, scoped narrow on the credential, so a compromised seat token can't self-declare into a lane).
+
+## 2026-11-11 Seat mint: one call makes a whole seat (DevDesk #95)
+
+- **State:** built and tested (396/0 across the full suite; new `test/seats.test.js`, 15 tests). New:
+  `POST /api/admin/seats/mint` and `GET /api/admin/seats/mints` (admin-only), table `seat_mints`.
+- **What one call does:** claims the payment (one rail + payment ref mints one seat, ever: a retried
+  webhook replays), opens a TOUR for the seat (24-hour keys renewed to an end date, budget set once:
+  no long-lived key), seats the agent (sponsor/owner/blueprint, via the now-shared `upsertSeat` in
+  identity.js), writes SOUL.md / MEMORY.md / MATRIX.md into `agent:<name>:seat` (MATRIX.md is
+  generated from the tour's grant, so it cannot drift from the real power), and leaves a receipt
+  (`seat_mints` row + `seat.minted` event). A seat never holds more budget than was paid. Any
+  failure after the claim undoes the tour, the seat row and the files, and marks the claim `failed`
+  so the same payment can be retried. `dryRun` writes nothing.
+- **Built on, not beside:** tours.js (time + money), identity.js (seat + freezes), memory.js (files).
+  No new grant, key or freeze logic.
+- **Destination:** runtime.meshtool.ai. Issues keys, so the PR carries `needs-human` — DW merges.
+- **Next steps (not built):** (1) PayRail → mint: a paid self-serve seat arrives as a plan cheque
+  the owner signs, which then calls this route (no unattended mint from a webhook). (2) once #89
+  (OIDC) merges, the seat's OIDC subject is `<tenant>/agent:<name>`, no extra wiring. (3) the
+  Start page "Take a seat" button (DevDesk #120) calls the dry run, then the cheque.
+- **Merge note:** #89 also moves the route snapshot to 213 and edits `src/index.js` + `test/run.mjs`;
+  whichever lands second rebases (snapshot regenerates with `UPDATE_SNAPSHOT=1 node test/run.mjs`).
