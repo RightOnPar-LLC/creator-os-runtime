@@ -1,5 +1,5 @@
 {
-  "count": 213,
+  "count": 217,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -212,6 +212,10 @@
     "POST /api/admin/seats/mint",
     "GET /api/admin/seats/mints",
     "GET /api/admin/seats/mints",
+    "GET /.well-known/openid-configuration",
+    "GET /.well-known/jwks.json",
+    "POST /api/admin/identity/oidc-token",
+    "POST /api/admin/identity/oidc-token",
     "GET /routes",
     "GET /selftest"
   ],
@@ -336,6 +340,9 @@
     "GET /api/identity/me :: grant",
     "POST /api/admin/seats/mint :: admin",
     "GET /api/admin/seats/mints :: admin",
+    "GET /.well-known/openid-configuration :: public",
+    "GET /.well-known/jwks.json :: public",
+    "POST /api/admin/identity/oidc-token :: admin",
     "GET /routes :: public",
     "GET /selftest :: public"
   ]

@@ -45,4 +45,5 @@ const market = run(["market.test.js"]);
 const identity = run(["identity.test.js"]);
 const access = run(["access-view.test.js"]);
 const seats = run(["seats.test.js"]);
-process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1));
+const oidc = run(["oidc.test.js"]);
+process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1) || (oidc.status ?? 1));

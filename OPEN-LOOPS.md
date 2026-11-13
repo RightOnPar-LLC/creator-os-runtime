@@ -73,6 +73,32 @@ Filed: draft PR https://github.com/RightOnPar-LLC/creator-os-runtime/pull/52; im
 - **Next step (not built):** push `cheque.issued` to DW's phone. Needs a push channel the runtime can reach (no push integration exists in the runtime today).
 
 
+## 2026-11-11 OIDC issuer for agent seats (DevDesk #128)
+
+- **State:** built and tested (391/0 across the full suite, incl. a dedicated `test/oidc.test.js` that
+  signs, cryptographically verifies against the published JWKS, confirms tamper detection, and
+  confirms freeze/paperwork gating). New: `GET /.well-known/openid-configuration`, `GET
+  /.well-known/jwks.json` (both public, no auth — a relying party fetches these on its own), `POST
+  /api/admin/identity/oidc-token` (admin-only; mints an ES256-signed ID token for one seat, refused
+  the same way the grant door already refuses an unseated/frozen/quarantined seat — reuses
+  `identity.js`'s `paperworkProblem`/freeze checks rather than a second set of rules).
+- **Why:** tailwall (the estate's Tailscale tailnet) needs agent seats to join with a short-lived
+  verified identity instead of a static auth key. gatehouse was considered and ruled out — it's a
+  localhost-only bearer broker by design, not meant to be internet-exposed, and has no asymmetric
+  signing. This runtime already signs things (`GRANT_SIGNING_KEY`) and is already public
+  (runtime.meshtool.ai), so it's the natural issuer; the new ES256 keypair is separate from
+  `GRANT_SIGNING_KEY` (symmetric, internal-only) and from the Ed25519 SSO pass/notice verification
+  in `sso.js` (verifies FROM id.meshtool.ai, doesn't sign).
+- **Destination:** runtime.meshtool.ai. Touches auth/identity (new token-issuance surface), so the
+  PR carries `needs-human` per the estate's auto-merge policy — DW merges.
+- **Not built (human action, outside this runtime):** the Tailscale-side half. In Tailscale's admin
+  console, Settings → Trust credentials → + Credential → OpenID Connect → Custom issuer, pointed at
+  `https://runtime.meshtool.ai`. That step hands back a Client ID and Audience; the Audience is what
+  callers pass as `aud` to `POST /api/admin/identity/oidc-token`. Also undecided: whether agent seats
+  get tagged `tag:mainstream`/`tag:adult` directly or a new `tag:agent-seat` is added so agent
+  identities are distinguishable from device identities in the tailwall ACL (recommended: the new
+  tag, scoped narrow on the credential, so a compromised seat token can't self-declare into a lane).
+
 ## 2026-11-11 Seat mint: one call makes a whole seat (DevDesk #95)
 
 - **State:** built and tested (396/0 across the full suite; new `test/seats.test.js`, 15 tests). New:
