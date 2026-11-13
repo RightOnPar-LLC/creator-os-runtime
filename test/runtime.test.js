@@ -166,6 +166,8 @@ describe("3. OAuth 2.1 + PKCE client flow", () => {
     expect(r.headers.get("content-type")).toContain("text/html");
     expect(r.text).toContain("Approve connector");
     expect(r.text).toContain("product:devdesk");
+    expect(r.text).toContain("20 deployments");
+    expect(r.text).toContain("Your workspace may allow less");
     expect(r.text).not.toContain("<x>");
     const noPkce = await req("GET", "/oauth/authorize?" + new URLSearchParams({ client_id: clientId, redirect_uri: redirect }));
     expect(noPkce.status).toBe(400);
@@ -2785,9 +2787,31 @@ describe("8. extras: grants, deploys, cog, docs, status", () => {
   });
 
   test("status report runs; every outbound call was blocked and is a known probe", async () => {
-    const s = await req("GET", "/status.json");
+    const originalKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-configured-no-model-call";
+    let s;
+    try {
+      s = await req("GET", "/status.json");
+    } finally {
+      if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = originalKey;
+    }
     expect(s.status).toBe(200);
     expect(s.json.version).toBe("0.3.7");
+    expect(s.json.checks.find((check) => check.key === "cogPlanner")).toMatchObject({
+      ok: true, providers: expect.arrayContaining(["Anthropic"]),
+    });
+    expect(s.json.bodies.find((body) => body.name === "MeshMarket")).toMatchObject({
+      up: false, connected: false, connection: "setup_unavailable",
+    });
+    const statusPage = await req("GET", "/status");
+    expect(statusPage.text).toContain("Runtime is responding");
+    expect(statusPage.text).toContain("Service health");
+    expect(statusPage.text).toContain("Connect flow unavailable");
+    expect(statusPage.text).toContain("AI providers configured");
+    expect(statusPage.text).toContain("This page does not make a model call");
+    expect(statusPage.text).not.toContain("ANTHROPIC_API_KEY");
+    expect(statusPage.text).not.toContain("Connect button ships");
     expect(s.json.bodies.map((b) => b.up)).toEqual([false, false, false]);
     const allowed = new Set([
       "https://devdesk.meshtool.ai/health", "https://market.meshtool.ai/api/health",

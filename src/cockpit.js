@@ -1,19 +1,18 @@
 // HTML page shell, status report (product probes), docs store and markdown renderer.
-import { armedIntegrations, VERSION } from "./config.js";
-import { nowSec, parseJson } from "./util.js";
+import { armedIntegrations, env, VERSION } from "./config.js";
+import { nowSec } from "./util.js";
 import { isKillSwitchOn, sql } from "./db.js";
 import { sourceBytes, sourceSha256 } from "./http.js";
-import { OAUTH_PROFILES, profileForRedirect } from "./oauth.js";
+import { OAUTH_PROFILES } from "./oauth.js";
 
 var PAGE_CSS =
-  "body{margin:0;background:#050506;color:#f6f1e4;font:15px/1.5 Geist,system-ui,sans-serif;padding:16px}main{max-width:980px;margin:0 auto}h1{letter-spacing:-.02em}a{color:#f5c542;text-decoration:none}code{font-family:'Geist Mono',ui-monospace,monospace;color:#19f0d8;word-break:break-all}.card{background:rgba(20,19,24,.72);border:1px solid rgba(245,197,66,.16);border-radius:14px;padding:16px;margin:12px 0}button{background:#f5c542;color:#050506;border:0;border-radius:10px;padding:8px 14px;font-weight:600;cursor:pointer}input,select{background:#09090b;color:#f6f1e4;border:1px solid rgba(245,197,66,.3);border-radius:8px;padding:8px}table{border-collapse:collapse;width:100%}td{padding:8px;border-bottom:1px solid rgba(245,197,66,.1);vertical-align:top}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.g{background:#19f0d8;box-shadow:0 0 8px #19f0d8}.r{background:#ff3d7f;box-shadow:0 0 8px #ff3d7f}.p{background:#5a5566}.dim{color:#9a927f;font-size:13px}.btn{display:inline-block;background:#f5c542;color:#050506;border-radius:10px;padding:6px 12px;font-weight:600}";
+  "body{margin:0;background:#050506;color:#f6f1e4;font:15px/1.5 Geist,system-ui,sans-serif;padding:16px}main{max-width:980px;margin:0 auto}h1{letter-spacing:-.02em}a{color:#f5c542;text-decoration:none}code{font-family:'Geist Mono',ui-monospace,monospace;color:#19f0d8;word-break:break-all}.card{background:rgba(20,19,24,.72);border:1px solid rgba(245,197,66,.16);border-radius:14px;padding:16px;margin:12px 0}button{background:#f5c542;color:#050506;border:0;border-radius:10px;padding:8px 14px;font-weight:600;cursor:pointer}input,select{background:#09090b;color:#f6f1e4;border:1px solid rgba(245,197,66,.3);border-radius:8px;padding:8px}table{border-collapse:collapse;width:100%}td,th{padding:8px;border-bottom:1px solid rgba(245,197,66,.1);vertical-align:top;text-align:left;overflow-wrap:anywhere}summary{cursor:pointer;font-weight:600}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.g{background:#19f0d8;box-shadow:0 0 8px #19f0d8}.r{background:#ff3d7f;box-shadow:0 0 8px #ff3d7f}.p{background:#5a5566}.dim{color:#9a927f;font-size:13px}.btn{display:inline-block;background:#f5c542;color:#050506;border-radius:10px;padding:6px 12px;font-weight:600}";
 export var renderPage = (e, t) =>
   `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e}</title><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;600&family=Geist+Mono&display=swap"><style>${PAGE_CSS}</style></head><body><main>${t}</main></body></html>`;
-var RAILWAY_VARS_PATH = "Railway \u2192 creator-os-runtime \u2192 runtime \u2192 Variables";
+var RAILWAY_VARS_PATH = "Railway \u2192 creator-os-runtime \u2192 runtime-svc \u2192 Variables";
 var STATUS_CHECKS = [
   ["admin", "core", "Admin key (cockpit unlock + approvals)", "RUNTIME_ADMIN_KEY"],
   ["vault", "core", "Vault (encrypts stored secrets)", "VAULT_KEY (64 hex chars)"],
-  ["anthropic", "core", "COG brain (plans work)", "ANTHROPIC_API_KEY"],
   ["railway", "core", "Deploys to Railway", "RAILWAY_API_TOKEN"],
   ["github", "hook", "GitHub webhook", "GITHUB_WEBHOOK_SECRET"],
   ["railwayWebhook", "hook", "Railway webhook", "RAILWAY_WEBHOOK_TOKEN"],
@@ -65,73 +64,60 @@ export function buildStatusReport(now = Date.now()) {
   return statusCache.p;
 }
 async function computeStatusReport() {
-  let e = !1,
-    t = [];
+  let db = false;
+  let consents = null;
+  let marketReceiptSeen = null;
+  const now = nowSec();
   try {
-    (await sql`SELECT 1`,
-      (e = !0),
-      (t =
-        await sql`SELECT DISTINCT ON (c.id) c.id, c.name, c.redirect_uris, r.consent_until, r.created_at, g.status AS gstatus, g.exp AS gexp
-      FROM oauth_refresh r JOIN oauth_clients c ON c.id = r.client_id LEFT JOIN grants g ON g.id = r.grant_id
-      WHERE r.revoked = false AND r.consent_until > ${nowSec()} ORDER BY c.id, r.created_at DESC`));
+    await sql`SELECT 1`;
+    db = true;
+    consents = await sql`SELECT DISTINCT ON (g.sub) g.sub, r.created_at
+      FROM oauth_refresh r
+      JOIN grants g ON g.id = r.grant_id AND g.tenant = r.tenant
+      JOIN grants root ON root.id = r.root_id AND root.tenant = r.tenant
+      JOIN tenants t ON t.id = r.tenant
+      WHERE r.revoked = false AND r.consent_until > ${now}
+        AND g.status IN ('active', 'expired') AND root.status = 'active' AND root.exp > ${now}
+        AND t.status = 'active'
+        AND g.sub IN (${OAUTH_PROFILES.devdesk.sub}, ${OAUTH_PROFILES.meshtool.sub})
+      ORDER BY g.sub, r.created_at DESC`;
+    const [receipt] = await sql`SELECT EXISTS (SELECT 1 FROM webhook_events WHERE source = 'mesh' AND handled = true) AS seen`;
+    marketReceiptSeen = receipt.seen;
   } catch {}
-  let a = armedIntegrations(),
-    n = await isKillSwitchOn().catch(() => !1),
-    r = await Promise.all(
-      PRODUCT_PROBES.map(async ([o, l, c, E]) => {
-        let T = await probeUrl(l),
-          R = c && t.find((B) => profileForRedirect(parseJson(B.redirect_uris)[0]) === OAUTH_PROFILES[c]),
-          S = E && !R ? (await probeUrl(new URL("/runtime/status", E).href)).ok : !!E;
-        return {
-          name: o,
-          url: l,
-          up: T.ok,
-          code: T.code,
-          ms: T.ms,
-          profile: c,
-          connected: c ? !!R : null,
-          since: R?.created_at || null,
-          connect: S ? E : null,
-        };
-      }),
-    ),
-    s = STATUS_CHECKS.map(([o, l, c, E]) => ({
-      key: o,
-      kind: l,
-      label: c,
-      ok: !!a[o],
-      fix: a[o] ? null : `Set ${E} in ${RAILWAY_VARS_PATH}`,
-    }));
-  s.unshift(
-    {
-      key: "db",
-      kind: "core",
-      label: "Database",
-      ok: e,
-      fix: e ? null : "Check the Postgres service in Railway",
-    },
-    {
-      key: "kill",
-      kind: "core",
-      label: "Kill switch off",
-      ok: !n,
-      fix: n ? "Cockpit \u2192 Resume (runtime is paused)" : null,
-    },
-  );
-  let i =
-    s.filter((o) => !o.ok && o.kind !== "parked").length +
-    r.filter((o) => !o.up || o.connected === !1).length;
+  const armed = armedIntegrations();
+  const paused = await isKillSwitchOn().catch(() => null);
+  const providers = [
+    env.OLLAMA_URL && "Ollama",
+    env.ANTHROPIC_API_KEY && "Anthropic",
+    env.OPENAI_API_KEY && env.COG_OPENAI_MODEL && "OpenAI",
+  ].filter(Boolean);
+  const bodies = await Promise.all(PRODUCT_PROBES.map(async ([name, url, profile, connectUrl]) => {
+    const probe = await probeUrl(url);
+    const consent = profile && consents?.find((row) => row.sub === OAUTH_PROFILES[profile].sub);
+    const connect = connectUrl && (consent || (await probeUrl(new URL("/runtime/status", connectUrl).href)).ok) ? connectUrl : null;
+    const connection = !profile ? "not_required" : consents === null ? "unknown" : consent ? "consent_saved"
+      : connect ? "needs_consent" : connectUrl ? "entry_unreachable" : "setup_unavailable";
+    return {
+      name, url, up: probe.ok, code: probe.code, ms: probe.ms, profile, connection,
+      connected: profile && consents !== null ? !!consent : null,
+      since: consent?.created_at || null, connect,
+    };
+  }));
+  const checks = [
+    { key: "db", kind: "core", label: "Database", ok: db, fix: db ? null : "Check Postgres in Railway" },
+    { key: "kill", kind: "core", label: "Agent activity", ok: paused === false,
+      fix: paused === null ? "Could not read the emergency stop setting" : paused ? "Review the emergency stop in Runtime" : null },
+    { key: "cogPlanner", kind: "core", label: "COG planning", ok: true, fix: null, providers },
+    ...STATUS_CHECKS.map(([key, kind, label, setting]) => ({
+      key, kind, label, ok: !!armed[key], fix: armed[key] ? null : `Set ${setting} in ${RAILWAY_VARS_PATH}`,
+      ...(key === "mesh" ? { deliverySeen: marketReceiptSeen } : {}),
+    })),
+  ];
+  const red = checks.filter((check) => !check.ok && check.kind !== "parked").length +
+    bodies.filter((body) => !body.up || (body.profile && body.connected !== true)).length;
   return {
-    ok: i === 0,
-    red: i,
-    version: VERSION,
-    source: {
-      sha256: sourceSha256,
-      bytes: sourceBytes,
-    },
-    checks: s,
-    bodies: r,
-    time: new Date().toISOString(),
+    ok: red === 0, red, available: db, paused, version: VERSION,
+    source: { sha256: sourceSha256, bytes: sourceBytes }, checks, bodies, time: new Date().toISOString(),
   };
 }
 export async function listDocNames() {
