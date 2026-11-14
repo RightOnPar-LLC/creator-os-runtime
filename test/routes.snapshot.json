@@ -1,5 +1,5 @@
 {
-  "count": 217,
+  "count": 226,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -216,6 +216,15 @@
     "GET /.well-known/jwks.json",
     "POST /api/admin/identity/oidc-token",
     "POST /api/admin/identity/oidc-token",
+    "GET /.well-known/receipt-keys.json",
+    "GET /api/receipts/:id",
+    "POST /api/receipts/verify",
+    "GET /verify",
+    "GET /verify/:id",
+    "POST /api/admin/receipts",
+    "POST /api/admin/receipts",
+    "GET /api/admin/receipts/audit",
+    "GET /api/admin/receipts/audit",
     "GET /routes",
     "GET /selftest"
   ],
@@ -343,6 +352,13 @@
     "GET /.well-known/openid-configuration :: public",
     "GET /.well-known/jwks.json :: public",
     "POST /api/admin/identity/oidc-token :: admin",
+    "GET /.well-known/receipt-keys.json :: public",
+    "GET /api/receipts/:id :: public",
+    "POST /api/receipts/verify :: public",
+    "GET /verify :: public",
+    "GET /verify/:id :: public",
+    "POST /api/admin/receipts :: admin",
+    "GET /api/admin/receipts/audit :: admin",
     "GET /routes :: public",
     "GET /selftest :: public"
   ]

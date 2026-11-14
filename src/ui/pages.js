@@ -11,9 +11,10 @@ import runtime from "./runtime.html" with { type: "text" };
 import loop from "./loop.html" with { type: "text" };
 import card from "./card.html" with { type: "text" };
 import invite from "./invite.html" with { type: "text" };
+import verify from "./verify.html" with { type: "text" };
 
 const fill = (html) => html.replace("/*LOOK*/", () => look).replace("/*KIT*/", () => kit);
-export const PAGES = { runtime: fill(runtime), loop: fill(loop), card: fill(card), invite: fill(invite) };
+export const PAGES = { runtime: fill(runtime), loop: fill(loop), card: fill(card), invite: fill(invite), verify: fill(verify) };
 
 // Sent with every page: no referrer leaking a /?connect=… request id, and the browser never caches a page
 // that may show signed-in data. Framing is left as it was (the deck shows the runtime in its centre); a

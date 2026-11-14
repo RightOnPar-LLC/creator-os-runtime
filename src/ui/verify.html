@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Check a receipt · the Mesh</title>
+<meta name="description" content="Check any Mesh receipt yourself: the signature is re-checked in your browser against our published public key, and against our hash-chained ledger.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap">
+<style>
+/*LOOK*/
+.wrap{max-width:720px;margin:0 auto;padding:32px 20px 48px;display:flex;flex-direction:column;gap:16px}
+.wrap h1{margin:0;font-size:30px;line-height:1.1;font-weight:600}
+.lede{margin:0;color:var(--text2)}
+.box{padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--panel);display:flex;flex-direction:column;gap:10px}
+textarea{width:100%;min-height:150px;padding:10px 12px;border-radius:10px;background:var(--sunk);border:1px solid var(--line);font:12px/1.5 var(--mono)}
+.go{min-height:46px;border-radius:10px;border:0;background:var(--accent);color:var(--accent-ink);font-weight:600}
+.row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line2);font-size:14px}
+.row:first-child{border-top:0}
+.ok{color:var(--accent)}.no{color:var(--bad)}.wait{color:var(--dim)}
+.verdict{font-size:20px;font-weight:600}
+pre{margin:0;padding:10px 12px;border-radius:10px;background:var(--sunk);border:1px solid var(--line);font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto}
+.small{font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body>
+<main class="wrap">
+  <h1>Check a receipt</h1>
+  <p class="lede">Every receipt on the Mesh is signed. Paste one here, or a receipt id, and see each check for yourself. The signature is checked twice: by our server, and in your own browser against the <a href="/.well-known/receipt-keys.json">public key we publish</a>, so you don't have to take our word for it.</p>
+  <div class="box">
+    <label for="in" class="small">A receipt id (rc_…) or the whole receipt JSON</label>
+    <textarea id="in" spellcheck="false" placeholder="rc_9b21e0…"></textarea>
+    <button class="go" id="go" type="button">Check it</button>
+    <p class="err small no" id="err" role="alert" hidden></p>
+  </div>
+  <div class="box" id="out" hidden aria-live="polite">
+    <div class="verdict" id="verdict"></div>
+    <div id="rows"></div>
+    <details><summary class="small">The receipt</summary><pre id="raw"></pre></details>
+  </div>
+  <p class="small">How it works: the receipt body is canonical JSON (keys sorted, no spaces), signed with Ed25519. Its <span class="mono">prev</span> field is the hash of the receipt before it, so history can't be edited without breaking the chain.</p>
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function canon(v) {
+    if (v === null) return "null";
+    if (Array.isArray(v)) return "[" + v.map(function (x) { return canon(x === undefined ? null : x); }).join(",") + "]";
+    if (typeof v === "object") return "{" + Object.keys(v).filter(function (k) { return v[k] !== undefined; }).sort().map(function (k) { return JSON.stringify(k) + ":" + canon(v[k]); }).join(",") + "}";
+    return JSON.stringify(v);
+  }
+  function b64u(s) { s = s.replace(/-/g, "+").replace(/_/g, "/"); s += "===".slice((s.length + 3) % 4); var b = atob(s), u = new Uint8Array(b.length); for (var i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+  async function browserCheck(env) {
+    try {
+      var keys = (await (await fetch("/.well-known/receipt-keys.json")).json()).keys;
+      var jwk = keys.filter(function (k) { return k.kid === env.kid; })[0];
+      if (!jwk) return false;
+      var key = await crypto.subtle.importKey("jwk", { kty: jwk.kty, crv: jwk.crv, x: jwk.x }, { name: "Ed25519" }, false, ["verify"]);
+      return await crypto.subtle.verify({ name: "Ed25519" }, key, b64u(env.sig), new TextEncoder().encode(canon(env.receipt)));
+    } catch (e) { return null; }
+  }
+  function row(label, state, note) {
+    var cls = state === true ? "ok" : state === false ? "no" : "wait";
+    var word = state === true ? "Pass" : state === false ? "Fail" : "Couldn't run";
+    return '<div class="row"><span>' + label + (note ? ' <span class="small">· ' + note + "</span>" : "") + '</span><b class="' + cls + '">' + word + "</b></div>";
+  }
+  async function check() {
+    var text = $("in").value.trim(); $("err").hidden = true;
+    if (!text) { $("err").textContent = "Paste a receipt or a receipt id first."; $("err").hidden = false; return; }
+    var env;
+    try {
+      if (/^rc_[A-Za-z0-9_-]{6,40}$/.test(text)) {
+        var g = await fetch("/api/receipts/" + encodeURIComponent(text));
+        if (!g.ok) throw new Error("No public receipt with that id. To check a private one, paste the whole receipt.");
+        env = await g.json();
+      } else {
+        try { env = JSON.parse(text); } catch (e) { throw new Error("That isn't a receipt id or valid JSON."); }
+        if (!env.receipt || !env.sig) throw new Error("A receipt needs receipt, sig and kid fields.");
+      }
+      var r = await fetch("/api/receipts/verify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ receipt: env.receipt, sig: env.sig, kid: env.kid }) });
+      var v = await r.json();
+      if (!r.ok) throw new Error(v.error === "rate_limited" ? "Too many checks right now. Try again in a minute." : "The server couldn't check that receipt (" + (v.error || r.status) + ").");
+      var mine = await browserCheck(env);
+      var all = v.valid && mine !== false;
+      $("verdict").innerHTML = all ? '<span class="ok">Valid receipt</span>' : '<span class="no">Not valid</span>';
+      $("rows").innerHTML =
+        row("Signed with a key we publish", v.checks.key, env.kid) +
+        row("Signature (our server)", v.checks.signature) +
+        row("Signature (your browser)", mine, mine === null ? "your browser lacks Ed25519" : "") +
+        row("In our ledger", v.checks.ledger) +
+        row("Chain unbroken", v.checks.chain, env.receipt && env.receipt.seq ? "#" + env.receipt.seq : "");
+      $("raw").textContent = JSON.stringify(env, null, 2);
+      $("out").hidden = false;
+    } catch (e) { $("err").textContent = e.message; $("err").hidden = false; $("out").hidden = true; }
+  }
+  $("go").addEventListener("click", check);
+  var m = location.pathname.match(/^\/verify\/(rc_[A-Za-z0-9_-]{6,40})$/);
+  if (m) { $("in").value = m[1]; check(); }
+})();
+</script>
+</body>
+</html>

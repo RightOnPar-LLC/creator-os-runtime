@@ -47,4 +47,5 @@ const access = run(["access-view.test.js"]);
 const seats = run(["seats.test.js"]);
 const oidc = run(["oidc.test.js"]);
 const staging = run(["staging-gateway.test.js"]);
-process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1) || (oidc.status ?? 1) || (staging.status ?? 1));
+const receipts = run(["receipts.test.js"]);
+process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1) || (oidc.status ?? 1) || (staging.status ?? 1) || (receipts.status ?? 1));
