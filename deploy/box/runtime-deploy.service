@@ -1,0 +1,9 @@
+[Unit]
+Description=Pull-deploy creator-os-runtime master to this box (DevDesk #163)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/runtime/deploy/deploy.sh
+TimeoutStartSec=900
