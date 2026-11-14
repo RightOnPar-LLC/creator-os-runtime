@@ -149,6 +149,13 @@ CREATE TABLE IF NOT EXISTS seat_mints (
   created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
 CREATE UNIQUE INDEX IF NOT EXISTS seat_mints_payment ON seat_mints(tenant, rail, payment_ref) WHERE payment_ref IS NOT NULL;
 CREATE INDEX IF NOT EXISTS seat_mints_tenant ON seat_mints(tenant, created_at);
+-- Signed receipts (receipts.js): the public trust ledger. body is the canonical JSON that was signed;
+-- hash = sha256(body), prev = the hash of seq-1 (null for #1): editing or deleting history breaks the chain.
+CREATE TABLE IF NOT EXISTS signed_receipts (
+  id TEXT PRIMARY KEY, seq BIGINT NOT NULL UNIQUE, kind TEXT NOT NULL, tenant TEXT, public BOOLEAN NOT NULL DEFAULT false,
+  body TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, prev TEXT, sig TEXT NOT NULL, kid TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now());
+CREATE INDEX IF NOT EXISTS signed_receipts_kind ON signed_receipts(kind, seq DESC);
 `;
 export async function migrateSchema() {
   for (let e of SCHEMA_SQL.split(";")
