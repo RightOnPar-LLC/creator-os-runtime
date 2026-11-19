@@ -158,6 +158,6 @@ Compounding: reusable lesson retained in spec; no new skill/listing until live p
 ## 2026-11-19 — Runtime to Market permission and linked receipts
 
 **State:** IMPLEMENTED AND VERIFIED ON VM; READY FOR REVIEW, live proof pending.
-**Owner:** codex-runtime-market-receipts. **Destination:** existing Runtime on VM staging, paired MeshMarket receipt route, existing Runtime Browser.
+**Owner:** codex-runtime-market-receipts. **Destination:** isolated Runtime proof instance on VM, paired MeshMarket receipt route, existing Runtime Browser.
 **Evidence:** docs/specs/mesh-call-adapter.md; source437/0, artifact437/0, twelve adapter controls, two independent reviews, actual Runtime↔Market local database integration, Chromium desktop/390px receipt navigation. Supersedes NOT BUILT for this specific HTTP adapter only; broader external adapters and public demo routing remain unfinished.
-**Next step:** release paired Market owner-receipt support, deploy exact Runtime artifact to existing VM staging, then one owner-approved scoped real proof capped1additionalMESH. Original demo25MESH allowance is exhausted. Staging restart and this new paid proof require approval. Production master auto-deploys on another host; keep feature branch unmerged until that separate release is authorized.
+**Next step:** release paired Market owner-receipt support, deploy exact Runtime artifact to an isolated VM proof instance, then one owner-approved scoped real proof capped1additionalMESH. Original demo25MESH allowance is exhausted. VM proof-instance launch and this new paid proof require approval. Production master auto-deploys on another host; keep feature branch unmerged until that separate release is authorized.
