@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import datetime as dt
 import fcntl
 import hashlib
+import http.client
 import io
 import ipaddress
 import json
@@ -20,6 +22,7 @@ from pathlib import Path, PurePosixPath
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -39,6 +42,10 @@ PRODUCTION_PID = 700646
 PRODUCTION_STARTED = "2026-11-14T08:51:34.616308668Z"
 PRODUCTION_RESTART_COUNT = 0
 PRODUCTION_ADDRESS = "172.17.0.5"
+DOCKER_SOCKET = "/var/run/docker.sock"
+DOCKER_VERSION = "29.1.3"
+DOCKER_API = "1.52"
+DOCKER_ENGINE_ID = "e982df3c-d2fd-4dec-bace-1b3831fb421c"
 NETWORK = "staging-net"
 NETWORK_ID = "60b98edbb630a5f50d6b2adc53209b54811cb45c2a5de53446afbf5b3153e75c"
 PORTS = {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18080"},
@@ -135,6 +142,48 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Refusal("health_redirect_refused")
 
 
+def verify_docker_socket():
+    path = Path(DOCKER_SOCKET)
+    info = path.lstat()
+    require(stat.S_ISSOCK(info.st_mode) and info.st_uid == 0 and info.st_gid == 110
+            and stat.S_IMODE(info.st_mode) == 0o660, "docker_socket_identity_refused")
+
+
+class DockerSocketConnection(http.client.HTTPConnection):
+    """Fixed root-owned Unix socket only; no TCP, proxy or alternate host."""
+    def __init__(self):
+        super().__init__("localhost", timeout=15)
+
+    def connect(self):
+        verify_docker_socket()
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(DOCKER_SOCKET)
+
+
+def candidate_create_body(original, image_id, sha):
+    """Copy the exact current staging settings; never persist this secret body."""
+    require(original["Id"] == STAGING_ID and original["Image"] == BASE_IMAGE
+            and original["State"]["Running"], "create_original_pin_mismatch")
+    require("OomKillDisable" in original["HostConfig"]
+            and original["HostConfig"]["OomKillDisable"] is None, "staging_oom_shape_changed")
+    require(re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) and re.fullmatch(r"[0-9a-f]{40}", sha),
+            "create_image_or_source_refused")
+    env = environment(original)
+    require(all(key not in env or env[key] == value for key, value in PROOF_ENV.items()), "proof_env_conflict")
+    body = copy.deepcopy(original["Config"])
+    body["Hostname"] = ""  # Docker assigns the new container's hostname.
+    body["Image"] = image_id
+    body["Env"] = list(original["Config"]["Env"])
+    body["Env"].extend(key + "=" + value for key, value in PROOF_ENV.items() if key not in env)
+    body["Labels"] = {**(body.get("Labels") or {}), "org.opencontainers.image.revision": sha,
+                      "meshtool.purpose": "isolated-staging-proof"}
+    body["HostConfig"] = copy.deepcopy(original["HostConfig"])
+    require(body["HostConfig"] == original["HostConfig"], "create_host_config_changed")
+    require(environment({"Config": body}) == {**env, **PROOF_ENV}, "create_environment_changed")
+    return body
+
+
 class Backend:
     def run(self, args, *, label, input_bytes=None, timeout=60):
         try:
@@ -156,6 +205,80 @@ class Backend:
 
     def volume(self, name):
         return json.loads(self.run(["docker", "volume", "inspect", name], label="volume_inspect"))[0]
+
+    def engine_request(self, method, path, body=None):
+        """Only the pinned read endpoints and one new-candidate create endpoint."""
+        reads = {"/version", "/v" + DOCKER_API + "/info",
+                 "/v" + DOCKER_API + "/containers/" + STAGING_ID + "/json"}
+        create_path = (r"/v" + re.escape(DOCKER_API) + r"/containers/create\?name="
+                       + re.escape(STAGING) + r"-candidate-[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}")
+        require((method == "GET" and path in reads and body is None)
+                or (method == "POST" and re.fullmatch(create_path, path) and isinstance(body, dict)),
+                "engine_endpoint_refused")
+        connection = None
+        try:
+            verify_docker_socket()
+            payload = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
+            require(payload is None or len(payload) <= 1024 * 1024, "engine_request_too_large")
+            connection = DockerSocketConnection()
+            # There is deliberately no automatic retry, including ambiguous POST failure.
+            connection.request(method, path, body=payload,
+                               headers={"Content-Type": "application/json"} if payload is not None else {})
+            response = connection.getresponse()
+            require(response.status == (201 if method == "POST" else 200), "engine_response_status_refused")
+            raw = response.read(1024 * 1024 + 1)
+            require(len(raw) <= 1024 * 1024, "engine_response_too_large")
+            result = json.loads(raw)
+            require(isinstance(result, dict), "engine_response_shape_refused")
+            return result
+        except Refusal:
+            raise
+        except Exception:
+            raise Refusal("engine_request_unavailable_details_suppressed") from None
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def verify_create_engine(self, original):
+        require(all(not os.environ.get(key) for key in
+                    ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_API_VERSION", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH")),
+                "docker_environment_override_refused")
+        require(self.run(["docker", "context", "show"], label="docker_context").strip() == b"default",
+                "docker_context_refused")
+        endpoint = self.run(["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
+                            label="docker_endpoint").strip()
+        require(endpoint == b"unix:///var/run/docker.sock", "docker_endpoint_refused")
+        version = self.engine_request("GET", "/version")
+        require(version.get("Version") == DOCKER_VERSION and version.get("ApiVersion") == DOCKER_API
+                and version.get("MinAPIVersion") == "1.44" and version.get("Os") == "linux",
+                "docker_engine_version_changed")
+        info = self.engine_request("GET", "/v" + DOCKER_API + "/info")
+        require(info.get("ID") == DOCKER_ENGINE_ID, "docker_engine_identity_changed")
+        observed = self.engine_request("GET", "/v" + DOCKER_API + "/containers/" + STAGING_ID + "/json")
+        require(identity(observed) == identity(original) and observed["Config"] == original["Config"]
+                and observed["HostConfig"] == original["HostConfig"], "engine_original_differs_from_cli")
+        return {"transport": "root_owned_unix_socket", "context": "default",
+                "apiVersion": version["ApiVersion"], "engineVersion": version["Version"],
+                "engineId": info["ID"], "socketOwnerAndModePinned": True,
+                "originalIdentityConfigHostConfigMatched": True}
+
+    def create_candidate(self, original, image_id, sha, name):
+        require(re.fullmatch(r"[0-9a-f]{40}", sha), "create_source_refused")
+        require(re.fullmatch(re.escape(STAGING) + r"-candidate-[0-9]{8}T[0-9]{12}Z-" + sha[:12], name),
+                "create_candidate_name_refused")
+        current = self.inspect(STAGING_ID)
+        require(identity(current) == identity(original) and current["Config"] == original["Config"]
+                and current["HostConfig"] == original["HostConfig"], "create_original_changed")
+        self.verify_create_engine(current)
+        image = self.image(image_id)
+        require(image["Id"] == image_id and image["Config"].get("Labels", {}).get("org.opencontainers.image.revision") == sha,
+                "create_image_identity_changed")
+        body = candidate_create_body(current, image_id, sha)
+        result = self.engine_request("POST", "/v" + DOCKER_API + "/containers/create?name=" + name, body)
+        require(isinstance(result.get("Id"), str) and re.fullmatch(r"[0-9a-f]{64}", result["Id"]),
+                "candidate_id_invalid")
+        require(not result.get("Warnings"), "candidate_create_warning_refused")
+        return result["Id"]
 
     def production_sockets(self, pid):
         require(pid == PRODUCTION_PID, "socket_process_pin_mismatch")
@@ -403,11 +526,14 @@ def baseline(backend):
             and ports(s["HostConfig"].get("PortBindings")) == ports(PORTS), "staging_topology_changed")
     require(s["HostConfig"]["RestartPolicy"] == {"Name": "unless-stopped", "MaximumRetryCount": 0},
             "staging_restart_policy_changed")
+    require("OomKillDisable" in s["HostConfig"] and s["HostConfig"]["OomKillDisable"] is None,
+            "staging_oom_shape_changed")
+    engine = backend.verify_create_engine(s)
     env = environment(s)
     require(all(key not in env or env[key] == value for key, value in PROOF_ENV.items()), "proof_env_conflict")
     require(healthy(backend.health(STAGING_HEALTH), BASE_HASH), "staging_baseline_hash_mismatch")
     require(healthy(backend.health(PRODUCTION_HEALTH), BASE_HASH), "production_baseline_hash_mismatch")
-    return s, p, check_database_isolation(backend, s, p)
+    return s, p, check_database_isolation(backend, s, p), {**engine, "originalOomKillDisableIsNull": True}
 
 
 def assert_production_unchanged(backend, before, expected_env=None):
@@ -516,7 +642,7 @@ def restore(backend, record, expected_prod_env=None):
 def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
     require(re.fullmatch(r"[0-9a-f]{64}", expected_bundle_hash or ""), "tested_bundle_hash_required")
     source = backend.candidate(repo, sha)
-    old, prod, isolation = baseline(backend)
+    old, prod, isolation, engine = baseline(backend)
     original_production_env = production_environment_snapshot(prod)
     original_database_target = database_target(backend, old)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -524,7 +650,7 @@ def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
     record = {"kind": KIND, "host": HOST, "startedAt": now(), "phase": "building", "source": source,
               "stagingBefore": identity(old), "productionBefore": identity(prod),
               "expectedTestedBundleHash": expected_bundle_hash,
-              "databaseIsolation": isolation, "permittedEnvAdditions": PROOF_ENV,
+              "databaseIsolation": isolation, "candidateCreationTransport": engine, "permittedEnvAdditions": PROOF_ENV,
               "candidateName": STAGING + "-candidate-" + suffix,
               "rollbackName": STAGING + "-before-proof-" + suffix,
               "failedName": STAGING + "-failed-proof-" + suffix}
@@ -537,13 +663,7 @@ def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
         # No mutable source refs and no pre-existing staging drift before create/stop.
         require(identity(backend.inspect(STAGING)) == identity(old), "staging_changed_during_build")
         assert_production_unchanged(backend, record["productionBefore"], original_production_env)
-        arguments = ["create", "--name", record["candidateName"], "--restart", "unless-stopped",
-                     "--network", NETWORK, "-p", "127.0.0.1:18080:3000", "-p", "100.85.34.93:18080:3000",
-                     "--env-file", ENV_FILE]
-        for key, value in PROOF_ENV.items():
-            arguments.extend(["--env", key + "=" + value])
-        arguments.append(record["candidate"]["imageId"])
-        candidate_id = backend.docker(*arguments).decode().strip()
+        candidate_id = backend.create_candidate(old, record["candidate"]["imageId"], sha, record["candidateName"])
         require(re.fullmatch(r"[0-9a-f]{64}", candidate_id), "candidate_id_invalid")
         record["candidateContainerId"] = candidate_id
         record["phase"] = "candidate_created"
@@ -633,9 +753,10 @@ def main():
     require(re.fullmatch(r"[0-9a-f]{64}", args.expected_bundle_sha256 or ""), "tested_bundle_hash_required")
     if not args.apply:
         source = backend.candidate(args.repo, args.sha)
-        s, p, isolation = baseline(backend)
+        s, p, isolation, engine = baseline(backend)
         print(json.dumps({"outcome": "read_only_plan", "source": source, "staging": identity(s),
                           "production": identity(p), "databaseIsolation": isolation,
+                          "candidateCreationTransport": engine,
                           "expectedTestedBundleHash": args.expected_bundle_sha256,
                           "permittedEnvAdditions": PROOF_ENV, "locksRequired": LOCKS,
                           "next": "Review exact candidate and this plan before --apply"}))
