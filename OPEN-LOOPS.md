@@ -154,3 +154,10 @@ Next: inspect PR/CI, resolve the targeted staging check, deploy only isolated st
 capture live receipt IDs, then phase 2 signed audit bundle, then phase 3 durable tap engine.
 Do not build phases 2/3 in parallel or claim any phase live from local test results.
 Compounding: reusable lesson retained in spec; no new skill/listing until live proof.
+
+## 2026-11-19 — Runtime to Market permission and linked receipts
+
+**State:** DONE — approved isolated VM adapter launch and real paid proof verified; production Runtime rollout is a separate READY FOR REVIEW unit.
+**Owner:** codex-runtime-market-receipts. **Destination:** isolated Runtime on meshtool-vm; Market PR136 deployed; Runtime implementation and durable proof filed in PR94.
+**Evidence:** docs/specs/mesh-call-adapter.md and mesh-call-verification.json; source437/0, artifact437/0, twelve controls, two independent implementation and operational reviews. Live wrong-tool403/no debit; scrub exactly1MESH; both receipt clicks; signed summary valid; grants revoked and401 verified.
+**Next step:** preserve the VM proof and its receipts. For a separately authorized production rollout, review PR94 against current master and its deployment target first; then connect public /call grant onboarding explicitly. Direct clients remain outside this adapter. No paid budget remains.

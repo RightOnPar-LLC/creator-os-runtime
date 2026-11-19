@@ -4,6 +4,8 @@ import { HttpError, nowSec, parseJson, sha256Hex } from "./util.js";
 import { TEMPLATES } from "./railway.js";
 import { autonomyViolation, requestedAutonomy } from "./autonomy.js";
 
+import { meshScopeViolation } from "./mesh-policy.js";
+
 export var CAPS = [
   "grant.issue",
   "grant.read",
@@ -40,6 +42,7 @@ export var CAPS = [
   "repo.read",
   "repo.diff",
   "repo.pr",
+  "mesh.call",
 ];
 var CAP_SET = new Set(CAPS);
 export var TIERS = {
@@ -198,6 +201,10 @@ export function attenuationViolations(e, t, a, w = {}) {
     for (let c of t.caps)
       if (!CAP_SET.has(c)) n.push(`unknown_cap:${c}`);
       else if (!s.includes(c)) n.push(`cap_not_in_parent:${c}`);
+    if (t.caps.includes('mesh.call')) {
+      const fault = !i.mesh && Number(e.depth) !== 0 ? 'mesh_scope_required' : meshScopeViolation(i.mesh, t.scope.mesh);
+      if (fault) n.push(fault);
+    }
     if (t.caps.length === 0) n.push("no_caps");
     if (t.exp > Number(e.exp)) n.push("exp_exceeds_parent");
     if (t.exp - nowSec() > r.maxTtlSec) n.push("ttl_exceeds_tier");

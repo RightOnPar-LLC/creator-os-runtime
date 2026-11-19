@@ -41,6 +41,7 @@ const main = run(["runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "
 // Each file that imports harness.js boots its own runtime and database when it is imported, and
 // shuts them down when it ends. runtime.test.js holds that boot, so any other such file runs in its
 // own bun process, after it, and the run fails if either failed.
+const mesh = run(["mesh-call.test.js"]);
 const market = run(["market.test.js"]);
 const identity = run(["identity.test.js"]);
 const access = run(["access-view.test.js"]);
@@ -48,4 +49,4 @@ const seats = run(["seats.test.js"]);
 const oidc = run(["oidc.test.js"]);
 const staging = run(["staging-gateway.test.js"]);
 const receipts = run(["receipts.test.js"]);
-process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1) || (oidc.status ?? 1) || (staging.status ?? 1) || (receipts.status ?? 1));
+process.exit((mesh.status ?? 1) || (main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1) || (oidc.status ?? 1) || (staging.status ?? 1) || (receipts.status ?? 1));
