@@ -1,17 +1,21 @@
 # Runtime isolated staging rollout — review handoff
 
 Prepared 2026-11-19 for the existing MeshTool brother-demo continuation, HQ claim 715.
-**No apply or recovery has been run on a live host.** Root's first read-only plan
-refused an ambiguous production environment before activation. Only read-only target
-metadata and local mocked failure-path tests were performed in this lane. Root
+**No staging switch or recovery has been performed.** The socket-based revision
+passed root's live read-only plan. Root's subsequent apply built the tested image
+and created an unstarted candidate, then refused a HostConfig difference before
+activation. Original staging and production identities remained unchanged. This
+lane performed only read-only inspection and scratch implementation/tests; root
 remains the sole rollout operator.
 
 ## Files
 
 - `runtime_staging_deploy.py`: deployment helper; default invocation is read-only.
-- `test_runtime_staging_deploy.py`: 42 mocked tests; no Docker, SSH or network calls.
+- `test_runtime_staging_deploy.py`: 52 mocked tests; no Docker, SSH or network calls.
 - `runtime_staging_db_observation_20261119.json`: sanitized, read-only baseline
   evidence behind the pinned production process and database checks.
+- `runtime_staging_hostconfig_observation_20261119.json`: sanitized failed-apply
+  diagnosis and local Docker Engine transport metadata.
 
 ## Before using it
 
@@ -90,6 +94,11 @@ Read-only observations on `meshtool-prod` confirmed Python **3.12.3** and this b
 | Network ID | `60b98edbb630a5f50d6b2adc53209b54811cb45c2a5de53446afbf5b3153e75c` |
 | Bindings | `127.0.0.1:18080:3000` and `100.85.34.93:18080:3000` |
 | Existing environment file | `/opt/staging/runtime.env` |
+| Docker Engine / API | `29.1.3` / `1.52`; minimum API `1.44` |
+| Docker Engine ID | `e982df3c-d2fd-4dec-bace-1b3831fb421c` |
+| Docker context / transport | `default` / `unix:///var/run/docker.sock` |
+| Socket owner / group / mode | UID `0`, GID `110`, mode `0660` |
+| Existing HostConfig.OomKillDisable | Explicit JSON `null` |
 | Existing mounts / custom aliases / IPAM config | None |
 | Restart policy | `unless-stopped` |
 | Deployment lock | `/opt/runtime/deploy/lock` |
@@ -112,9 +121,11 @@ DEVDESK_PROOF_REDIRECT_URI=https://chatgpt-devdesk.meshtool.ai/runtime/callback
 ```
 
 `PUBLIC_URL` was absent in the observed baseline. No secret is added, rotated or
-printed. Existing secrets are supplied directly from the existing environment file
-to Docker and compared in process against the old container. Receipts contain only
-the four public additions and safe identity metadata.
+printed. The create adapter copies the current staging environment from the verified
+original container into its private, in-memory Engine request. It does not reread
+or rewrite the environment file. CLI and Engine API readback must agree on the
+original Config and HostConfig. Receipts contain only the four public additions
+and safe identity metadata.
 
 ## What apply verifies
 
@@ -128,6 +139,15 @@ the four public additions and safe identity metadata.
   command configuration are compared with the original. Any difference outside the
   four public proof additions refuses activation; inspect it rather than weaken the
   check.
+- The create request uses the pinned root-owned Unix socket and Engine API `1.52`.
+  The default read-only plan verifies and reports this transport, daemon, original
+  readback and explicit-null pin without POST. Apply sends one create request for
+  its new candidate name and tested image. It never retries an ambiguous POST or
+  updates an existing container through this adapter.
+- The request preserves the original full HostConfig, including literal null. It
+  preserves the original Config and environment, assigns a fresh hostname, selects
+  the tested image and sets two public provenance labels. Full post-create
+  HostConfig equality remains mandatory.
 - The staging and candidate database URLs are handled only in process. Query strings
   and fragments are refused because the observed baseline has neither. Docker DNS
   aliases and links must resolve their configured target to the exact pinned staging
@@ -176,7 +196,7 @@ From this scratch directory:
 python3 -m unittest -v test_runtime_staging_deploy.py
 ```
 
-**42 tests passed.** They cover read-only default behavior, missing tested hash,
+**52 tests passed.** They cover read-only default behavior, missing tested hash,
 hash mismatch before activation, stale topology, conflicting proof origin,
 environment/security-config drift, database alias and storage failures, network
 rebinding, lock contention, unsafe archives, source recipe drift, stop/rename/start
@@ -187,6 +207,10 @@ multiple owners, unexpected or multiple peers, wrong local addresses, PID/start/
 restart drift, environment-array drift, database/network/address/storage/volume
 changes, and socket loss before activation or after health. They also prove that
 the production-only exception does not relax staging/candidate parsing.
+The create-adapter tests inspect the serialized request, preserve literal null and
+the original environment prefix, reject null-versus-false drift, require the same
+CLI/API original, pin socket/context/daemon/version, restrict endpoints and candidate
+identity, and prove that errors/warnings disclose no body and cause no retry.
 
 ## Follow-up from the first live read-only plan
 
@@ -235,19 +259,40 @@ and must not be carried forward as proof. Production configuration is unchanged.
 
 Independent review found three concrete issues—candidate database identity,
 interrupted-checkpoint recovery, and hidden URL routing parameters—which were fixed
-and tested. The current socket boundary then received an independent **PASS** for
-the exact helper and test hashes below. The reviewer read the source, socket and
-rollout paths, independently ran all 42 mocked tests, and found no remaining blocker
-for the scoped rollout after a passing actual read-only plan. A JSON serialization
-fix preserves manual recovery identity comparisons; its roundtrip test passes.
+and tested. The socket boundary received independent **PASS**, followed by a passing
+live read-only plan. The Engine create adapter and final safe transport-evidence
+addition received independent **PASS** for the exact hashes below; the reviewer
+independently reran all 52 tests successfully. A JSON serialization fix preserves manual
+recovery identity comparisons; its roundtrip test passes.
 
 Current helper SHA256:
-`3f760bdb636f08a088573235f19f2fc0daf464ed694c7b7e5f7fe5e0afcb7225`.
-Reviewed test SHA256:
-`9b813b247f91def0023e1e5419e9438fc7f5067b9703bc6ec44c0e6c2ac1dfa1`.
-Final test SHA256 after removing one trailing space (no behavioral change):
-`0b7420b59d1a74ea8c04ab2b8a4c38ff5cc53423fec303f5f1b5445a85d2fdb4`.
+`84cebdb28c621cb5f5a22c9c9746c7140e5f858b8f318945421b09ec66e38589`.
+Current test SHA256:
+`54efa55ec0661f9854f1fae37f8211ac06be4ab121ff2cce5c4207c6ad413225`.
 
-**Not verified:** a real candidate build on this host, a real candidate container
-comparison, an actual staging switch/recovery, or the end-to-end grant/job demo.
-Those remain the root operator's review and execution steps.
+## Follow-up from the first apply: preserve the nullable field
+
+Apply for commit `0d9debb445c93a3c7c5246f81463ce3bf1a241c6` matched the independently
+tested bundle hash. Candidate
+`6e0a6e6b05eb113fcd3457d26fa8f0e4f3d486dca28cf21a6d2314bbfa629f7a` was created but
+never started. Its only HostConfig difference was `OomKillDisable`: original `null`,
+candidate `false`. Read-only inspection confirmed the original remained running,
+both Runtime identities matched the receipt, and the complete baseline passed again.
+The failed candidate is retained untouched.
+
+The installed [Docker CLI v29.1.3 source](https://github.com/docker/cli/blob/v29.1.3/cli/command/container/opts.go)
+defaults its Boolean flag to false and always takes its address for create resources.
+The bundled [Moby API type](https://github.com/docker/cli/blob/v29.1.3/vendor/github.com/moby/moby/api/types/container/hostconfig.go)
+uses a nullable Boolean pointer. Explicit CLI false cannot preserve null. The fix
+uses the [Engine API v1.52 create interface](https://docs.docker.com/reference/api/engine/version/v1.52/)
+through the already configured local daemon, preserving exact equality and API version.
+
+A failed/ambiguous create response or a 201 response with warnings refuses before
+activation and is not retried. An unstarted candidate may exist after such a response;
+its unique candidate name is already in the durable receipt. Existing candidates
+are not replaced or deleted.
+
+**Still unverified:** a live POST through this adapter, a successful full candidate
+comparison, an actual staging switch/recovery, and the end-to-end grant/job demo.
+These remain root's execution steps after the new read-only plan and reviewed
+candidate pass.

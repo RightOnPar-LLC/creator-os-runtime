@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -33,7 +34,7 @@ def container(cid, name, network, ip, portmap, env, image=r.BASE_IMAGE):
                    "ExposedPorts": {"3000/tcp": {}}, "Volumes": None},
         "HostConfig": {"NetworkMode": network, "PortBindings": copy.deepcopy(portmap),
                        "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
-                       "Links": None, "Privileged": False},
+                       "Links": None, "Privileged": False, "OomKillDisable": None},
         "Mounts": [],
         "NetworkSettings": {"Networks": {network: {"NetworkID": r.NETWORK_ID if network == r.NETWORK else r.DB_PINS["production"]["networkId"],
                                                    "IPAddress": ip, "Aliases": None, "DNSNames": [name]}}},
@@ -96,6 +97,13 @@ class Fake:
 
     def volume(self, name):
         return copy.deepcopy(self.volumes[name])
+
+    def verify_create_engine(self, original):
+        return {"transport": "root_owned_unix_socket", "apiVersion": r.DOCKER_API}
+
+    def create_candidate(self, original, image_id, sha, name):
+        self.created_body = r.candidate_create_body(original, image_id, sha)
+        return self.docker("create", "--name", name).decode()
 
     def production_sockets(self, pid):
         if pid != r.PRODUCTION_PID:
@@ -466,7 +474,184 @@ class RolloutTests(unittest.TestCase):
         self.assertNotIn(SECRET, str(caught.exception))
 
 
+class EngineCreateTests(unittest.TestCase):
+    def setUp(self):
+        self.original = Fake().inspect(r.STAGING_ID)
+        self.original["Config"].update(Hostname="old-host", Image="old-image", Labels={"keep": "label"})
+        self.cli_original = copy.deepcopy(self.original)
+        self.api_original = copy.deepcopy(self.original)
+        self.context = b"default"
+        self.endpoint = b"unix:///var/run/docker.sock"
+        self.version = {"Version": r.DOCKER_VERSION, "ApiVersion": r.DOCKER_API,
+                        "MinAPIVersion": "1.44", "Os": "linux"}
+        self.engine_id = r.DOCKER_ENGINE_ID
+        self.image = {"Id": NEW_IMAGE, "Config": {"Labels": {"org.opencontainers.image.revision": SHA}}}
+        self.name = r.STAGING + "-candidate-20261119T120000123456Z-" + SHA[:12]
+        self.requests = []
+        self.post_status = 201
+        self.post_raise = False
+        self.warnings = []
+        self.backend = r.Backend()
+        self.backend.inspect = lambda name: copy.deepcopy(self.cli_original)
+        self.backend.image = lambda name: copy.deepcopy(self.image)
+        self.backend.run = lambda args, **kw: self.context if kw["label"] == "docker_context" else self.endpoint
+        self.env_patch = patch.dict(r.os.environ, {}, clear=True)
+        self.socket_patch = patch.object(r, "verify_docker_socket")
+        self.connection_patch = patch.object(r, "DockerSocketConnection", side_effect=self.connection)
+        for item in (self.env_patch, self.socket_patch, self.connection_patch):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def connection(self):
+        outer = self
+        class Connection:
+            def request(self, method, path, *, body, headers):
+                self.method, self.path = method, path
+                outer.requests.append((method, path, body, headers))
+            def getresponse(self):
+                if self.method == "POST":
+                    if outer.post_raise:
+                        raise OSError(SECRET)
+                    data = {"Id": NEW_ID, "Warnings": outer.warnings, "message": SECRET}
+                    status = outer.post_status
+                elif self.path == "/version":
+                    data, status = outer.version, 200
+                elif self.path.endswith("/info"):
+                    data, status = {"ID": outer.engine_id}, 200
+                else:
+                    data, status = outer.api_original, 200
+                raw = json.dumps(data).encode()
+                return SimpleNamespace(status=status, read=lambda limit: raw[:limit])
+            def close(self):
+                pass
+        return Connection()
+
+    def create(self):
+        return self.backend.create_candidate(self.original, NEW_IMAGE, SHA, self.name)
+
+    def posts(self):
+        return [request for request in self.requests if request[0] == "POST"]
+
+    def test_serialized_create_preserves_literal_null_and_only_four_env_additions(self):
+        preserved = copy.deepcopy(self.original)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            self.assertEqual(self.create(), NEW_ID)
+        self.assertEqual(len(self.posts()), 1)
+        method, path, payload, headers = self.posts()[0]
+        body = json.loads(payload)
+        self.assertEqual(path, "/v1.52/containers/create?name=" + self.name)
+        self.assertIn(b'"OomKillDisable":null', payload)
+        self.assertEqual(body["HostConfig"], self.original["HostConfig"])
+        self.assertEqual(body["Image"], NEW_IMAGE)
+        self.assertEqual(body["Hostname"], "")
+        self.assertEqual(r.environment({"Config": body}), {**r.environment(self.original), **r.PROOF_ENV})
+        self.assertEqual(body["Env"][:len(self.original["Config"]["Env"])], self.original["Config"]["Env"])
+        self.assertEqual(body["Labels"]["org.opencontainers.image.revision"], SHA)
+        self.assertEqual(self.original, preserved)
+        self.assertEqual(headers, {"Content-Type": "application/json"})
+        self.assertEqual(output.getvalue(), "")
+
+    def test_null_false_mismatch_still_fails_full_candidate_comparison(self):
+        candidate = copy.deepcopy(self.original)
+        candidate["Config"]["Env"] = r.candidate_create_body(self.original, NEW_IMAGE, SHA)["Env"]
+        candidate["State"]["Running"] = False
+        candidate["HostConfig"]["OomKillDisable"] = False
+        with self.assertRaisesRegex(r.Refusal, "candidate_host_config_mismatch"):
+            r.validate_candidate_container(self.original, candidate)
+
+    def test_original_oom_null_is_a_required_baseline_pin(self):
+        backend = Fake()
+        backend.obj(r.STAGING)["HostConfig"]["OomKillDisable"] = False
+        with patch.object(r.socket, "gethostname", return_value=r.HOST):
+            with self.assertRaisesRegex(r.Refusal, "staging_oom_shape_changed"):
+                r.baseline(backend)
+        self.assertEqual(backend.commands, [])
+
+    def test_api_original_env_hostconfig_and_identity_must_equal_cli(self):
+        for mutation in (lambda c: c["Config"]["Env"].append("INJECTED=" + SECRET),
+                         lambda c: c["HostConfig"].update(OomKillDisable=False),
+                         lambda c: c.update(Id=r.PRODUCTION_ID)):
+            with self.subTest(mutation=mutation):
+                self.api_original = copy.deepcopy(self.original)
+                mutation(self.api_original)
+                with self.assertRaisesRegex(r.Refusal, "engine_original_differs_from_cli"):
+                    self.create()
+                self.assertFalse(self.posts())
+
+    def test_original_cli_drift_refuses_before_engine_create(self):
+        self.cli_original["HostConfig"]["OomKillDisable"] = False
+        with self.assertRaisesRegex(r.Refusal, "create_original_changed"):
+            self.create()
+        self.assertFalse(self.requests)
+
+    def test_daemon_version_id_context_endpoint_and_environment_are_pinned(self):
+        for case in ("version", "api", "minimum", "os", "id", "context", "endpoint", "override"):
+            with self.subTest(case=case):
+                old = (copy.deepcopy(self.version), self.engine_id, self.context, self.endpoint)
+                if case == "version": self.version["Version"] = "unexpected"
+                elif case == "api": self.version["ApiVersion"] = "1.51"
+                elif case == "minimum": self.version["MinAPIVersion"] = "1.45"
+                elif case == "os": self.version["Os"] = "windows"
+                elif case == "id": self.engine_id = "another-daemon"
+                elif case == "context": self.context = b"another-context"
+                elif case == "endpoint": self.endpoint = b"tcp://example.invalid:2375"
+                else: r.os.environ["DOCKER_HOST"] = "tcp://example.invalid:2375"
+                try:
+                    with self.assertRaises(r.Refusal): self.create()
+                    self.assertFalse(self.posts())
+                finally:
+                    self.version, self.engine_id, self.context, self.endpoint = old
+                    r.os.environ.pop("DOCKER_HOST", None)
+
+    def test_wrong_image_revision_or_name_refuses_create(self):
+        for name in (r.STAGING, r.PRODUCTION, self.name + "&force=true"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(r.Refusal, "create_candidate_name_refused"):
+                    self.backend.create_candidate(self.original, NEW_IMAGE, SHA, name)
+        self.image["Config"]["Labels"]["org.opencontainers.image.revision"] = "0" * 40
+        with self.assertRaisesRegex(r.Refusal, "create_image_identity_changed"):
+            self.create()
+        self.assertFalse(self.posts())
+
+    def test_only_pinned_read_and_new_staging_create_endpoints_are_allowed(self):
+        for method, path in (("POST", "/v1.52/containers/" + r.PRODUCTION_ID + "/stop"),
+                             ("POST", "/v1.52/containers/" + NEW_ID + "/update"),
+                             ("DELETE", "/v1.52/containers/" + NEW_ID),
+                             ("GET", "/v1.52/containers/" + r.PRODUCTION_ID + "/json"),
+                             ("POST", "/v1.52/containers/create?name=" + r.PRODUCTION)):
+            with self.subTest(method=method, path=path):
+                with self.assertRaisesRegex(r.Refusal, "engine_endpoint_refused"):
+                    self.backend.engine_request(method, path, {} if method == "POST" else None)
+        self.assertFalse(self.requests)
+
+    def test_create_errors_or_warnings_are_private_and_never_retried(self):
+        for case in ("status", "transport", "warning"):
+            with self.subTest(case=case):
+                self.requests.clear()
+                self.post_status = 500 if case == "status" else 201
+                self.post_raise = case == "transport"
+                self.warnings = [SECRET] if case == "warning" else []
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                    with self.assertRaises(r.Refusal) as raised:
+                        self.create()
+                self.assertEqual(len(self.posts()), 1)
+                self.assertNotIn(SECRET, str(raised.exception) + output.getvalue())
+                self.assertEqual(self.cli_original, self.original)
+
+
 class BoundaryTests(unittest.TestCase):
+    def test_docker_socket_must_have_the_observed_owner_mode_and_socket_type(self):
+        good = {"st_mode": r.stat.S_IFSOCK | 0o660, "st_uid": 0, "st_gid": 110}
+        with patch.object(r.Path, "lstat", return_value=SimpleNamespace(**good)):
+            r.verify_docker_socket()
+        for change in ({"st_uid": 1}, {"st_gid": 1}, {"st_mode": r.stat.S_IFREG | 0o660},
+                       {"st_mode": r.stat.S_IFLNK | 0o777}, {"st_mode": r.stat.S_IFSOCK | 0o666}):
+            with self.subTest(change=change), patch.object(r.Path, "lstat", return_value=SimpleNamespace(**{**good, **change})):
+                with self.assertRaisesRegex(r.Refusal, "docker_socket_identity_refused"):
+                    r.verify_docker_socket()
+
     def test_production_exception_does_not_relax_general_environment_parser(self):
         backend = Fake()
         with self.assertRaisesRegex(r.Refusal, "environment_conflicting_duplicate"):
@@ -532,7 +717,10 @@ class BoundaryTests(unittest.TestCase):
              patch.object(r, "save_receipt", side_effect=AssertionError("read-only mode must not write")), \
              contextlib.redirect_stdout(output):
             r.main()
-        self.assertEqual(json.loads(output.getvalue())["outcome"], "read_only_plan")
+        plan = json.loads(output.getvalue())
+        self.assertEqual(plan["outcome"], "read_only_plan")
+        self.assertEqual(plan["candidateCreationTransport"]["apiVersion"], r.DOCKER_API)
+        self.assertTrue(plan["candidateCreationTransport"]["originalOomKillDisableIsNull"])
         self.assertEqual(backend.commands, [])
         self.assertNotIn(SECRET, output.getvalue())
 
