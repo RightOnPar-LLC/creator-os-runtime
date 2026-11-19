@@ -1,0 +1,15 @@
+{
+  "verified_at_utc": "2026-11-19",
+  "execution_host": "meshtool-vm",
+  "source_tests": {"passed":437,"failed":0},
+  "artifact_tests": {"passed":437,"failed":0},
+  "adapter_controls":12,
+  "independent_reviews":2,
+  "paired_real_local_implementations":true,
+  "browser": {"runtime_receipt_opened":true,"market_link_clicked":true,"phone_width":390,"overflow":false,"exceptions":0,"synthetic_settlement":true},
+  "dockerfile_build_matches_tested_artifact":true,
+  "artifact_sha256":"190f6303f1711bf2cf38cdfef9cd6637c62fc34c292af05e4a6271aea313678e",
+  "live_paid_proof_executed":false,
+  "production_deployed":false,
+  "python_required":false
+}
