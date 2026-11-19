@@ -157,7 +157,7 @@ Compounding: reusable lesson retained in spec; no new skill/listing until live p
 
 ## 2026-11-19 — Runtime to Market permission and linked receipts
 
-**State:** IMPLEMENTED AND VERIFIED ON VM; READY FOR REVIEW, live proof pending.
-**Owner:** codex-runtime-market-receipts. **Destination:** isolated Runtime proof instance on VM, paired MeshMarket receipt route, existing Runtime Browser.
-**Evidence:** docs/specs/mesh-call-adapter.md; source437/0, artifact437/0, twelve adapter controls, two independent reviews, actual Runtime↔Market local database integration, Chromium desktop/390px receipt navigation. Supersedes NOT BUILT for this specific HTTP adapter only; broader external adapters and public demo routing remain unfinished.
-**Next step:** release paired Market owner-receipt support, deploy exact Runtime artifact to an isolated VM proof instance, then one owner-approved scoped real proof capped1additionalMESH. Original demo25MESH allowance is exhausted. VM proof-instance launch and this new paid proof require approval. Production master auto-deploys on another host; keep feature branch unmerged until that separate release is authorized.
+**State:** DONE — approved isolated VM adapter launch and real paid proof verified; production Runtime rollout is a separate READY FOR REVIEW unit.
+**Owner:** codex-runtime-market-receipts. **Destination:** isolated Runtime on meshtool-vm; Market PR136 deployed; Runtime implementation and durable proof filed in PR94.
+**Evidence:** docs/specs/mesh-call-adapter.md and mesh-call-verification.json; source437/0, artifact437/0, twelve controls, two independent implementation and operational reviews. Live wrong-tool403/no debit; scrub exactly1MESH; both receipt clicks; signed summary valid; grants revoked and401 verified.
+**Next step:** preserve the VM proof and its receipts. For a separately authorized production rollout, review PR94 against current master and its deployment target first; then connect public /call grant onboarding explicitly. Direct clients remain outside this adapter. No paid budget remains.

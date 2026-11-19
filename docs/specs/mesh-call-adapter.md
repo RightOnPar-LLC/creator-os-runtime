@@ -1,6 +1,6 @@
 # Runtime permission before Market execution
 
-State: IMPLEMENTED AND VERIFIED ON meshtool-vm with isolated databases. Live deployment and a real paid acceptance call remain pending. Owner: codex-runtime-market-receipts.
+State: VERIFIED LIVE in the isolated proof instance on meshtool-vm. Market receipt support is deployed. Production Runtime release remains a separate unit. Owner: codex-runtime-market-receipts.
 
 The caller sends POST /api/mesh/call with a real Runtime grant carrying mesh.call, an operation request_id, capability, input, max_mesh, and market_key. The grant's scope.mesh contains key_sha256, an explicit capabilities list, and max_mesh_per_call. Descendants inherit these restrictions and cannot widen them. A tenant root can authorize the first binding. Existing grants do not acquire this capability automatically.
 
@@ -37,6 +37,21 @@ This path covers POST /api/mesh/call only. Existing direct Market clients and th
 4. From the VM, prove refusal before forwarding, run exactly one live scrub, open both real receipts in Chromium, reconcile the single debit, then revoke the test grant/root. Preserve both IDs and the browser recording. Stop on any uncertain response; no automatic retry or budget increase.
 5. Only after that proof, consider the separate production Runtime release and public /call grant-onboarding connection. No existing blanket release/reviewer exception is reused.
 
-No paid call, live grant issuance, production mutation or VM proof-instance launch was performed for the isolated verification above. Python is not a dependency: Runtime, adapter, CLI, Market change and tests use JavaScript/Bun/Node.
+Historical pre-release checkpoint: no paid call, live grant issuance, production mutation or VM proof-instance launch had been performed for the isolated verification above. Python is not a dependency: Runtime, adapter, CLI, Market change and tests use JavaScript/Bun/Node.
 
-Deployment preflight correction (2026-11-19): old own-rails-runtime-staging is stopped on meshtool-vm, and no Runtime or Postgres container is currently running there. The first live proof will use a dedicated test database, exact reviewed artifact and loopback listener on the VM. Existing staging/production records and public DNS are untouched. Browser execution remains on the VM; a loopback SSH forward can expose the authenticated proof page to the owner's desktop. Launch and one paid test remain unexecuted pending the scoped release/spending approval.
+Historical deployment preflight (before the live proof, 2026-11-19): old own-rails-runtime-staging is stopped on meshtool-vm, and no Runtime or Postgres container is currently running there. The first live proof will use a dedicated test database, exact reviewed artifact and loopback listener on the VM. Existing staging/production records and public DNS are untouched. Browser execution remains on the VM; a loopback SSH forward can expose the authenticated proof page to the owner's desktop. Launch and one paid test remain unexecuted pending the scoped release/spending approval.
+
+## Live VM proof — 2026-11-19
+
+Owner-approved proof completed on meshtool-vm at 2026-11-19T06:40:50.430Z. The exact reviewed Runtime artifact ran in a fresh isolated PostgreSQL instance with a loopback-only listener. Market PR #136 shipped as 65e646b7c17211feccbade7236ba75a10f461440; [release and live smoke passed](https://github.com/Meshtool/meshmarket/actions/runs/44472940906). Production Runtime on the other host was not changed.
+
+A short-lived grant allowed only Safety Scrub, one call and at most 1 MESH. A wrong-tool attempt was denied with HTTP403 and no debit (invocation tr__jCocV6kZI3J). The authorized attempt tr_r44CNPJ-TxHY then succeeded; its real Market receipt shows one caller debit, one provider credit and zero fee. Exactly 1 of the separately approved 1 MESH was spent. The earlier 25 MESH allowance remains exhausted and unchanged.
+
+- [Real Market settlement](https://market.meshtool.ai/receipts/call_29b6cb8cb1cd635414117c8f039061f133bc33e7a2f46eeb) — public demo receipt, ledger_verified=true.
+- [Signed Runtime summary](http://127.0.0.1:18194/verify/rc_sMscQT9VMpYA) — reachable through the owner's desktop SSH forward to the VM; not an internet-public deployment. Signature, ledger and chain verified. This is a sanitized signed summary of the private invocation, not a replacement for its access controls.
+- The VM Chromium browser opened the private Runtime invocation and clicked its Market link, then opened the Market receipt JSON. Both actual receipts were checked. No browser exceptions; signed summary has no horizontal overflow at390px.
+- Fresh root and child grants were revoked; the former child credential returned401 afterward. No automatic paid retry occurred.
+
+The live proof record is in the companion verification JSON. The application, adapter, CLI and tests use JavaScript/Bun/Node; Python is not required.
+
+Boundary: this verifies the adapter in the isolated VM instance. Runtime PR #94 remains unmerged because master publishes production on another host. Existing direct Market clients and the public /call model loop still use their previous path. The next separate unit is production Runtime rollout and explicit public-demo grant onboarding; this proof does not authorize that unit.
