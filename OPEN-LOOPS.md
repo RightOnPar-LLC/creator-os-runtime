@@ -154,3 +154,15 @@ Next: inspect PR/CI, resolve the targeted staging check, deploy only isolated st
 capture live receipt IDs, then phase 2 signed audit bundle, then phase 3 durable tap engine.
 Do not build phases 2/3 in parallel or claim any phase live from local test results.
 Compounding: reusable lesson retained in spec; no new skill/listing until live proof.
+
+
+## 2026-11-19 ? bounded DevDesk proof reconnect (HQ claim 715)
+
+State: IN PROGRESS. Owner: ChatGPT, continuing Foundry PR117 and historical claim705.
+Destination: the existing isolated proof desk and staging Runtime tenant; no production merge or rollout.
+
+Implemented: strict owner-issued proof root limits, exact reserved proof callback, distinct bounded OAuth profile, and finite same-child refresh. The proof keeps memory in product:devdesk, zero USD and deployments, and at most40 allocated calls. Starter child lifetime remains one hour. Memory.write retains the existing forget permission in that partition; the call allocation is not a universal HTTP request meter.
+
+Verified locally on Z13:442 source tests and442 compiled-artifact tests passed;9 pure policy tests passed. Tested bundle SHA256:25f72bc77c00fcbf6794a3fed7efee350f0f216690ef9633b9e90b6e4c8d0ee9. The staging-only rollout helper passed26 mocked refusal/recovery tests and independent review. The original source rebuilt to the observed live baseline hash before these changes.
+
+Next: review the helper's read-only plan, activate only the existing isolated staging container, register the exact proof callback, complete supported owner/OAuth reconnect, and capture one harmless NATS job plus same-job resume. Live reconnect/job evidence is not yet complete. Ordinary deploy/box/deploy.sh also updates production and is not this proof's rollout path. Retain the original staging container and exact receipt for rollback. See deploy/box/PROOF-RECONNECT-20261119.md.

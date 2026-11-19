@@ -4,7 +4,12 @@ import { env } from "./config.js";
 import { HttpError, nowSec, parseJson, sha256Hex } from "./util.js";
 import { getGrant, getTenant, isOperatorLspCapsEnabled, sql } from "./db.js";
 import { remainingBudget, TIERS } from "./policy.js";
-import { issueChildGrant, mintRootGrant } from "./grants.js";
+import { issueChildGrant, mintRootGrant, verifyGrant } from "./grants.js";
+import { reissueGrantToken } from "./tokens.js";
+import {
+  PROOF_PROFILE, PROOF_ROOT_SUB, PROOF_SUB, isProofRedirect, proofConfig,
+  proofProfileForRedirect, proofRootProblem, proofChildProblem, rejectProofOAuthOverrides,
+} from "./proof-oauth.js";
 
 // deploy.worker + worker.status added 2026-09-26 so Claude (operator) and DevDesk
 // can launch and watch workers. `deploys` is the per-grant deploy ceiling; it is
@@ -60,8 +65,16 @@ var PROFILE_BY_HOST = {
 // registration, which can name several redirects (2026-09-25 fix: refresh used
 // the client's FIRST redirect, so a client approved on devdesk could refresh
 // into OPERATOR caps). Unknown sub → null → the caller fails closed.
-export var profileForGrant = (g) => Object.values(OAUTH_PROFILES).find((p) => p.sub === g?.sub) || null;
+export var profileForGrant = (g) => {
+  if (g?.sub === PROOF_SUB) {
+    try { proofConfig(env); return PROOF_PROFILE; } catch { return null; }
+  }
+  return Object.values(OAUTH_PROFILES).find((p) => p.sub === g?.sub) || null;
+};
 export var profileForRedirect = (e) => {
+  // Deliberately outside the legacy fallback: disabled or mismatched proof
+  // callbacks must never receive the operator profile.
+  if (isProofRedirect(e)) return proofProfileForRedirect(e, env);
   try {
     return OAUTH_PROFILES[PROFILE_BY_HOST[new URL(e).hostname]] || OPERATOR_PROFILE;
   } catch {
@@ -98,6 +111,7 @@ export var publicBaseUrl = (e) => {
 };
 export var isAllowedRedirectUri = (e) => {
   try {
+    if (isProofRedirect(e)) return !!proofProfileForRedirect(e, env);
     let t = new URL(e);
     return (
       (t.protocol === "https:" && ALLOWED_REDIRECT_HOSTS.has(t.hostname)) ||
@@ -115,7 +129,16 @@ export var oauthError = (e, t, a, n = 400) =>
     },
     n,
   );
-export async function ensureRootGrant(e) {
+export async function ensureRootGrant(e, profile = null) {
+  if (profile === PROOF_PROFILE) {
+    const config = proofConfig(env);
+    if (e.id !== config.tenant || e.status !== "active") throw new HttpError(403, "proof_tenant_mismatch");
+    const rows = await sql`SELECT * FROM grants WHERE tenant = ${e.id} AND depth = 0 AND sub = ${PROOF_ROOT_SUB}
+      AND status = 'active' AND exp > ${nowSec() + 60}`;
+    const eligible = rows.filter((row) => !proofRootProblem(row, env) && remainingBudget(row).calls > 0);
+    if (eligible.length !== 1) throw new HttpError(409, eligible.length ? "bounded_root_ambiguous" : "bounded_root_required");
+    return eligible[0];
+  }
   return (
     (
       await sql`SELECT * FROM grants WHERE tenant = ${e.id} AND depth = 0 AND status = 'active' AND exp > ${nowSec() + 3600} ORDER BY exp DESC LIMIT 1`
@@ -136,6 +159,11 @@ export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
     r = n && (await getTenant(n.tenant));
   if (!n || n.status !== "active" || Number(n.exp) <= nowSec() || !r)
     throw new HttpError(400, "root_inactive");
+  if (a === PROOF_PROFILE) {
+    const reason = proofRootProblem(n, env);
+    if (reason || r.status !== "active") throw new HttpError(400, reason || "proof_tenant_inactive");
+    if (remainingBudget(n).calls < 1) throw new HttpError(409, "proof_call_budget_unavailable");
+  }
   let s = remainingBudget(n),
     i = Math.min(a.ttl, TIERS[r.tier].maxTtlSec, Number(n.exp) - nowSec(), t - nowSec()),
     caps = await effectiveCaps(a);
@@ -148,7 +176,7 @@ export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
         ? {
             scope: {
               memory: {
-                partitions: a.parts,
+                partitions: a === PROOF_PROFILE ? parseJson(n.scope).memory.partitions : a.parts,
               },
             },
           }
@@ -166,6 +194,18 @@ export async function issueOAuthGrant(e, t, a = OPERATOR_PROFILE) {
     },
     "oauth",
   );
+}
+// A proof lease is finite. Refresh rotates the refresh token through the normal
+// one-use route, but never remints a child, extends expiry, or reserves calls twice.
+export async function refreshProofGrant(g, consentUntil) {
+  const root = g?.parent ? await getGrant(g.parent) : null;
+  const tenant = g?.tenant ? await getTenant(g.tenant) : null;
+  const reason = proofChildProblem(g, root, tenant, env);
+  if (reason || !Number.isSafeInteger(Number(consentUntil)) || Number(consentUntil) <= nowSec() || Number(consentUntil) > Number(g.exp))
+    throw new HttpError(400, reason || "proof_consent_invalid");
+  const token = reissueGrantToken(g);
+  await verifyGrant(token, null, null, false);
+  return { row: g, token };
 }
 export var tokenResponse = (e, t, a = OPERATOR_PROFILE) => ({
   access_token: e.token,
@@ -189,6 +229,10 @@ export var protectedResourceMetadata = (e) =>
     bearer_methods_supported: ["header"],
   });
 export async function validateAuthorizeRequest(e) {
+  if (isProofRedirect(e.redirect_uri)) {
+    proofProfileForRedirect(e.redirect_uri, env);
+    rejectProofOAuthOverrides(e);
+  }
   let t = (await sql`SELECT * FROM oauth_clients WHERE id = ${String(e.client_id || "")}`)[0];
   if (!t) throw new HttpError(400, "unknown_client");
   if (!parseJson(t.redirect_uris).includes(String(e.redirect_uri || "")))
