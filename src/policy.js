@@ -40,6 +40,10 @@ export var CAPS = [
   "repo.read",
   "repo.diff",
   "repo.pr",
+  // x402 payment jobs (staging: Base Sepolia): start, sign, reconcile one
+  // fixed-price order through PayRail. A grant carrying this cap can spend
+  // only through a payment job — never directly, never money-out.
+  "payments.x402",
 ];
 var CAP_SET = new Set(CAPS);
 export var TIERS = {

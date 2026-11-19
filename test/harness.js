@@ -45,9 +45,10 @@ const realFetch = globalThis.fetch;
 export const blockedFetches = [];
 let port = 0;
 let lspPort = 0;
+let payrailPort = 0;
 globalThis.fetch = async (input, init) => {
   const url = new URL(typeof input === "string" ? input : input.url ?? String(input));
-  if (url.hostname === "127.0.0.1" && (Number(url.port) === port || Number(url.port) === lspPort)) return localFetch(input, init);
+  if (url.hostname === "127.0.0.1" && (Number(url.port) === port || Number(url.port) === lspPort || Number(url.port) === payrailPort)) return localFetch(input, init);
   blockedFetches.push(url.href);
   throw new TypeError(`blocked by test harness: ${url.href}`);
 };
@@ -152,6 +153,81 @@ const lspServer = Bun.serve({
 lspPort = lspServer.port;
 export const LSP_URL = `http://127.0.0.1:${lspPort}`;
 
+// ---- 2c. a fake PayRail (x402, Base Sepolia staging) --------------------------------
+// Answers GET /pay/x402 the way the real PayRail does: no signature -> 402 with
+// the payment-required header; with one -> 200 settled (or the mode's failure).
+// Also answers JSON-RPC eth_getTransactionReceipt for reconcile. The test sets
+// payrail.offer before starting a job (the order the fake will offer), flips
+// payrail.mode for failure paths, and reads payrail.seen to prove exactly-once
+// submission. Mirrors the fake lsp-mcp above: same shape, same rules.
+export const PAYRAIL_NETWORK = "eip155:84532";
+export const PAYRAIL_ASSET = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+export const PAYRAIL_RECIPIENT = "0x1111111111111111111111111111111111111111";
+export const PAYRAIL_FEE_PAYER = "0x2222222222222222222222222222222222222222";
+export const PAYRAIL_TX = "0x" + "ab".repeat(32);
+export const payrail = {
+  mode: "ok", // ok | invalid | drop (settle, then lose the response)
+  offer: null, // { orderId, amountUsdCents } — the one order the fake will offer
+  seen: [], // every signed /pay/x402 call: { orderId, signature }
+  settledTx: null, // the tx the fake settled, once it has
+  txReceipt: null, // what eth_getTransactionReceipt returns for settledTx (null = not mined)
+};
+const payrailRequirement = (offer) => ({
+  scheme: "exact",
+  network: PAYRAIL_NETWORK,
+  amount: String(offer.amountUsdCents * 10000),
+  asset: PAYRAIL_ASSET,
+  payTo: PAYRAIL_RECIPIENT,
+  maxTimeoutSeconds: 60,
+  extra: { feePayer: PAYRAIL_FEE_PAYER },
+});
+const b64u = (v) => Buffer.from(JSON.stringify(v)).toString("base64url");
+const payrailServer = Bun.serve({
+  hostname: "127.0.0.1",
+  port: 0,
+  async fetch(r) {
+    const u = new URL(r.url);
+    if (u.pathname === "/pay/x402" && r.method === "GET") {
+      const orderId = u.searchParams.get("order");
+      if (!payrail.offer || payrail.offer.orderId !== orderId) return Response.json({ error: "unknown_order" }, { status: 404 });
+      const requirement = payrailRequirement(payrail.offer);
+      const signature = r.headers.get("payment-signature");
+      if (!signature) {
+        const required = { x402Version: 2, error: "payment_required", resource: { url: `${PAYRAIL_URL}/pay/x402?order=${encodeURIComponent(orderId)}`, description: `PayRail order ${orderId}`, mimeType: "application/json" }, accepts: [requirement] };
+        return new Response(JSON.stringify({ error: "payment_required", order: orderId, amount_usd: (payrail.offer.amountUsdCents / 100).toFixed(2) }), { status: 402, headers: { "payment-required": b64u(required), "content-type": "application/json" } });
+      }
+      let payload = null;
+      try {
+        payload = JSON.parse(Buffer.from(signature, "base64url").toString("utf8"));
+      } catch {
+        return Response.json({ error: "bad_payment_signature" }, { status: 400 });
+      }
+      payrail.seen.push({ orderId, signature: payload });
+      if (payrail.mode === "invalid") return Response.json({ error: "invalid:authorization_used" }, { status: 402 });
+      payrail.settledTx = PAYRAIL_TX;
+      // "drop" = the settle response is lost after the tx lands. A real drop is
+      // a connection reset; the engine treats any non-200 the same way (the job
+      // stays settling for reconcile). The fake answers 502 rather than throwing:
+      // a throwing serve handler surfaces as an uncaught exception and aborts
+      // the running bun:test test before its assertions run.
+      if (payrail.mode === "drop") return Response.json({ error: "settle_response_dropped" }, { status: 502 });
+      const response = { success: true, transaction: PAYRAIL_TX, network: PAYRAIL_NETWORK, payer: payload?.payload?.authorization?.from ?? null };
+      return new Response(JSON.stringify({ ok: true, id: PAYRAIL_TX, order: orderId, paid_usd: (payrail.offer.amountUsdCents / 100).toFixed(2), unlocked: true }), { status: 200, headers: { "payment-response": b64u(response), "content-type": "application/json" } });
+    }
+    if (u.pathname === "/" && r.method === "POST") {
+      const body = await r.json().catch(() => ({}));
+      if (body.method === "eth_getTransactionReceipt") {
+        const receipt = body.params?.[0] === payrail.settledTx ? payrail.txReceipt : null;
+        return Response.json({ jsonrpc: "2.0", id: body.id ?? 1, result: receipt });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id ?? 1, result: "0x0" });
+    }
+    return Response.json({ error: "not_found" }, { status: 404 });
+  },
+});
+payrailPort = payrailServer.port;
+export const PAYRAIL_URL = `http://127.0.0.1:${payrailPort}`;
+
 // ---- 3. listener on 127.0.0.1 (port known before import, for PUBLIC_URL) ---------
 let handler = () => new Response("booting", { status: 503 });
 // idleTimeout as the runtime sets it for its own listener (src/index.js; section 1 checks the number).
@@ -199,9 +275,15 @@ for (const k of [
   "STRIPE_WEBHOOK_SECRET", "STRIPE_PRICE_MAP", "COG_BRIDGE_URL", "COG_BRIDGE_TOKEN", "COG_SYNC_TOKEN",
   "BRAIN_URL", "GRANT_SIGNING_KEY", "OAUTH_REDIRECT_HOSTS", "POSTGRES_URL", "PORT", "RUNTIME_MODE", "COG_MODEL",
   "LSP_MCP_URL", "LSP_MCP_TIMEOUT_MS", "REAP_INTERVAL_MS", "BUS_EVENTS_URL", "BUS_EVENTS_KEY", "NTFY_URL", "NTFY_TOKEN",
+  "PAYRAIL_URL", "X402_RPC_URL", "X402_PAYMENT_NETWORK", "X402_PAYMENT_ASSET", "X402_PAYMENT_RECIPIENT",
 ]) delete process.env[k];
 Object.assign(process.env, {
   LSP_MCP_URL: LSP_URL,
+  PAYRAIL_URL,
+  X402_RPC_URL: PAYRAIL_URL,
+  X402_PAYMENT_NETWORK: PAYRAIL_NETWORK,
+  X402_PAYMENT_ASSET: PAYRAIL_ASSET,
+  X402_PAYMENT_RECIPIENT: PAYRAIL_RECIPIENT,
   CREATOR_WORKER_READY: "1",
   DATABASE_URL,
   RUNTIME_ADMIN_KEY: ADMIN_KEY,
@@ -228,6 +310,7 @@ export async function shutdown() {
     console.warn(`harness: this machine reset ${loopback.reset} established connection(s) to the harness listener; those were NOT asked again (the runtime may have acted on them), so a test may have failed with ECONNRESET. That is the machine, not the runtime: node test/loopback-check.mjs`);
   server.stop(true);
   lspServer.stop(true);
+  payrailServer.stop(true);
   await pgServer.stop();
   await pg.close();
 }

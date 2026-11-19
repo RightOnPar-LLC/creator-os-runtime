@@ -32,6 +32,7 @@ import "./routes/identity.js";
 import "./routes/seats.js";
 import "./routes/oidc.js";
 import "./routes/receipts.js";
+import "./routes/payments.js";
 import "./routes/meta.js";
 
 try {
