@@ -32,6 +32,14 @@ CREATE TABLE IF NOT EXISTS ledger (
   id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT now(), tenant TEXT NOT NULL, grant_id TEXT, parent TEXT,
   kind TEXT NOT NULL, usd_cents INT NOT NULL DEFAULT 0, calls INT NOT NULL DEFAULT 0, deploys INT NOT NULL DEFAULT 0,
   ref TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS payment_jobs (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL, grant_id TEXT NOT NULL,
+  status TEXT NOT NULL, order_id TEXT NOT NULL, amount_usd_cents INT NOT NULL,
+  intent_hash TEXT NOT NULL, requirement JSONB NOT NULL, signature JSONB,
+  tx TEXT, receipt JSONB, error TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
+CREATE INDEX IF NOT EXISTS payment_jobs_tenant ON payment_jobs(tenant);
+CREATE INDEX IF NOT EXISTS payment_jobs_grant ON payment_jobs(grant_id);
 CREATE TABLE IF NOT EXISTS deploys (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, grant_id TEXT, name TEXT NOT NULL, template TEXT, intent JSONB NOT NULL,
   plan JSONB, status TEXT NOT NULL, executed BOOLEAN NOT NULL DEFAULT false, railway_service_id TEXT,
