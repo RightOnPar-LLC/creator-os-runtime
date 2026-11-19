@@ -134,6 +134,7 @@ export async function issueChildGrant(e, t, a, w = {}) {
     c = end;
   }
   let E = {
+      ...((t.scope?.mesh ?? s.mesh) ? {mesh: t.scope?.mesh ?? s.mesh} : {}),
       railway: {
         projects: t.scope?.railway?.projects ?? s.railway?.projects ?? [],
         environments: t.scope?.railway?.environments ?? s.railway?.environments ?? [],
