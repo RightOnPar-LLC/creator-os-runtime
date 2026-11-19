@@ -2,20 +2,22 @@
 
 Prepared 2026-11-19 for the existing MeshTool brother-demo continuation, HQ claim 715.
 **No staging switch or recovery has been performed.** The socket-based revision
-passed root's live read-only plan. Root's subsequent apply built the tested image
-and created an unstarted candidate, then refused a HostConfig difference before
-activation. Original staging and production identities remained unchanged. This
+passed root's live read-only plan. Two subsequent applies built the tested image
+and created unstarted candidates, then refused the same HostConfig difference
+before activation. Original staging and production identities remained unchanged. This
 lane performed only read-only inspection and scratch implementation/tests; root
 remains the sole rollout operator.
 
 ## Files
 
 - `runtime_staging_deploy.py`: deployment helper; default invocation is read-only.
-- `test_runtime_staging_deploy.py`: 52 mocked tests; no Docker, SSH or network calls.
+- `test_runtime_staging_deploy.py`: 55 mocked tests; no Docker, SSH or network calls.
 - `runtime_staging_db_observation_20261119.json`: sanitized, read-only baseline
   evidence behind the pinned production process and database checks.
 - `runtime_staging_hostconfig_observation_20261119.json`: sanitized failed-apply
   diagnosis and local Docker Engine transport metadata.
+- `runtime_staging_oom_lifecycle_observation_20261119.json`: second refusal,
+  installed build/cgroup evidence and upstream create/start lifecycle rationale.
 
 ## Before using it
 
@@ -95,6 +97,8 @@ Read-only observations on `meshtool-prod` confirmed Python **3.12.3** and this b
 | Bindings | `127.0.0.1:18080:3000` and `100.85.34.93:18080:3000` |
 | Existing environment file | `/opt/staging/runtime.env` |
 | Docker Engine / API | `29.1.3` / `1.52`; minimum API `1.44` |
+| API-reported GitCommit / Ubuntu build | `29.1.3-0ubuntu3~24.04.2` |
+| Cgroups / driver / OomKillDisable support | Version `2` / `systemd` / `false` |
 | Docker Engine ID | `e982df3c-d2fd-4dec-bace-1b3831fb421c` |
 | Docker context / transport | `default` / `unix:///var/run/docker.sock` |
 | Socket owner / group / mode | UID `0`, GID `110`, mode `0660` |
@@ -136,9 +140,9 @@ and safe identity metadata.
 - The image's `/app/runtime.js` hash equals **the independent tested-artifact hash**
   before a candidate container is created or staging is stopped.
 - The candidate is created but not started. Its environment, HostConfig and runtime
-  command configuration are compared with the original. Any difference outside the
-  four public proof additions refuses activation; inspect it rather than weaken the
-  check.
+  command configuration are compared with the original. Only the four public proof
+  environment additions and the narrowly pinned pre-start lifecycle transition
+  below are allowed. Other differences refuse activation.
 - The create request uses the pinned root-owned Unix socket and Engine API `1.52`.
   The default read-only plan verifies and reports this transport, daemon, original
   readback and explicit-null pin without POST. Apply sends one create request for
@@ -146,8 +150,12 @@ and safe identity metadata.
   updates an existing container through this adapter.
 - The request preserves the original full HostConfig, including literal null. It
   preserves the original Config and environment, assigns a fresh hostname, selects
-  the tested image and sets two public provenance labels. Full post-create
-  HostConfig equality remains mandatory.
+  the tested image and sets two public provenance labels. On this exact build,
+  cgroup v2 and support=false, the daemon changes the null request to false during
+  create. Only a genuinely unstarted candidate (zero StartedAt and PID0) may show
+  that single difference; every other HostConfig field must match. Immediately after
+  START and again after health, **the entire HostConfig must equal the original,
+  including null**, or the original staging container is restored.
 - The staging and candidate database URLs are handled only in process. Query strings
   and fragments are refused because the observed baseline has neither. Docker DNS
   aliases and links must resolve their configured target to the exact pinned staging
@@ -196,7 +204,7 @@ From this scratch directory:
 python3 -m unittest -v test_runtime_staging_deploy.py
 ```
 
-**52 tests passed.** They cover read-only default behavior, missing tested hash,
+**55 tests passed.** They cover read-only default behavior, missing tested hash,
 hash mismatch before activation, stale topology, conflicting proof origin,
 environment/security-config drift, database alias and storage failures, network
 rebinding, lock contention, unsafe archives, source recipe drift, stop/rename/start
@@ -208,9 +216,12 @@ restart drift, environment-array drift, database/network/address/storage/volume
 changes, and socket loss before activation or after health. They also prove that
 the production-only exception does not relax staging/candidate parsing.
 The create-adapter tests inspect the serialized request, preserve literal null and
-the original environment prefix, reject null-versus-false drift, require the same
+the original environment prefix, reject unproved null-versus-false drift, require the same
 CLI/API original, pin socket/context/daemon/version, restrict endpoints and candidate
 identity, and prove that errors/warnings disclose no body and cause no retry.
+Three lifecycle tests cover literal-type/state/capability boundaries and rollback
+when false persists after start. The successful rollout fixture models the observed
+created=false state and required running=null state.
 
 ## Follow-up from the first live read-only plan
 
@@ -260,15 +271,15 @@ and must not be carried forward as proof. Production configuration is unchanged.
 Independent review found three concrete issues—candidate database identity,
 interrupted-checkpoint recovery, and hidden URL routing parameters—which were fixed
 and tested. The socket boundary received independent **PASS**, followed by a passing
-live read-only plan. The Engine create adapter and final safe transport-evidence
-addition received independent **PASS** for the exact hashes below; the reviewer
-independently reran all 52 tests successfully. A JSON serialization fix preserves manual
+live read-only plan. The Engine adapter and narrow lifecycle comparison received
+independent **PASS** for the exact hashes below; the reviewer independently reran
+all 55 tests successfully. A JSON serialization fix preserves manual
 recovery identity comparisons; its roundtrip test passes.
 
 Current helper SHA256:
-`84cebdb28c621cb5f5a22c9c9746c7140e5f858b8f318945421b09ec66e38589`.
+`8c1c7da9fd7274fac0de15c26dabe19067a8d136b42154d98a4533bf17ac144c`.
 Current test SHA256:
-`54efa55ec0661f9854f1fae37f8211ac06be4ab121ff2cce5c4207c6ad413225`.
+`8f0601f7666b1e171a58eaf6bebd44abaccc20ce1a320f0e146ed2068509e170`.
 
 ## Follow-up from the first apply: preserve the nullable field
 
@@ -283,16 +294,45 @@ The failed candidate is retained untouched.
 The installed [Docker CLI v29.1.3 source](https://github.com/docker/cli/blob/v29.1.3/cli/command/container/opts.go)
 defaults its Boolean flag to false and always takes its address for create resources.
 The bundled [Moby API type](https://github.com/docker/cli/blob/v29.1.3/vendor/github.com/moby/moby/api/types/container/hostconfig.go)
-uses a nullable Boolean pointer. Explicit CLI false cannot preserve null. The fix
+uses a nullable Boolean pointer. Explicit CLI false cannot preserve null. The adapter
 uses the [Engine API v1.52 create interface](https://docs.docker.com/reference/api/engine/version/v1.52/)
-through the already configured local daemon, preserving exact equality and API version.
+through the already configured local daemon. A second live attempt proved that
+the daemon itself still converts its null request to false before start.
 
 A failed/ambiguous create response or a 201 response with warnings refuses before
 activation and is not retried. An unstarted candidate may exist after such a response;
 its unique candidate name is already in the durable receipt. Existing candidates
 are not replaced or deleted.
 
-**Still unverified:** a live POST through this adapter, a successful full candidate
-comparison, an actual staging switch/recovery, and the end-to-end grant/job demo.
-These remain root's execution steps after the new read-only plan and reviewed
-candidate pass.
+## Follow-up from the second apply: verify the create/start lifecycle
+
+Apply for `196ac48db4a313420d56e8679039cdcfb74b5a6f` created candidate
+`4b8093f5cee8491da4fbe2440fb58beb169db157aee3ec240f33b7c892db81df` through the new
+adapter. The tested bundle matched, but this candidate again had false while the
+running original had null. It remains unstarted; staging and production identities
+were unchanged and the full baseline passed again.
+
+Read-only host evidence shows cgroup v2/systemd and OomKillDisable support=false.
+The original stage's OCI memory resources are empty, with no disableOOMKiller field;
+memory.oom.group is 0, memory/swap limits are max, OOM counters are zero, and both
+process and HostConfig OomScoreAdj are 0. No kernel or OOM setting was changed.
+
+The matching upstream release explains a phase transition: [create.go](https://github.com/moby/moby/blob/docker-v29.1.3/daemon/create.go)
+validates resources then adapts defaults; [daemon_unix.go](https://github.com/moby/moby/blob/docker-v29.1.3/daemon/daemon_unix.go)
+sets a nil OomKillDisable pointer to false during that adaptation.
+[start.go](https://github.com/moby/moby/blob/docker-v29.1.3/daemon/start.go) validates
+resources again before start, and the resource validator clears unsupported
+OomKillDisable to nil. This is the rationale for the narrowly scoped pre-start rule.
+
+**Provenance boundary:** upstream tag `docker-v29.1.3` resolves to
+`fbf3ed25f893e6ce21336f1101590e40a13934f4`; the installed Ubuntu daemon reports build
+`29.1.3-0ubuntu3~24.04.2`. The helper pins the observed API build string, daemon,
+transport and capabilities. It does not claim the upstream commit is the installed
+binary or add package/binary inspection requirements. The recorded binary hash is
+documentary evidence only. Mandatory full post-start equality verifies the actual
+installed daemon's outcome and restores staging if it differs from the rationale.
+
+**Still unverified:** live activation using the phase-aware check, actual full
+running-state candidate equality, staging switch/recovery, and the end-to-end
+grant/job demo. These remain root's execution steps after the new read-only plan
+and reviewed candidate pass.

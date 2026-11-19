@@ -44,6 +44,7 @@ PRODUCTION_RESTART_COUNT = 0
 PRODUCTION_ADDRESS = "172.17.0.5"
 DOCKER_SOCKET = "/var/run/docker.sock"
 DOCKER_VERSION = "29.1.3"
+DOCKER_BUILD = "29.1.3-0ubuntu3~24.04.2"
 DOCKER_API = "1.52"
 DOCKER_ENGINE_ID = "e982df3c-d2fd-4dec-bace-1b3831fb421c"
 NETWORK = "staging-net"
@@ -250,15 +251,20 @@ class Backend:
         require(endpoint == b"unix:///var/run/docker.sock", "docker_endpoint_refused")
         version = self.engine_request("GET", "/version")
         require(version.get("Version") == DOCKER_VERSION and version.get("ApiVersion") == DOCKER_API
+                and version.get("GitCommit") == DOCKER_BUILD
                 and version.get("MinAPIVersion") == "1.44" and version.get("Os") == "linux",
                 "docker_engine_version_changed")
         info = self.engine_request("GET", "/v" + DOCKER_API + "/info")
         require(info.get("ID") == DOCKER_ENGINE_ID, "docker_engine_identity_changed")
+        require(info.get("CgroupVersion") == "2" and info.get("CgroupDriver") == "systemd"
+                and info.get("OomKillDisable") is False, "docker_oom_capability_changed")
         observed = self.engine_request("GET", "/v" + DOCKER_API + "/containers/" + STAGING_ID + "/json")
         require(identity(observed) == identity(original) and observed["Config"] == original["Config"]
                 and observed["HostConfig"] == original["HostConfig"], "engine_original_differs_from_cli")
         return {"transport": "root_owned_unix_socket", "context": "default",
                 "apiVersion": version["ApiVersion"], "engineVersion": version["Version"],
+                "engineGitCommit": version["GitCommit"], "cgroupVersion": info["CgroupVersion"],
+                "cgroupDriver": info["CgroupDriver"], "oomKillDisableSupported": info["OomKillDisable"],
                 "engineId": info["ID"], "socketOwnerAndModePinned": True,
                 "originalIdentityConfigHostConfigMatched": True}
 
@@ -542,13 +548,33 @@ def assert_production_unchanged(backend, before, expected_env=None):
     return observe_production_database(backend, production, expected_env)
 
 
-def validate_candidate_container(old, new):
+def validate_candidate_container(old, new, *, started=False, engine=None):
     require(environment(new) == {**environment(old), **PROOF_ENV}, "candidate_environment_mismatch")
-    # Docker allocates a new hostname/id. All operational HostConfig fields must agree.
-    require(new["HostConfig"] == old["HostConfig"], "candidate_host_config_mismatch")
+    require(not new["Mounts"], "candidate_mounts_refused")
+    if started:
+        require(new["State"]["Running"], "candidate_must_be_running")
+        require(new["HostConfig"] == old["HostConfig"], "candidate_started_host_config_mismatch")
+    else:
+        require(not new["State"]["Running"] and new["State"]["Pid"] == 0
+                and new["State"]["StartedAt"] == "0001-01-01T00:00:00Z", "candidate_must_be_unstarted")
+        if new["HostConfig"] != old["HostConfig"]:
+            # This exact daemon creates false after capability validation, then
+            # clears it during START on cgroup v2. This is not general equality
+            # normalization: the fully running HostConfig must match above.
+            expected_engine = {"engineVersion": DOCKER_VERSION, "engineGitCommit": DOCKER_BUILD,
+                               "apiVersion": DOCKER_API, "engineId": DOCKER_ENGINE_ID,
+                               "cgroupVersion": "2", "cgroupDriver": "systemd"}
+            pinned = (isinstance(engine, dict) and all(engine.get(k) == v for k, v in expected_engine.items())
+                      and engine.get("oomKillDisableSupported") is False)
+            before, after = old["HostConfig"], new["HostConfig"]
+            require(pinned and old["Id"] == STAGING_ID and old["State"]["Running"]
+                    and "OomKillDisable" in before and before["OomKillDisable"] is None
+                    and "OomKillDisable" in after and after["OomKillDisable"] is False
+                    and {k: v for k, v in before.items() if k != "OomKillDisable"}
+                    == {k: v for k, v in after.items() if k != "OomKillDisable"},
+                    "candidate_host_config_mismatch")
     for key in ("Cmd", "Entrypoint", "User", "WorkingDir", "Healthcheck", "StopSignal", "ExposedPorts", "Volumes"):
         require(new["Config"].get(key) == old["Config"].get(key), "candidate_runtime_config_mismatch")
-    require(not new["Mounts"] and not new["State"]["Running"], "candidate_must_be_unstarted")
 
 
 def assert_candidate_database(backend, candidate, expected_target, *, started):
@@ -669,7 +695,9 @@ def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
         record["phase"] = "candidate_created"
         writer(path, record)
         candidate = backend.inspect(candidate_id)
-        validate_candidate_container(old, candidate)
+        validate_candidate_container(old, candidate, engine=engine)
+        record["candidateHostConfigPrestart"] = ("exact_original" if candidate["HostConfig"] == old["HostConfig"]
+                                                else "pinned_daemon_oom_default_false_pending_start")
         assert_candidate_database(backend, candidate, original_database_target, started=False)
         require(candidate["Image"] == record["candidate"]["imageId"], "candidate_image_mismatch")
         assert_production_unchanged(backend, record["productionBefore"], original_production_env)
@@ -685,9 +713,12 @@ def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
         record["phase"] = "starting_candidate"
         writer(path, record)
         backend.docker("start", candidate_id)
+        validate_candidate_container(old, backend.inspect(candidate_id), started=True)
+        record["candidateHostConfigAfterStart"] = "exact_original"
         wait_health(backend, record["candidate"]["bundleHash"])
         require(backend.inspect(STAGING)["Id"] == candidate_id, "active_candidate_identity_mismatch")
         live_candidate = backend.inspect(candidate_id)
+        validate_candidate_container(old, live_candidate, started=True)
         assert_candidate_database(backend, live_candidate, original_database_target, started=True)
         record["databaseIsolationAfter"] = check_database_isolation(
             backend, live_candidate, backend.inspect(PRODUCTION), original_production_env)

@@ -48,6 +48,7 @@ class Fake:
         self.fail = None
         self.env_drift = False
         self.config_drift = False
+        self.oom_stays_false = False
         self.bad_health = False
         self.production_drift_at = None
         self.rollback_start_failure = False
@@ -99,7 +100,10 @@ class Fake:
         return copy.deepcopy(self.volumes[name])
 
     def verify_create_engine(self, original):
-        return {"transport": "root_owned_unix_socket", "apiVersion": r.DOCKER_API}
+        return {"transport": "root_owned_unix_socket", "apiVersion": r.DOCKER_API,
+                "engineVersion": r.DOCKER_VERSION, "engineGitCommit": r.DOCKER_BUILD,
+                "engineId": r.DOCKER_ENGINE_ID, "cgroupVersion": "2", "cgroupDriver": "systemd",
+                "oomKillDisableSupported": False}
 
     def create_candidate(self, original, image_id, sha, name):
         self.created_body = r.candidate_create_body(original, image_id, sha)
@@ -154,7 +158,8 @@ class Fake:
         if op == "create":
             c = copy.deepcopy(self.obj(r.STAGING_ID))
             c.update(Id=NEW_ID, Image=NEW_IMAGE, Name="/" + args[args.index("--name") + 1])
-            c["State"] = {"Running": False, "StartedAt": "", "Pid": 0}
+            c["State"] = {"Running": False, "StartedAt": "0001-01-01T00:00:00Z", "Pid": 0}
+            c["HostConfig"]["OomKillDisable"] = False
             env = {**r.environment(c), **r.PROOF_ENV}
             if self.env_drift:
                 env["DATABASE_URL"] += "-changed"
@@ -178,7 +183,9 @@ class Fake:
         elif op == "start":
             if c["Id"] == r.STAGING_ID and self.rollback_start_failure:
                 raise r.Refusal("rollback_start_failed")
-            c["State"].update(Running=True, Pid=456)
+            c["State"].update(Running=True, Pid=456, StartedAt="2026-11-19T12:00:00Z")
+            if c["Id"] == NEW_ID and not self.oom_stays_false:
+                c["HostConfig"]["OomKillDisable"] = None
             if c["Id"] == NEW_ID and self.production_drift_at == "start":
                 self.obj(r.PRODUCTION)["State"]["Pid"] += 1
         else:
@@ -224,8 +231,20 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(result["databaseIsolation"]["productionDatabaseEvidence"], "owned_established_sockets")
         self.assertEqual(result["databaseIsolationAfter"]["productionDatabaseEvidence"], "owned_established_sockets")
         self.assertNotIn("normalizedTargetsDistinct", json.dumps(result))
+        self.assertEqual(result["candidateHostConfigPrestart"], "pinned_daemon_oom_default_false_pending_start")
+        self.assertEqual(result["candidateHostConfigAfterStart"], "exact_original")
         self.assertIn({"candidateExists": True, "candidateRunning": False, "originalRunning": True}, self.backend.socket_observations)
         self.assertIn({"candidateExists": True, "candidateRunning": True, "originalRunning": False}, self.backend.socket_observations)
+        self.assert_production_never_mutated()
+
+    def test_candidate_oom_default_must_clear_after_start_or_original_is_restored(self):
+        self.backend.oom_stays_false = True
+        with self.assertRaisesRegex(r.Refusal, "failed_restored:candidate_started_host_config_mismatch"):
+            self.deploy()
+        self.assertEqual(self.backend.obj(r.STAGING)["Id"], r.STAGING_ID)
+        self.assertTrue(self.backend.obj(r.STAGING_ID)["State"]["Running"])
+        self.assertFalse(self.backend.obj(NEW_ID)["State"]["Running"])
+        self.assertEqual(self.records[-1]["phase"], "failed_restored")
         self.assert_production_never_mutated()
 
     def test_missing_or_foreign_or_multiple_production_socket_peers_refuse_before_build(self):
@@ -482,9 +501,10 @@ class EngineCreateTests(unittest.TestCase):
         self.api_original = copy.deepcopy(self.original)
         self.context = b"default"
         self.endpoint = b"unix:///var/run/docker.sock"
-        self.version = {"Version": r.DOCKER_VERSION, "ApiVersion": r.DOCKER_API,
+        self.version = {"Version": r.DOCKER_VERSION, "GitCommit": r.DOCKER_BUILD, "ApiVersion": r.DOCKER_API,
                         "MinAPIVersion": "1.44", "Os": "linux"}
         self.engine_id = r.DOCKER_ENGINE_ID
+        self.cgroup = {"CgroupVersion": "2", "CgroupDriver": "systemd", "OomKillDisable": False}
         self.image = {"Id": NEW_IMAGE, "Config": {"Labels": {"org.opencontainers.image.revision": SHA}}}
         self.name = r.STAGING + "-candidate-20261119T120000123456Z-" + SHA[:12]
         self.requests = []
@@ -517,7 +537,7 @@ class EngineCreateTests(unittest.TestCase):
                 elif self.path == "/version":
                     data, status = outer.version, 200
                 elif self.path.endswith("/info"):
-                    data, status = {"ID": outer.engine_id}, 200
+                    data, status = {"ID": outer.engine_id, **outer.cgroup}, 200
                 else:
                     data, status = outer.api_original, 200
                 raw = json.dumps(data).encode()
@@ -555,10 +575,55 @@ class EngineCreateTests(unittest.TestCase):
     def test_null_false_mismatch_still_fails_full_candidate_comparison(self):
         candidate = copy.deepcopy(self.original)
         candidate["Config"]["Env"] = r.candidate_create_body(self.original, NEW_IMAGE, SHA)["Env"]
-        candidate["State"]["Running"] = False
+        candidate["State"].update(Running=False, Pid=0, StartedAt="0001-01-01T00:00:00Z")
         candidate["HostConfig"]["OomKillDisable"] = False
         with self.assertRaisesRegex(r.Refusal, "candidate_host_config_mismatch"):
             r.validate_candidate_container(self.original, candidate)
+
+    def test_only_exact_unstarted_false_transition_with_pinned_capability_is_accepted(self):
+        candidate = copy.deepcopy(self.original)
+        candidate["Config"]["Env"] = r.candidate_create_body(self.original, NEW_IMAGE, SHA)["Env"]
+        candidate["State"].update(Running=False, Pid=0, StartedAt="0001-01-01T00:00:00Z")
+        candidate["HostConfig"]["OomKillDisable"] = False
+        engine = self.backend.verify_create_engine(self.original)
+        r.validate_candidate_container(self.original, candidate, engine=engine)
+        for value in (True, 0, "false", "missing"):
+            with self.subTest(value=value):
+                changed = copy.deepcopy(candidate)
+                if value == "missing": changed["HostConfig"].pop("OomKillDisable")
+                else: changed["HostConfig"]["OomKillDisable"] = value
+                with self.assertRaisesRegex(r.Refusal, "candidate_host_config_mismatch"):
+                    r.validate_candidate_container(self.original, changed, engine=engine)
+        for mutation in (lambda c: c["HostConfig"].update(Privileged=True),
+                         lambda c: c["State"].update(Pid=123),
+                         lambda c: c["State"].update(StartedAt="2026-11-19T10:00:00Z")):
+            changed = copy.deepcopy(candidate)
+            mutation(changed)
+            with self.assertRaises(r.Refusal):
+                r.validate_candidate_container(self.original, changed, engine=engine)
+        for key, value in (("engineGitCommit", "other-build"), ("cgroupVersion", "1"),
+                           ("oomKillDisableSupported", True), ("oomKillDisableSupported", 0)):
+            with self.subTest(key=key, value=value):
+                with self.assertRaisesRegex(r.Refusal, "candidate_host_config_mismatch"):
+                    r.validate_candidate_container(self.original, candidate, engine={**engine, key: value})
+        candidate["State"].update(Running=True, Pid=456, StartedAt="2026-11-19T12:00:00Z")
+        with self.assertRaisesRegex(r.Refusal, "candidate_started_host_config_mismatch"):
+            r.validate_candidate_container(self.original, candidate, started=True, engine=engine)
+        candidate["HostConfig"]["OomKillDisable"] = None
+        r.validate_candidate_container(self.original, candidate, started=True, engine=engine)
+
+    def test_engine_cgroup_and_oom_capability_changes_refuse_before_post(self):
+        for key, value in (("CgroupVersion", "1"), ("CgroupDriver", "cgroupfs"),
+                           ("OomKillDisable", True), ("OomKillDisable", None), ("OomKillDisable", 0)):
+            with self.subTest(key=key, value=value):
+                saved = copy.deepcopy(self.cgroup)
+                self.cgroup[key] = value
+                try:
+                    with self.assertRaisesRegex(r.Refusal, "docker_oom_capability_changed"):
+                        self.create()
+                    self.assertFalse(self.posts())
+                finally:
+                    self.cgroup = saved
 
     def test_original_oom_null_is_a_required_baseline_pin(self):
         backend = Fake()
@@ -586,10 +651,11 @@ class EngineCreateTests(unittest.TestCase):
         self.assertFalse(self.requests)
 
     def test_daemon_version_id_context_endpoint_and_environment_are_pinned(self):
-        for case in ("version", "api", "minimum", "os", "id", "context", "endpoint", "override"):
+        for case in ("version", "build", "api", "minimum", "os", "id", "context", "endpoint", "override"):
             with self.subTest(case=case):
                 old = (copy.deepcopy(self.version), self.engine_id, self.context, self.endpoint)
                 if case == "version": self.version["Version"] = "unexpected"
+                elif case == "build": self.version["GitCommit"] = "different-build"
                 elif case == "api": self.version["ApiVersion"] = "1.51"
                 elif case == "minimum": self.version["MinAPIVersion"] = "1.45"
                 elif case == "os": self.version["Os"] = "windows"
