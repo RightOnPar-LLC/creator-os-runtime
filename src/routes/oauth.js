@@ -16,12 +16,14 @@ import {
   OPERATOR_PROFILE,
   profileForGrant,
   profileForRedirect,
+  refreshProofGrant,
   protectedResourceMetadata,
   publicBaseUrl,
   tokenResponse,
   validateAuthorizeRequest,
 } from "../oauth.js";
 import { renderPage } from "../cockpit.js";
+import { PROOF_PROFILE, PROOF_SUB, isProofRedirect, rejectProofOAuthOverrides } from "../proof-oauth.js";
 
 app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
 app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
@@ -112,7 +114,7 @@ app.post("/oauth/approve", requireAdmin, async (e) => {
   await validateAuthorizeRequest(t);
   let a = await getTenant(String(t.tenant || ""));
   if (!a || a.status !== "active") throw new HttpError(404, "tenant_not_found");
-  let n = await ensureRootGrant(a),
+  let n = await ensureRootGrant(a, profileForRedirect(t.redirect_uri)),
     r = randomBytes(24).toString("base64url");
   (await sql`INSERT INTO oauth_codes (hash, client_id, redirect_uri, challenge, tenant, root_id) VALUES (${sha256Hex(r)}, ${t.client_id}, ${t.redirect_uri}, ${t.code_challenge}, ${a.id}, ${n.id})`,
     await recordEvent(
@@ -135,6 +137,7 @@ app.post("/oauth/token", async (e) => {
     ? await readJsonBody(e)
     : Object.fromEntries(new URLSearchParams(await e.req.text()));
   if (t.grant_type === "authorization_code") {
+    if (isProofRedirect(t.redirect_uri)) rejectProofOAuthOverrides(t);
     let a = (
       await sql`DELETE FROM oauth_codes WHERE hash = ${sha256Hex(String(t.code || ""))} AND created_at > now() - interval '10 minutes' RETURNING *`
     )[0];
@@ -145,6 +148,7 @@ app.post("/oauth/token", async (e) => {
     let n = profileForRedirect(a.redirect_uri),
       r = nowSec() + n.consent,
       s = await issueOAuthGrant(a.root_id, r, n);
+    if (n === PROOF_PROFILE) r = Math.min(r, Number(s.row.exp));
     return e.json(tokenResponse(s, await mintRefreshToken(a.client_id, a.tenant, a.root_id, s.row.id, r), n));
   }
   if (t.grant_type === "refresh_token") {
@@ -185,14 +189,16 @@ app.post("/oauth/token", async (e) => {
       return oauthError(e, "invalid_grant", "consent window ended; approve again");
     let n = await getGrant(a.grant_id);
     if (!n || n.status === "revoked") return oauthError(e, "invalid_grant", "operator grant was revoked");
+    if (n.sub === PROOF_SUB) rejectProofOAuthOverrides(t);
     // Same profile the grant was approved under, or no refresh at all.
     let r = profileForGrant(n);
     if (!r) return oauthError(e, "invalid_grant", "grant profile unknown; approve again");
     // The same grant is signed again only while it would still be let in: a grant whose grant above has ended
     // answers 401 at the door (grants.js, endedAbove), so it goes the other way, where a root that is no longer
     // active ends in "approve again".
-    let s =
-      n.status === "active" && Number(n.exp) - nowSec() > 3600 && !(await endedAbove(sql, n.id))
+    let s = n.sub === PROOF_SUB
+      ? await refreshProofGrant(n, Number(a.consent_until)).catch(() => null)
+      : n.status === "active" && Number(n.exp) - nowSec() > 3600 && !(await endedAbove(sql, n.id))
         ? {
             row: n,
             token: reissueGrantToken(n),

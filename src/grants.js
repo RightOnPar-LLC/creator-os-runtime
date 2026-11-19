@@ -1,6 +1,7 @@
 // Grant lifecycle: mint root, issue child, revoke tree, settle usage, rate limit, verify.
 import { randomBytes } from "crypto";
-import { POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN, SERVICE_NAME } from "./config.js";
+import { env, POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN, SERVICE_NAME } from "./config.js";
+import { PROOF_ROOT_SUB, validateProofRootLimits } from "./proof-oauth.js";
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "./db.js";
 import { parseGrantToken, signGrantToken } from "./tokens.js";
@@ -25,10 +26,13 @@ import {
   zeroUsage,
 } from "./policy.js";
 
-export async function mintRootGrant(e, t = "tenant:root") {
+export async function mintRootGrant(e, t = "tenant:root", proofLimits = undefined) {
+  const proof = proofLimits !== undefined ? validateProofRootLimits(proofLimits, e, TIERS[e.tier], env) : null;
+  if ((proof && t !== PROOF_ROOT_SUB) || (!proof && t === PROOF_ROOT_SUB))
+    throw new HttpError(400, "proof_limits_required");
   let a = TIERS[e.tier],
     n = nowSec(),
-    r = n + a.maxTtlSec * 4,
+    r = n + (proof ? proof.ttlSec : a.maxTtlSec * 4),
     s = newId("gr"),
     i = parseJson(e.allowed_targets || {}),
     o = {
@@ -41,25 +45,26 @@ export async function mintRootGrant(e, t = "tenant:root") {
       iss: SERVICE_NAME,
       iat: n,
       exp: r,
-      caps: [...CAPS],
+      caps: proof ? proof.caps : [...CAPS],
       scope: {
         railway: {
-          projects: i.railway?.projects || [],
-          environments: i.railway?.environments || ["production"],
+          projects: proof ? [] : i.railway?.projects || [],
+          environments: proof ? [] : i.railway?.environments || ["production"],
         },
         workers: {
           namePrefix: tenantWorkerPrefix(e.id),
         },
-        memory: {
+        memory: proof ? proof.memory : {
           partitions: [""],
         },
+        ...(proof ? { proof: proof.marker } : {}),
       },
-      budget: {
+      budget: proof ? proof.budget : {
         usd_cents: a.usdCents,
         calls: a.deploysPerPeriod * 50,
         deploys: a.deploysPerPeriod,
       },
-      constraints: {
+      constraints: proof ? proof.constraints : {
         maxWorkers: a.maxWorkers,
         maxReplicas: a.maxReplicas,
         allowDelete: !0,

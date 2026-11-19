@@ -1,0 +1,49 @@
+{
+  "kind": "runtime-staging-readonly-hostconfig-observation/v1",
+  "dateUtc": "2026-11-19",
+  "target": "meshtool-prod",
+  "receiptPath": "/opt/staging/proof-reconnect-receipts/20261119T114345637875Z-0d9debb445c9.json",
+  "sourceSha": "0d9debb445c93a3c7c5246f81463ce3bf1a241c6",
+  "phase": "refused_before_activation",
+  "reason": "candidate_host_config_mismatch",
+  "bundleMatchesTested": true,
+  "candidateId": "6e0a6e6b05eb113fcd3457d26fa8f0e4f3d486dca28cf21a6d2314bbfa629f7a",
+  "candidateName": "/staging-runtime-candidate-20261119T114346271606Z-0d9debb445c9",
+  "candidateRunning": false,
+  "candidateStartedAt": "0001-01-01T00:00:00Z",
+  "originalStagingRunning": true,
+  "originalStagingUnchangedFromReceipt": true,
+  "productionUnchangedFromReceipt": true,
+  "baselinePassed": true,
+  "productionDatabaseEvidence": "owned_established_sockets",
+  "hostConfigDifferences": {
+    "OomKillDisable": {"original": null, "candidate": false}
+  },
+  "docker": {
+    "clientVersion": "29.1.3",
+    "serverVersion": "29.1.3",
+    "apiVersion": "1.52",
+    "minimumApiVersion": "1.44",
+    "engineId": "e982df3c-d2fd-4dec-bace-1b3831fb421c",
+    "contextIsDefault": true,
+    "endpointIsExpectedUnixSocket": true,
+    "socketIsSocket": true,
+    "socketOwnerUid": 0,
+    "socketOwnerGid": 110,
+    "socketMode": "0o660",
+    "apiOriginalIdMatchesCli": true,
+    "apiOriginalConfigMatchesCli": true,
+    "apiOriginalHostConfigMatchesCli": true
+  },
+  "sourceEvidence": {
+    "cli": "https://github.com/docker/cli/blob/v29.1.3/cli/command/container/opts.go",
+    "cliBlob": "a0cc1cb8f9d372ccf2a01429481c8524352aa432",
+    "apiType": "https://github.com/docker/cli/blob/v29.1.3/vendor/github.com/moby/moby/api/types/container/hostconfig.go",
+    "apiTypeBlob": "0f889c65124c6caac05a61b835ec0bba9c987cc3"
+  },
+  "limits": [
+    "Read-only inspection only; no remote create, update, start, stop, rename or delete in this lane",
+    "No environment values, request bodies or logging-option values emitted",
+    "New adapter remains unexecuted; strict candidate equality is still required before activation"
+  ]
+}

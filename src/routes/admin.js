@@ -1,6 +1,7 @@
 // Routes: admin: tenants, kill switch, policy, breakglass, grants, read-only tables. Registration order is significant.
 import { armedIntegrations, POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN } from "../config.js";
-import { HttpError, newId } from "../util.js";
+import { HttpError, newId, parseJson } from "../util.js";
+import { PROOF_ROOT_SUB, validateRootGrantBody } from "../proof-oauth.js";
 import { getGrant, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
@@ -143,12 +144,19 @@ app.post("/api/tenants/:id/targets", requireAdmin, async (e) => {
 app.post("/api/tenants/:id/root-grant", requireAdmin, async (e) => {
   let t = await getTenant(e.req.param("id"));
   if (!t) throw new HttpError(404, "tenant_not_found");
-  let a = await mintRootGrant(t, String((await readJsonBody(e)).sub || "tenant:root"));
+  const body = await readJsonBody(e);
+  validateRootGrantBody(body);
+  const proof = Object.hasOwn(body, "proof_limits");
+  let a = await mintRootGrant(t, proof ? PROOF_ROOT_SUB : String(body.sub || "tenant:root"), proof ? body.proof_limits : undefined);
   return e.json(
     {
       id: a.row.id,
       token: a.token,
       exp: Number(a.row.exp),
+      ...(proof ? {
+        sub: a.row.sub, caps: parseJson(a.row.caps), scope: parseJson(a.row.scope),
+        budget: parseJson(a.row.budget), constraints: parseJson(a.row.constraints),
+      } : {}),
     },
     201,
   );
