@@ -20,6 +20,8 @@ NEW_ID = "e" * 64
 NEW_IMAGE = "sha256:" + "f" * 64
 NEW_HASH = "a" * 64
 SECRET = "fake-password-never-in-evidence"
+STAGING_DB_ID = r.DB_PINS["staging"]["id"]
+PRODUCTION_DB_ID = r.DB_PINS["production"]["id"]
 
 
 def container(cid, name, network, ip, portmap, env, image=r.BASE_IMAGE):
@@ -33,7 +35,7 @@ def container(cid, name, network, ip, portmap, env, image=r.BASE_IMAGE):
                        "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
                        "Links": None, "Privileged": False},
         "Mounts": [],
-        "NetworkSettings": {"Networks": {network: {"NetworkID": r.NETWORK_ID if network == r.NETWORK else "bridge-id",
+        "NetworkSettings": {"Networks": {network: {"NetworkID": r.NETWORK_ID if network == r.NETWORK else r.DB_PINS["production"]["networkId"],
                                                    "IPAddress": ip, "Aliases": None, "DNSNames": [name]}}},
     }
 
@@ -48,19 +50,35 @@ class Fake:
         self.bad_health = False
         self.production_drift_at = None
         self.rollback_start_failure = False
+        self.env_drift_during_observation = False
+        self.db_drift_during_observation = False
+        self.socket_loss_after_activation = False
+        self.socket_loss_before_activation = False
+        self.socket_observations = []
         s = container(r.STAGING_ID, r.STAGING, r.NETWORK, "172.18.0.3", r.PORTS,
                       {"NODE_ENV": "production", "DATABASE_URL": "postgres://user:" + SECRET + "@staging-db-alias/db"})
-        p = container(r.PRODUCTION_ID, r.PRODUCTION, "bridge", "172.17.0.5",
+        p = container(r.PRODUCTION_ID, r.PRODUCTION, "bridge", r.PRODUCTION_ADDRESS,
                       {"3000/tcp": [{"HostIp": "100.85.34.93", "HostPort": "18081"}]},
-                      {"NODE_ENV": "production", "DATABASE_URL": "postgres://user:" + SECRET + "@pg/db"})
+                      {"NODE_ENV": "production", "DATABASE_URL": "postgres://user:" + SECRET + "@unresolved-old-db/db",
+                       **{"PUBLIC_FIXTURE_" + str(i): "fixture" for i in range(26)}})
+        p["Config"]["Env"].append("DATABASE_URL=postgres://user:" + SECRET + "@pg/db")
+        p["State"].update(Pid=r.PRODUCTION_PID, StartedAt=r.PRODUCTION_STARTED)
         p["HostConfig"]["Links"] = ["/production-db:/own-rails-runtime-prod/pg"]
-        sd = container("1" * 64, "staging-db", r.NETWORK, "172.18.0.2", {}, {})
+        sd = container(STAGING_DB_ID, "staging-db", r.NETWORK, r.DB_PINS["staging"]["address"], {}, {},
+                       image=r.DB_PINS["staging"]["image"])
         sd["NetworkSettings"]["Networks"][r.NETWORK]["Aliases"] = ["staging-db-alias"]
-        sd["Mounts"] = [{"Source": "/var/lib/docker/volumes/staging/_data", "Destination": "/data", "Type": "volume", "RW": True}]
-        pd = container("2" * 64, "production-db", "bridge", "172.17.0.2", {}, {})
-        pd["Mounts"] = [{"Source": "/var/lib/docker/volumes/prod/_data", "Destination": "/data", "Type": "volume", "RW": True}]
+        sd["Mounts"] = [{"Name": r.DB_PINS["staging"]["volume"], "Source": r.DB_PINS["staging"]["source"],
+                         "Destination": "/var/lib/postgresql", "Type": "volume", "RW": True}]
+        pd = container(PRODUCTION_DB_ID, "production-db", "bridge", r.DB_PINS["production"]["address"], {}, {},
+                       image=r.DB_PINS["production"]["image"])
+        pd["Mounts"] = [{"Name": r.DB_PINS["production"]["volume"], "Source": r.DB_PINS["production"]["source"],
+                         "Destination": "/var/lib/postgresql", "Type": "volume", "RW": True}]
         for c in (s, p, sd, pd):
             self.objects[c["Id"]] = c
+        self.volumes = {pin["volume"]: {"Name": pin["volume"], "Driver": "local", "Options": None,
+                                        "Mountpoint": pin["source"], "Scope": "local"} for pin in r.DB_PINS.values()}
+        self.sockets = [{"local": (r.PRODUCTION_ADDRESS, 43123),
+                         "peer": (r.DB_PINS["production"]["address"], 5432), "owners": {r.PRODUCTION_PID}}]
 
     def obj(self, name):
         for value in self.objects.values():
@@ -72,9 +90,29 @@ class Fake:
         return copy.deepcopy(self.obj(name))
 
     def network(self, name):
-        return {"Id": r.NETWORK_ID if name == r.NETWORK else "bridge-id", "Containers": {x["Id"]: {"Name": x["Name"].lstrip("/"),
+        return {"Id": r.NETWORK_ID if name == r.NETWORK else r.DB_PINS["production"]["networkId"], "Containers": {x["Id"]: {"Name": x["Name"].lstrip("/"),
                                           "IPv4Address": x["NetworkSettings"]["Networks"][name]["IPAddress"] + "/16"}
                                for x in self.objects.values() if name in x["NetworkSettings"]["Networks"]}}
+
+    def volume(self, name):
+        return copy.deepcopy(self.volumes[name])
+
+    def production_sockets(self, pid):
+        if pid != r.PRODUCTION_PID:
+            raise AssertionError("wrong process inspected")
+        self.socket_observations.append({"candidateExists": NEW_ID in self.objects,
+                                         "candidateRunning": NEW_ID in self.objects and self.obj(NEW_ID)["State"]["Running"],
+                                         "originalRunning": self.obj(r.STAGING_ID)["State"]["Running"]})
+        if self.env_drift_during_observation:
+            self.obj(r.PRODUCTION)["Config"]["Env"][0] += "-changed"
+        if self.db_drift_during_observation:
+            self.obj(PRODUCTION_DB_ID)["Mounts"][0]["Source"] += "-changed"
+        if NEW_ID in self.objects:
+            if self.socket_loss_after_activation and self.obj(NEW_ID)["State"]["Running"]:
+                return []
+            if self.socket_loss_before_activation and not self.obj(NEW_ID)["State"]["Running"]:
+                return []
+        return copy.deepcopy(self.sockets)
 
     def health(self, url):
         name = r.STAGING if url == r.STAGING_HEALTH else r.PRODUCTION
@@ -175,6 +213,95 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(r.identity(self.backend.inspect(r.PRODUCTION)), prod)
         self.assertEqual(r.environment(self.backend.obj(NEW_ID)), {**r.environment(self.backend.obj(r.STAGING_ID)), **r.PROOF_ENV})
         self.assertEqual(result["candidate"]["bundleHash"], NEW_HASH)
+        self.assertEqual(result["databaseIsolation"]["productionDatabaseEvidence"], "owned_established_sockets")
+        self.assertEqual(result["databaseIsolationAfter"]["productionDatabaseEvidence"], "owned_established_sockets")
+        self.assertNotIn("normalizedTargetsDistinct", json.dumps(result))
+        self.assertIn({"candidateExists": True, "candidateRunning": False, "originalRunning": True}, self.backend.socket_observations)
+        self.assertIn({"candidateExists": True, "candidateRunning": True, "originalRunning": False}, self.backend.socket_observations)
+        self.assert_production_never_mutated()
+
+    def test_missing_or_foreign_or_multiple_production_socket_peers_refuse_before_build(self):
+        correct = copy.deepcopy(self.backend.sockets[0])
+        cases = [[], [{**correct, "owners": {r.PRODUCTION_PID + 1}}],
+                 [{**correct, "owners": {r.PRODUCTION_PID, r.PRODUCTION_PID + 1}}],
+                 [{**correct, "peer": ("172.17.0.99", 5432)}],
+                 [correct, {**correct, "peer": ("172.17.0.99", 5432)}],
+                 [{**correct, "local": ("172.18.0.3", 43123)}]]
+        for sockets in cases:
+            with self.subTest(sockets=sockets):
+                self.backend = Fake()
+                self.backend.sockets = sockets
+                with self.assertRaises(r.Refusal):
+                    self.deploy()
+                self.assertEqual(self.backend.commands, [])
+
+    def test_production_pid_start_or_restart_drift_refuses(self):
+        for mutate in (lambda p: p["State"].update(Pid=r.PRODUCTION_PID + 1),
+                       lambda p: p["State"].update(StartedAt="2026-11-19T00:00:00Z"),
+                       lambda p: p.update(RestartCount=1)):
+            with self.subTest(mutate=mutate):
+                self.backend = Fake()
+                mutate(self.backend.obj(r.PRODUCTION))
+                with self.assertRaisesRegex(r.Refusal, "production_process_pin_mismatch"):
+                    self.deploy()
+                self.assertEqual(self.backend.commands, [])
+
+    def test_production_raw_environment_drift_during_observation_refuses(self):
+        self.backend.env_drift_during_observation = True
+        with self.assertRaisesRegex(r.Refusal, "production_environment_changed"):
+            self.deploy()
+        self.assertEqual(self.backend.commands, [])
+
+    def test_production_raw_environment_drift_between_observations_refuses(self):
+        production = self.backend.inspect(r.PRODUCTION)
+        raw = r.production_environment_snapshot(production)
+        # Identity and shape remain the same; full raw array comparison catches it.
+        self.backend.obj(r.PRODUCTION)["Config"]["Env"][0] += "-changed"
+        with self.assertRaisesRegex(r.Refusal, "production_environment_changed"):
+            r.assert_production_unchanged(self.backend, r.identity(production), raw)
+
+    def test_database_peer_storage_changed_during_socket_observation_refuses(self):
+        self.backend.db_drift_during_observation = True
+        with self.assertRaisesRegex(r.Refusal, "production_database_storage_changed"):
+            self.deploy()
+        self.assertEqual(self.backend.commands, [])
+
+    def test_production_database_identity_network_address_volume_and_running_pins(self):
+        mutations = [lambda b: b.obj(PRODUCTION_DB_ID).update(Image="different"),
+                     lambda b: b.obj(PRODUCTION_DB_ID)["State"].update(Running=False),
+                     lambda b: b.obj(PRODUCTION_DB_ID)["NetworkSettings"]["Networks"]["bridge"].update(NetworkID="changed"),
+                     lambda b: b.obj(PRODUCTION_DB_ID)["NetworkSettings"]["Networks"]["bridge"].update(IPAddress="172.17.0.99"),
+                     lambda b: b.obj(PRODUCTION_DB_ID)["Mounts"][0].update(Source="/different"),
+                     lambda b: b.volumes[r.DB_PINS["production"]["volume"]].update(Options={"remote": "unapproved"})]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                self.backend = Fake()
+                mutate(self.backend)
+                with self.assertRaises(r.Refusal):
+                    self.deploy()
+                self.assertEqual(self.backend.commands, [])
+
+    def test_duplicate_docker_address_is_not_a_unique_peer(self):
+        other = copy.deepcopy(self.backend.obj(PRODUCTION_DB_ID))
+        other["Id"] = "7" * 64
+        self.backend.objects[other["Id"]] = other
+        with self.assertRaisesRegex(r.Refusal, "production_database_address_not_unique"):
+            self.deploy()
+        self.assertEqual(self.backend.commands, [])
+
+    def test_vanished_sockets_immediately_before_stop_refuse_without_stop(self):
+        self.backend.socket_loss_before_activation = True
+        with self.assertRaisesRegex(r.Refusal, "refused_before_activation:production_postgres_sockets_absent"):
+            self.deploy()
+        self.assertTrue(self.backend.obj(r.STAGING_ID)["State"]["Running"])
+        self.assertNotIn("stop", [c[0] for c in self.backend.commands])
+
+    def test_vanished_sockets_after_candidate_health_restore_original(self):
+        self.backend.socket_loss_after_activation = True
+        with self.assertRaisesRegex(r.Refusal, "failed_restored:production_postgres_sockets_absent"):
+            self.deploy()
+        self.assertEqual(self.backend.obj(r.STAGING)["Id"], r.STAGING_ID)
+        self.assertTrue(self.backend.obj(r.STAGING_ID)["State"]["Running"])
         self.assert_production_never_mutated()
 
     def test_wrong_host_refuses_without_build(self):
@@ -197,7 +324,7 @@ class RolloutTests(unittest.TestCase):
                 self.assertEqual(self.backend.commands, [])
 
     def test_unresolved_database_alias_refuses(self):
-        self.backend.obj("1" * 64)["NetworkSettings"]["Networks"][r.NETWORK]["Aliases"] = []
+        self.backend.obj(STAGING_DB_ID)["NetworkSettings"]["Networks"][r.NETWORK]["Aliases"] = []
         with self.assertRaisesRegex(r.Refusal, "database_target_not_unique"):
             self.deploy()
         self.assertEqual(self.backend.commands, [])
@@ -213,8 +340,8 @@ class RolloutTests(unittest.TestCase):
                 self.assertEqual(self.backend.commands, [])
 
     def test_shared_writable_database_storage_refuses(self):
-        self.backend.obj("1" * 64)["Mounts"][0]["Source"] = "/var/lib/docker/volumes/prod/_data/inside"
-        with self.assertRaisesRegex(r.Refusal, "database_isolation_refused"):
+        self.backend.obj(STAGING_DB_ID)["Mounts"][0]["Source"] = r.DB_PINS["production"]["source"] + "/inside"
+        with self.assertRaisesRegex(r.Refusal, "staging_database_storage_changed"):
             self.deploy()
         self.assertEqual(self.backend.commands, [])
 
@@ -243,7 +370,7 @@ class RolloutTests(unittest.TestCase):
 
     def test_candidate_database_mapping_change_refuses(self):
         original = r.database_target(self.backend, self.backend.inspect(r.STAGING))
-        self.backend.obj("1" * 64)["NetworkSettings"]["Networks"][r.NETWORK]["IPAddress"] = "172.18.0.9"
+        self.backend.obj(STAGING_DB_ID)["NetworkSettings"]["Networks"][r.NETWORK]["IPAddress"] = "172.18.0.9"
         with self.assertRaisesRegex(r.Refusal, "candidate_database_target_changed"):
             r.assert_candidate_database(self.backend, self.backend.inspect(r.STAGING), original, started=True)
 
@@ -340,6 +467,58 @@ class RolloutTests(unittest.TestCase):
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_production_exception_does_not_relax_general_environment_parser(self):
+        backend = Fake()
+        with self.assertRaisesRegex(r.Refusal, "environment_conflicting_duplicate"):
+            r.environment(backend.inspect(r.PRODUCTION))
+        raw = r.production_environment_snapshot(backend.inspect(r.PRODUCTION))
+        self.assertEqual(raw, backend.obj(r.PRODUCTION)["Config"]["Env"])
+
+    def test_production_exception_requires_only_the_exact_observed_duplicate_shape(self):
+        for mutate in (lambda raw: raw.append("EXTRA=value"),
+                       lambda raw: raw.__setitem__(2, "NODE_ENV=other"),
+                       lambda raw: raw.__setitem__(-1, raw[1])):
+            with self.subTest(mutate=mutate):
+                backend = Fake()
+                mutate(backend.obj(r.PRODUCTION)["Config"]["Env"])
+                with self.assertRaisesRegex(r.Refusal, "production_environment_shape_refused"):
+                    r.production_environment_snapshot(backend.inspect(r.PRODUCTION))
+
+    def test_socket_parser_extracts_endpoints_and_owner_without_raw_line(self):
+        line = '0 0 172.17.0.5:43123 172.17.0.3:5432 users:(("bun",pid=700646,fd=12))'
+        rows = r.parse_postgres_sockets(line)
+        self.assertEqual(rows, [{"local": ("172.17.0.5", 43123), "peer": ("172.17.0.3", 5432), "owners": {700646}}])
+        self.assertNotIn("users:", repr(rows))
+
+    def test_socket_parser_refuses_empty_unowned_wrong_port_or_malformed_rows(self):
+        for text in ("", "garbage", "0 0 172.17.0.5:43123 172.17.0.3:5432",
+                     '0 0 172.17.0.5:43123 172.17.0.3:9999 users:(("bun",pid=700646,fd=12))'):
+            with self.subTest(text=text):
+                with self.assertRaises(r.Refusal):
+                    r.parse_postgres_sockets(text)
+
+    def test_only_byte_identical_duplicate_environment_entries_are_equivalent(self):
+        c = {"Config": {"Env": ["A=value=with=equals", "B=", "A=value=with=equals", "B="]}}
+        self.assertEqual(r.environment(c), {"A": "value=with=equals", "B": ""})
+        for entries in (["A=value", "A=value "], ["A=value", "A=VALUE"],
+                        ["A=first", "A=second"], ["DATABASE_URL=one", "DATABASE_URL=two"]):
+            with self.subTest(entries=entries):
+                with self.assertRaisesRegex(r.Refusal, "environment_conflicting_duplicate"):
+                    r.environment({"Config": {"Env": entries}})
+
+    def test_malformed_environment_entries_are_not_normalized_away(self):
+        for entries in (["NO_EQUALS"], ["=empty-key"]):
+            with self.assertRaisesRegex(r.Refusal, "environment_shape_refused"):
+                r.environment({"Config": {"Env": entries}})
+
+    def test_unexpected_production_duplicate_shape_still_blocks_the_plan(self):
+        backend = Fake()
+        backend.obj(r.PRODUCTION)["Config"]["Env"].append("DATABASE_URL=postgres://different@pg/other")
+        with patch.object(r.socket, "gethostname", return_value=r.HOST):
+            with self.assertRaisesRegex(r.Refusal, "production_environment_shape_refused"):
+                r.baseline(backend)
+        self.assertEqual(backend.commands, [])
+
     def test_default_cli_is_read_only_and_never_locks_builds_or_writes(self):
         backend = Fake()
         output = io.StringIO()

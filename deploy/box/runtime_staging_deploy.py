@@ -13,6 +13,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -34,6 +35,10 @@ STAGING_ID = "090fc51c6884d1dbdc09b39cf6321ef40d42237fba25f2291d1f382ff0b11fa5"
 PRODUCTION_ID = "5146ed5cf72447487286ba4ab485060cc593af62e217cfa2e53e3bd1177109e0"
 BASE_IMAGE = "sha256:a6b89fcfad50fa125c3870253acef39e40ad98d742ecff82fb8c09ead8fc805f"
 BASE_HASH = "59107df04578198aef024dae1a8cf7882f3ef2573e89bfb24429156a0d8b9525"
+PRODUCTION_PID = 700646
+PRODUCTION_STARTED = "2026-11-14T08:51:34.616308668Z"
+PRODUCTION_RESTART_COUNT = 0
+PRODUCTION_ADDRESS = "172.17.0.5"
 NETWORK = "staging-net"
 NETWORK_ID = "60b98edbb630a5f50d6b2adc53209b54811cb45c2a5de53446afbf5b3153e75c"
 PORTS = {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18080"},
@@ -54,6 +59,21 @@ PROOF_ENV = {
 KIND = "runtime-isolated-staging-rollout/v1"
 RECOVERABLE = {"candidate_created", "stopping_original", "original_retained", "starting_candidate",
                "staged", "rollback_started", "uncertain_manual_recovery_required"}
+DB_PINS = {
+    "production": {
+        "id": "15cec49a81ca655e5931420942587810a41570aab5a0e6dcd6c4052474600075",
+        "image": "sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42",
+        "network": "bridge", "networkId": "cc32d3153b73425fbad4b7166296af5e0f00f7d70b50e66d263b6f741d45550a",
+        "address": "172.17.0.3", "volume": "pg-runtime",
+        "source": "/var/lib/docker/volumes/pg-runtime/_data",
+    },
+    "staging": {
+        "id": "8dc791d2cd40a6024a718b9e55d01fecd600ede1eb965662fe29e2bde28847fd",
+        "image": "sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81",
+        "network": NETWORK, "networkId": NETWORK_ID, "address": "172.18.0.2",
+        "volume": "staging-pg-data", "source": "/var/lib/docker/volumes/staging-pg-data/_data",
+    },
+}
 
 
 class Refusal(Exception):
@@ -73,7 +93,10 @@ def environment(container):
     result = {}
     for item in container["Config"].get("Env", []):
         key, sep, value = item.partition("=")
-        require(sep and key not in result, "environment_shape_refused")
+        require(sep and key, "environment_shape_refused")
+        # Identical repeats cannot change first/last-wins lookup semantics. A
+        # conflicting repeat is ambiguous, so never silently choose either one.
+        require(key not in result or result[key] == value, "environment_conflicting_duplicate")
         result[key] = value
     return result
 
@@ -130,6 +153,15 @@ class Backend:
 
     def image(self, name):
         return json.loads(self.run(["docker", "image", "inspect", name], label="image_inspect"))[0]
+
+    def volume(self, name):
+        return json.loads(self.run(["docker", "volume", "inspect", name], label="volume_inspect"))[0]
+
+    def production_sockets(self, pid):
+        require(pid == PRODUCTION_PID, "socket_process_pin_mismatch")
+        raw = self.run(["nsenter", "--target", str(pid), "--net", "--", "ss", "-Hntp",
+                        "state", "established", "( dport = :5432 )"], label="production_socket_read", timeout=10)
+        return parse_postgres_sockets(raw.decode("utf-8"))
 
     def docker(self, *args):
         # All callers pass literal staging names or previously verified staging IDs.
@@ -225,12 +257,135 @@ def database_target(backend, runtime):
     return container_id, (address, 5432, urllib.parse.unquote(u.path.lstrip("/"))), sources
 
 
-def check_database_isolation(backend, staging, production):
-    a, b = database_target(backend, staging), database_target(backend, production)
-    shared = any(x == y or x.startswith(y.rstrip("/") + "/") or y.startswith(x.rstrip("/") + "/")
-                 for x in a[2] for y in b[2])
-    require(a[0] != b[0] and a[1] != b[1] and not shared, "database_isolation_refused")
-    return {"normalizedTargetsDistinct": True, "databaseContainersDistinct": True,
+def production_environment_snapshot(production):
+    """The one observed production exception is opaque data, never a URL selection.
+
+    Staging/candidates always use environment(), which rejects conflicting values.
+    This array remains in memory only; no value or credential hash enters receipts.
+    """
+    raw = production["Config"].get("Env", [])
+    require(isinstance(raw, list) and len(raw) == 29, "production_environment_shape_refused")
+    grouped = {}
+    for item in raw:
+        require(isinstance(item, str), "production_environment_shape_refused")
+        key, sep, value = item.partition("=")
+        require(key and sep, "production_environment_shape_refused")
+        grouped.setdefault(key, []).append(value)
+    duplicates = {key: len(values) for key, values in grouped.items() if len(values) > 1}
+    require(len(grouped) == 28 and duplicates == {"DATABASE_URL": 2}
+            and grouped["DATABASE_URL"][0] != grouped["DATABASE_URL"][1], "production_environment_shape_refused")
+    return list(raw)
+
+
+def assert_production_process_pin(production):
+    require(production["Id"] == PRODUCTION_ID and production["Image"] == BASE_IMAGE,
+            "production_container_or_image_pin_mismatch")
+    state = production["State"]
+    require(state["Running"] and state["Pid"] == PRODUCTION_PID
+            and state["StartedAt"] == PRODUCTION_STARTED
+            and production["RestartCount"] == PRODUCTION_RESTART_COUNT, "production_process_pin_mismatch")
+    networks = production["NetworkSettings"]["Networks"]
+    require(set(networks) == {"bridge"} and production["HostConfig"]["NetworkMode"] == "bridge"
+            and networks["bridge"]["NetworkID"] == DB_PINS["production"]["networkId"]
+            and networks["bridge"]["IPAddress"] == PRODUCTION_ADDRESS, "production_network_pin_mismatch")
+
+
+def parse_postgres_sockets(text):
+    """Parse only endpoints and owner PIDs; never return a raw ss line."""
+    rows = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        endpoints = []
+        for field in line.split():
+            try:
+                address, port = field.rsplit(":", 1)
+                parsed = ipaddress.ip_address(address.strip("[]"))
+                if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+                    parsed = parsed.ipv4_mapped
+                endpoints.append((str(parsed), int(port)))
+            except (ValueError, TypeError):
+                pass
+        owners = set(int(value) for value in re.findall(r"pid=([0-9]+)", line))
+        require(len(endpoints) == 2 and endpoints[1][1] == 5432 and owners,
+                "postgres_socket_shape_refused")
+        rows.append({"local": endpoints[0], "peer": endpoints[1], "owners": owners})
+    require(rows, "production_postgres_sockets_absent")
+    return rows
+
+
+def pinned_database(backend, role):
+    pin = DB_PINS[role]
+    db = backend.inspect(pin["id"])
+    require(db["Id"] == pin["id"] and db["Image"] == pin["image"] and db["State"]["Running"],
+            role + "_database_identity_changed")
+    networks = db["NetworkSettings"]["Networks"]
+    require(set(networks) == {pin["network"]}
+            and networks[pin["network"]]["NetworkID"] == pin["networkId"]
+            and networks[pin["network"]]["IPAddress"] == pin["address"], role + "_database_network_changed")
+    network = backend.network(pin["network"])
+    require(network["Id"] == pin["networkId"], role + "_database_network_changed")
+    owners = [cid for cid, item in network.get("Containers", {}).items()
+              if item.get("IPv4Address", "").split("/")[0] == pin["address"]]
+    require(owners == [pin["id"]], role + "_database_address_not_unique")
+    writable = [{"type": m["Type"], "name": m.get("Name"), "source": m.get("Source"),
+                 "canonicalSource": os.path.realpath(m.get("Source", "")),
+                 "destination": m["Destination"], "rw": m["RW"]}
+                for m in db["Mounts"] if m.get("RW")]
+    expected = [{"type": "volume", "name": pin["volume"], "source": pin["source"],
+                 "canonicalSource": pin["source"], "destination": "/var/lib/postgresql", "rw": True}]
+    require(writable == expected, role + "_database_storage_changed")
+    volume = backend.volume(pin["volume"])
+    require(volume["Name"] == pin["volume"] and volume["Driver"] == "local"
+            and not volume.get("Options") and volume["Mountpoint"] == pin["source"]
+            and volume.get("Scope") == "local", role + "_database_volume_changed")
+    return pin
+
+
+def observe_production_database(backend, production, expected_env=None):
+    assert_production_process_pin(production)
+    before = identity(production)
+    env_before = production_environment_snapshot(production)
+    if expected_env is not None:
+        require(env_before == expected_env, "production_environment_changed")
+    # The existing public health route creates/uses the existing DB pool. No
+    # credential or SQL is injected; this also checks the pinned running source.
+    require(healthy(backend.health(PRODUCTION_HEALTH), BASE_HASH), "production_health_changed")
+    pin = pinned_database(backend, "production")
+    sockets = backend.production_sockets(PRODUCTION_PID)
+    require(sockets, "production_postgres_sockets_absent")
+    require(all(row["owners"] == {PRODUCTION_PID} for row in sockets), "production_socket_owner_mismatch")
+    require(all(row["local"][0] == PRODUCTION_ADDRESS for row in sockets), "production_socket_local_address_changed")
+    peers = {row["peer"] for row in sockets}
+    require(peers == {(pin["address"], 5432)}, "production_socket_peer_mismatch")
+    # Re-read the database after observing sockets; a cached peer must not stand
+    # in for an independently running, still-pinned database and volume.
+    pinned_database(backend, "production")
+    after = backend.inspect(PRODUCTION)
+    assert_production_process_pin(after)
+    require(identity(after) == before, "production_identity_changed_during_observation")
+    require(production_environment_snapshot(after) == env_before, "production_environment_changed")
+    require(healthy(backend.health(PRODUCTION_HEALTH), BASE_HASH), "production_health_changed")
+    return {"productionDatabaseEvidence": "owned_established_sockets",
+            "observedProcessPid": PRODUCTION_PID, "observedProcessStartedAt": PRODUCTION_STARTED,
+            "observedRestartCount": PRODUCTION_RESTART_COUNT,
+            "productionDatabaseContainerId": pin["id"], "productionDatabasePinsMatched": True,
+            "establishedPostgresSockets": len(sockets), "observedSocketPeers": 1,
+            "productionRawEnvArrayUnchanged": True, "observedAt": now()}
+
+
+def check_database_isolation(backend, staging, production, expected_prod_env=None):
+    target = database_target(backend, staging)
+    stage = pinned_database(backend, "staging")
+    require(target[0] == stage["id"] and target[1][:2] == (stage["address"], 5432)
+            and target[2] == [stage["source"]], "staging_database_target_not_pinned")
+    evidence = observe_production_database(backend, production, expected_prod_env)
+    prod = DB_PINS["production"]
+    require(stage["id"] != prod["id"] and stage["address"] != prod["address"]
+            and not (stage["source"] == prod["source"] or stage["source"].startswith(prod["source"] + "/")
+                     or prod["source"].startswith(stage["source"] + "/")), "database_isolation_refused")
+    return {**evidence, "stagingDatabaseContainerId": stage["id"], "stagingDatabasePinsMatched": True,
+            "socketPeersDistinct": True, "databaseContainersDistinct": True,
             "writableDatabaseStorageDisjoint": True}
 
 
@@ -255,9 +410,10 @@ def baseline(backend):
     return s, p, check_database_isolation(backend, s, p)
 
 
-def assert_production_unchanged(backend, before):
-    require(identity(backend.inspect(PRODUCTION)) == before, "production_identity_changed")
-    require(healthy(backend.health(PRODUCTION_HEALTH), BASE_HASH), "production_health_changed")
+def assert_production_unchanged(backend, before, expected_env=None):
+    production = backend.inspect(PRODUCTION)
+    require(identity(production) == before, "production_identity_changed")
+    return observe_production_database(backend, production, expected_env)
 
 
 def validate_candidate_container(old, new):
@@ -330,7 +486,7 @@ def save_receipt(path, data):
         os.close(directory)
 
 
-def restore(backend, record):
+def restore(backend, record, expected_prod_env=None):
     """Only restore the pinned original staging container; retain candidate stopped."""
     require(record["stagingBefore"]["id"] == STAGING_ID, "rollback_original_pin_mismatch")
     old = backend.inspect(STAGING_ID)
@@ -354,13 +510,14 @@ def restore(backend, record):
         backend.docker("start", STAGING_ID)
     require(backend.inspect(STAGING)["Id"] == STAGING_ID, "rollback_name_not_restored")
     wait_health(backend, BASE_HASH)
-    assert_production_unchanged(backend, record["productionBefore"])
+    assert_production_unchanged(backend, record["productionBefore"], expected_prod_env)
 
 
 def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
     require(re.fullmatch(r"[0-9a-f]{64}", expected_bundle_hash or ""), "tested_bundle_hash_required")
     source = backend.candidate(repo, sha)
     old, prod, isolation = baseline(backend)
+    original_production_env = production_environment_snapshot(prod)
     original_database_target = database_target(backend, old)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     suffix = stamp + "-" + sha[:12]
@@ -379,7 +536,7 @@ def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
         require(record["candidate"]["bundleHash"] == expected_bundle_hash, "image_differs_from_tested_bundle")
         # No mutable source refs and no pre-existing staging drift before create/stop.
         require(identity(backend.inspect(STAGING)) == identity(old), "staging_changed_during_build")
-        assert_production_unchanged(backend, record["productionBefore"])
+        assert_production_unchanged(backend, record["productionBefore"], original_production_env)
         arguments = ["create", "--name", record["candidateName"], "--restart", "unless-stopped",
                      "--network", NETWORK, "-p", "127.0.0.1:18080:3000", "-p", "100.85.34.93:18080:3000",
                      "--env-file", ENV_FILE]
@@ -395,7 +552,7 @@ def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
         validate_candidate_container(old, candidate)
         assert_candidate_database(backend, candidate, original_database_target, started=False)
         require(candidate["Image"] == record["candidate"]["imageId"], "candidate_image_mismatch")
-        assert_production_unchanged(backend, record["productionBefore"])
+        assert_production_unchanged(backend, record["productionBefore"], original_production_env)
         record["phase"] = "stopping_original"
         writer(path, record)
         touched_original = True
@@ -412,8 +569,9 @@ def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
         require(backend.inspect(STAGING)["Id"] == candidate_id, "active_candidate_identity_mismatch")
         live_candidate = backend.inspect(candidate_id)
         assert_candidate_database(backend, live_candidate, original_database_target, started=True)
-        check_database_isolation(backend, live_candidate, backend.inspect(PRODUCTION))
-        assert_production_unchanged(backend, record["productionBefore"])
+        record["databaseIsolationAfter"] = check_database_isolation(
+            backend, live_candidate, backend.inspect(PRODUCTION), original_production_env)
+        assert_production_unchanged(backend, record["productionBefore"], original_production_env)
         record.update(phase="staged", finishedAt=now(), productionUnchanged=True,
                       rollbackContainerRetained=STAGING_ID, databaseTargetPreserved=True)
         writer(path, record)
@@ -422,7 +580,7 @@ def deploy(backend, repo, sha, expected_bundle_hash, path, writer=save_receipt):
         record["reason"] = str(exc) if isinstance(exc, Refusal) else "unexpected_failure_details_suppressed"
         if touched_original:
             try:
-                restore(backend, record)
+                restore(backend, record, original_production_env)
                 record.update(phase="failed_restored", productionUnchanged=True)
             except BaseException:
                 record["phase"] = "uncertain_manual_recovery_required"
@@ -457,11 +615,12 @@ def main():
         require(record.get("candidateContainerId") and record.get("candidate", {}).get("imageId"),
                 "rollback_candidate_checkpoint_missing")
         with locks():
-            assert_production_unchanged(backend, record["productionBefore"])
+            original_production_env = production_environment_snapshot(backend.inspect(PRODUCTION))
+            assert_production_unchanged(backend, record["productionBefore"], original_production_env)
             record["phase"] = "rollback_started"
             save_receipt(path, record)
             try:
-                restore(backend, record)
+                restore(backend, record, original_production_env)
             except BaseException:
                 record["phase"] = "uncertain_manual_recovery_required"
                 save_receipt(path, record)
