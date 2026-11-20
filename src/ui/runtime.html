@@ -168,6 +168,11 @@ table.t tr:last-child td{border-bottom:0}
 @media (max-width:1180px){.body{grid-template-columns:220px minmax(0,1fr)}.cog{grid-column:1/-1;border-left:0;border-top:1px solid var(--line2)}.marks{max-height:340px}}
 @media (max-width:860px){.three{grid-template-columns:1fr}.three .card{min-height:0}.inbox{grid-template-columns:1fr}.inbox .list{border-right:0;border-bottom:1px solid var(--line2)}.signin{grid-template-columns:1fr}}
 @media (max-width:760px){.body{grid-template-columns:1fr}.rail{order:3;border-right:0;border-top:1px solid var(--line2)}.loupe{order:1;padding:16px}.cog{order:2}.lhead h1{font-size:24px}.omni{order:5;flex-basis:100%}.hist{display:none}.omni .cell{display:none}}
+.wallet-card[hidden]{display:none}
+.wallet-card{background:linear-gradient(120deg,var(--panel),var(--win));border-color:var(--line3)}
+.wallet-card iframe{display:block;width:100%;height:200px;border:0;color-scheme:dark}
+.wallet-links{display:flex;align-items:center;flex-wrap:wrap;gap:4px 18px}
+.wallet-links a{display:inline-flex;align-items:center;min-height:44px;color:var(--accent)}
 </style>
 </head>
 <body>
@@ -229,6 +234,11 @@ table.t tr:last-child td{border-bottom:0}
           <div class="act" id="headAct"></div>
         </div>
         <nav class="secnav" aria-label="Sections" id="secnav"></nav>
+        <section id="walletCard" class="card wallet-card" aria-labelledby="walletTitle" hidden>
+          <div class="ch"><h2 id="walletTitle">Mesh wallet</h2><span class="kick">MESH credits</span></div>
+          <iframe title="Your Mesh wallet balance" data-src="https://wallet.meshtool.ai/runtime-card" referrerpolicy="no-referrer" sandbox="allow-same-origin allow-top-navigation-by-user-activation"></iframe>
+          <div class="wallet-links"><a href="https://wallet.meshtool.ai/?view=details">Full ledger and wallet settings</a><a href="https://market.meshtool.ai/check">Check a receipt</a></div>
+        </section>
         <div id="view" style="display:flex;flex-direction:column;gap:14px;min-width:0"></div>
       </main>
 
@@ -308,6 +318,7 @@ const evTone = (t) => { t = String(t); return /fail|crash|denied|revok|paused/.t
 // ---- views -----------------------------------------------------------------------------------
 const VIEWS = {
   "": { title: "Everyone and everything on your Mesh", nav: "Overview", lex: "The Loupe" },
+  wallet: { title: "Your wallet", nav: "Wallet", lex: "MeshMarket credits" },
   grants: { title: "Who has access?", nav: "Access", lex: "Permissions" },
   worlds: { title: "Workspaces", nav: "Workspaces", lex: "Workspaces", one: "See the workspaces on this Runtime and their current status.", api: "/api/tenants", key: "tenants", cols: ["name", "tier", "status", "deploys_period", "created_at", "id"] },
   receipts: { title: "Receipts", nav: "Receipts", lex: "Hallmarks", one: "Every action the runtime, COG and the agents took, newest first.", api: "/api/admin/events", key: "events", cols: ["ts", "type", "actor", "tenant", "data"] },
@@ -343,6 +354,18 @@ async function route() {
   const { k, qs } = parseRoute();
   S.view = k;
   setHead(k);
+  const card = $("walletCard");
+  card.hidden = k !== "" && k !== "wallet";
+  const frame = card.querySelector("iframe");
+  if (!card.hidden && !frame.hasAttribute("src")) frame.src = frame.dataset.src;
+  if (k === "wallet") {
+    $("view").innerHTML = `<section class="card"><h2>Continue from here</h2><div class="wallet-links">
+      <a href="https://devdesk.meshtool.ai/board">Build in DevDesk</a>
+      <a href="https://market.meshtool.ai/exchange">Explore MeshMarket</a>
+      <a href="https://deck.meshtool.ai/">Open Mesh Deck</a>
+    </div></section>`;
+    return;
+  }
   if (k === "connect") return connect(qs);
   if (!S.signed) return signin();
   if (k === "") { const ch = new URLSearchParams(qs).get("cheque"); if (ch) S.sel = ch; return overview(); }
@@ -895,7 +918,7 @@ function chrome() {
   const dot = (n) => (B[n] ? `<span class="dot ${B[n].up ? "" : "bad"}"></span>` : "");
   const T = [["RT", "Runtime status", "/status", "runtime.meshtool.ai", (S.status ? (S.status.ok ? '<span class="dot"></span>' : '<span class="dot gold"></span>') : "")],
     ["DK", "Mesh Deck", "https://deck.meshtool.ai/", "deck.meshtool.ai", ""],
-    ["DD", "DevDesk", "https://devdesk.meshtool.ai/", st("DevDesk") || "devdesk.meshtool.ai", dot("DevDesk")],
+    ["DD", "DevDesk", "https://devdesk.meshtool.ai/board", st("DevDesk") || "devdesk.meshtool.ai", dot("DevDesk")],
     ["MK", "MeshMarket", "https://market.meshtool.ai/", st("MeshMarket") || "market.meshtool.ai", dot("MeshMarket")],
     ["GT", "MCP gate", "", st("MCP gate (Claude sign-in)") || "Claude sign-in", dot("MCP gate (Claude sign-in)")]];
   $("tabs").innerHTML = T.map(([i, n, href, sub, d]) => href ? `<a class="tab" href="${href}" ${href.startsWith("http") ? 'target="_blank" rel="noopener"' : ""}><span class="ini ${i === "MK" ? "gold" : ""}">${i}</span><span class="t"><b>${esc(n)}</b><span>${esc(sub)}</span></span>${d}</a>` : `<div class="tab"><span class="ini">${i}</span><span class="t"><b>${esc(n)}</b><span>${esc(sub)}</span></span>${d}</div>`).join("");
@@ -952,7 +975,11 @@ async function tick() {
 // ---- wiring ------------------------------------------------------------------------------------
 $("back").onclick = () => history.back();
 $("fwd").onclick = () => history.forward();
-$("reload").onclick = () => refresh();
+$("reload").onclick = () => {
+  const frame = $("walletCard").querySelector("iframe");
+  if (!$("walletCard").hidden && frame.hasAttribute("src")) frame.src = frame.dataset.src;
+  return refresh();
+};
 $("crown").onclick = crown;
 $("crown2").onclick = crown;
 $("who").onclick = async () => {
