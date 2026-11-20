@@ -166,3 +166,8 @@ Implemented: strict owner-issued proof root limits, exact reserved proof callbac
 Verified locally on Z13:442 source tests and442 compiled-artifact tests passed;9 pure policy tests passed. Tested bundle SHA256:25f72bc77c00fcbf6794a3fed7efee350f0f216690ef9633b9e90b6e4c8d0ee9. The staging-only rollout helper passed26 mocked refusal/recovery tests and independent review. The original source rebuilt to the observed live baseline hash before these changes.
 
 Next: review the helper's read-only plan, activate only the existing isolated staging container, register the exact proof callback, complete supported owner/OAuth reconnect, and capture one harmless NATS job plus same-job resume. Live reconnect/job evidence is not yet complete. Ordinary deploy/box/deploy.sh also updates production and is not this proof's rollout path. Retain the original staging container and exact receipt for rollback. See deploy/box/PROOF-RECONNECT-20261119.md.
+
+
+## Wallet onboarding and Runtime card
+
+The public Runtime wallet card depends on the paired MeshMarket wallet Worker. After both releases, verify a signed-out visitor and a designated wallet returning to the card, then verify the direct DevDesk board link. The cross-repository check lives in Meshtool/meshmarket at wallet/tests/runtime-handoff.mjs.

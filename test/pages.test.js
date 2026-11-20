@@ -30,6 +30,14 @@ describe("pages: the repo's pages, not the database's", () => {
     expect(home).toContain("control room for Dw's Mesh");
   });
 
+  test("Wallet is a read-only, wallet-origin card with direct access to the DevDesk board", async () => {
+    const home = await req("GET", "/");
+    expect(home.text).toContain('data-src="https://wallet.meshtool.ai/runtime-card"');
+    expect(home.text).toContain('sandbox="allow-same-origin allow-top-navigation-by-user-activation"');
+    expect(home.text).toContain('href="https://devdesk.meshtool.ai/board"');
+    expect(home.text).toContain('href="https://wallet.meshtool.ai/?view=details"');
+  });
+
   test("a _cockpit doc in the database no longer takes over /", async () => {
     await admin("PUT", "/api/admin/docs/_cockpit", { raw: "<p>old cockpit</p>" });
     const home = await req("GET", "/");
