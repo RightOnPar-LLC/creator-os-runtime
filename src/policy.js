@@ -44,6 +44,9 @@ export var CAPS = [
   // fixed-price order through PayRail. A grant carrying this cap can spend
   // only through a payment job — never directly, never money-out.
   "payments.x402",
+  // MeshMarket purchases (src/meshmarket.js): buy one MeshMarket capability out of this
+  // grant's own budget, through a payment job. Never money-out, never another tenant's wallet.
+  "payments.meshmarket",
 ];
 var CAP_SET = new Set(CAPS);
 export var TIERS = {
