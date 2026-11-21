@@ -46,9 +46,10 @@ export const blockedFetches = [];
 let port = 0;
 let lspPort = 0;
 let payrailPort = 0;
+let meshmarketPort = 0;
 globalThis.fetch = async (input, init) => {
   const url = new URL(typeof input === "string" ? input : input.url ?? String(input));
-  if (url.hostname === "127.0.0.1" && (Number(url.port) === port || Number(url.port) === lspPort || Number(url.port) === payrailPort)) return localFetch(input, init);
+  if (url.hostname === "127.0.0.1" && (Number(url.port) === port || Number(url.port) === lspPort || Number(url.port) === payrailPort || Number(url.port) === meshmarketPort)) return localFetch(input, init);
   blockedFetches.push(url.href);
   throw new TypeError(`blocked by test harness: ${url.href}`);
 };
@@ -228,6 +229,84 @@ const payrailServer = Bun.serve({
 payrailPort = payrailServer.port;
 export const PAYRAIL_URL = `http://127.0.0.1:${payrailPort}`;
 
+// ---- 2c. a fake MeshMarket (market.meshtool.ai) for the MeshMarket rail ------------------
+// Behaves like the real exchange on the paths the rail uses (src/index.js there): signup
+// returns the key once; /api/call/:slug honours idempotency-key (replays the stored outcome,
+// never a second charge) and x-max-price (409 price_above_max, nothing charged); a listing in
+// "hold" mode answers held:true with a hold the buyer can read and accept; a provider failure
+// is 502 provider_failed with refunded true/false. A test sets meshmarket.mode / .price, flips
+// a hold's state, and reads .charges to prove exactly-once.
+export const meshmarket = {
+  key: null, // the one key signup issued
+  credits: 250,
+  price: 20,
+  mode: "instant", // instant | hold | fail | fail_unrefunded | drop (charge, then lose the answer) | down (503, no body)
+  charges: 0, // calls that actually charged (replays excluded)
+  calls: [], // every POST /api/call: { slug, idem, max }
+  idem: {}, // idempotency key -> { status, body }
+  holds: {}, // hold_id -> public hold view
+  accepts: 0,
+};
+let mmSeq = 0;
+const meshmarketServer = Bun.serve({
+  hostname: "127.0.0.1",
+  port: 0,
+  async fetch(r) {
+    const u = new URL(r.url);
+    const authed = () => meshmarket.key && r.headers.get("x-agent-key") === meshmarket.key;
+    if (u.pathname === "/api/accounts" && r.method === "POST") {
+      const b = await r.json().catch(() => ({}));
+      if (!b.handle) return Response.json({ error: "handle_required" }, { status: 400 });
+      meshmarket.key = "mk_fake_" + ++mmSeq + "_" + Math.random().toString(36).slice(2);
+      return Response.json({ handle: b.handle, api_key: meshmarket.key, credits: meshmarket.credits }, { status: 201 });
+    }
+    if (!authed()) return Response.json({ error: "unauthorized" }, { status: 401 });
+    if (u.pathname === "/api/account" && r.method === "GET") return Response.json({ credits: meshmarket.credits });
+    const call = u.pathname.match(/^\/api\/call\/([a-z0-9-]+)$/);
+    if (call && r.method === "POST") {
+      const slug = call[1], idem = r.headers.get("idempotency-key") || "", max = Number(r.headers.get("x-max-price") || "0");
+      meshmarket.calls.push({ slug, idem, max });
+      if (meshmarket.mode === "down") return new Response("upstream unavailable", { status: 503 });
+      if (idem && meshmarket.idem[idem]) {
+        const p = meshmarket.idem[idem];
+        return Response.json({ ...p.body, replayed: true }, { status: p.status });
+      }
+      if (max && meshmarket.price > max) return Response.json({ error: "price_above_max", price: meshmarket.price, max }, { status: 409 });
+      const callId = "call_" + ++mmSeq;
+      if (meshmarket.mode === "fail" || meshmarket.mode === "fail_unrefunded")
+        return Response.json({ error: "provider_failed", refunded: meshmarket.mode === "fail", call_id: callId }, { status: 502 });
+      meshmarket.charges++;
+      meshmarket.credits -= meshmarket.price;
+      let body = { ok: true, capability: slug, charged: meshmarket.price, currency: "MESH", balance: meshmarket.credits, call_id: callId, result: { answer: "fake" } };
+      if (meshmarket.mode === "hold" || meshmarket.mode === "drop_hold") {
+        const holdId = "hold_" + mmSeq;
+        meshmarket.holds[holdId] = { id: holdId, call_id: callId, state: "held", price: meshmarket.price, currency: "MESH", stake: 0, verdict: null, provider_share: null, resolved_at: null };
+        body = { ...body, held: true, hold_id: holdId, release_at: "2099-01-01 00:00:00" };
+      }
+      if (idem) meshmarket.idem[idem] = { status: 200, body };
+      // "drop" = the call charged and was recorded, but the answer never reached the runtime.
+      if (meshmarket.mode === "drop" || meshmarket.mode === "drop_hold") return new Response("connection reset", { status: 502 });
+      return Response.json(body);
+    }
+    const hold = u.pathname.match(/^\/api\/holds\/([A-Za-z0-9_]+)(\/accept)?$/);
+    if (hold) {
+      const h = meshmarket.holds[hold[1]];
+      if (!h) return Response.json({ error: "not_found" }, { status: 404 });
+      if (hold[2] && r.method === "POST") {
+        if (h.state !== "held") return Response.json({ error: "illegal_transition", state: h.state }, { status: 409 });
+        meshmarket.accepts++;
+        h.state = "released";
+        h.resolved_at = "2026-11-21 00:00:00";
+        return Response.json({ ok: true, state: "released", provider_paid: h.price - Math.floor(h.price * 0.05), take: Math.floor(h.price * 0.05) });
+      }
+      return Response.json({ ...h, role: "caller" });
+    }
+    return Response.json({ error: "not_found" }, { status: 404 });
+  },
+});
+meshmarketPort = meshmarketServer.port;
+export const MESHMARKET_URL = `http://127.0.0.1:${meshmarketPort}`;
+
 // ---- 3. listener on 127.0.0.1 (port known before import, for PUBLIC_URL) ---------
 let handler = () => new Response("booting", { status: 503 });
 // idleTimeout as the runtime sets it for its own listener (src/index.js; section 1 checks the number).
@@ -276,6 +355,7 @@ for (const k of [
   "BRAIN_URL", "GRANT_SIGNING_KEY", "OAUTH_REDIRECT_HOSTS", "POSTGRES_URL", "PORT", "RUNTIME_MODE", "COG_MODEL",
   "LSP_MCP_URL", "LSP_MCP_TIMEOUT_MS", "REAP_INTERVAL_MS", "BUS_EVENTS_URL", "BUS_EVENTS_KEY", "NTFY_URL", "NTFY_TOKEN",
   "PAYRAIL_URL", "X402_RPC_URL", "X402_PAYMENT_NETWORK", "X402_PAYMENT_ASSET", "X402_PAYMENT_RECIPIENT",
+  "MESHMARKET_URL", "MESHMARKET_SWEEP_MS",
 ]) delete process.env[k];
 Object.assign(process.env, {
   LSP_MCP_URL: LSP_URL,
@@ -298,6 +378,10 @@ Object.assign(process.env, {
   // connection, so an out-of-band sweep would contend with the test's own query.
   // The suite drives the reaper deterministically via POST /api/admin/grants/reap.
   REAP_INTERVAL_MS: "0",
+  // MeshMarket rail: the fake exchange above; its sweep timer OFF for the same reason as the
+  // reaper's (tests drive it with POST /api/admin/meshmarket/sweep).
+  MESHMARKET_URL,
+  MESHMARKET_SWEEP_MS: "0",
 });
 
 export const mod = await import(pathToFileURL(entryPath).href);
@@ -311,6 +395,7 @@ export async function shutdown() {
   server.stop(true);
   lspServer.stop(true);
   payrailServer.stop(true);
+  meshmarketServer.stop(true);
   await pgServer.stop();
   await pg.close();
 }
