@@ -1,8 +1,9 @@
-// Escrow keystone (stage 1: open + read). An escrow is NOT a new value engine — it is a
-// child grant held by a neutral custodian. The HOLD is issueChildGrant's reserve (the payer's
-// value is parked, unspendable); the REFUND is the reaper / revokeGrantTree release-on-expiry.
-// CAPTURE (resolving held value to the payee on a verified condition) is stage 2 and lives
-// nowhere yet. See docs/specs/escrow-keystone.md.
+// Escrow keystone. An escrow is NOT a new value engine — it is a child grant held by a neutral
+// custodian. The HOLD is issueChildGrant's reserve (the payer's value is parked, unspendable);
+// the REFUND is the reaper / revokeGrantTree release-on-expiry. CAPTURE (resolving held value to
+// the payee on a verified condition) is implemented below (captureEscrow / captureFromMeshReceipt)
+// and wired live at POST /webhooks/mesh (routes/webhooks.js), gated behind the `escrow_capture`
+// operator setting + kill switch — OFF by default, not unbuilt. See docs/specs/escrow-keystone.md.
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
 import { getGrant, getTenant, recordEvent, sql } from "./db.js";
 import { addUsage, normalizeUsage, subtractUsage, TIERS } from "./policy.js";
