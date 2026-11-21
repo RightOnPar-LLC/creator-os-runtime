@@ -2,7 +2,7 @@
 import { armedIntegrations, POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN } from "../config.js";
 import { HttpError, newId, parseJson } from "../util.js";
 import { PROOF_ROOT_SUB, validateRootGrantBody } from "../proof-oauth.js";
-import { getGrant, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
+import { getGrant, getSetting, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
 import { endedAbove, grantsLeftUnderEnded, mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
@@ -197,6 +197,29 @@ app.post("/api/admin/operator-lsp-caps/off", requireAdmin, async (e) => {
     })
   );
 });
+// The capture switch. POST /webhooks/mesh resolves a held escrow to its payee only while the
+// `escrow_capture` setting is "on" and the kill switch is off. That is real value movement, so it is
+// OFF by default. Before these two routes the only way to arm it was a raw write to the settings
+// table; now it is one operator tap each way, and every flip leaves an event. Off stops new captures
+// at once: it changes no hold, refunds nothing, and needs no key rotation (MESH_RECEIPT_SECRET stays).
+app.post("/api/admin/escrow-capture/on", requireAdmin, async (e) => {
+  return (
+    await setSetting("escrow_capture", "on"),
+    await recordEvent("escrow.capture_enabled", {}, null, "admin"),
+    e.json({
+      escrowCapture: !0,
+    })
+  );
+});
+app.post("/api/admin/escrow-capture/off", requireAdmin, async (e) => {
+  return (
+    await setSetting("escrow_capture", "off"),
+    await recordEvent("escrow.capture_disabled", {}, null, "admin"),
+    e.json({
+      escrowCapture: !1,
+    })
+  );
+});
 app.get("/api/admin/policy", requireAdmin, (e) =>
   e.json({
     policy: POLICY_VERSION,
@@ -277,6 +300,7 @@ app.get("/api/admin/overview", requireAdmin, async (e) => {
     guest_pool: gp ? guestPoolStatus(gp) : { open: true, remaining_slots: null, note: "not initialized" },
     killSwitch: await isKillSwitchOn(),
     operatorLspCaps: await isOperatorLspCapsEnabled(),
+    escrowCapture: (await getSetting("escrow_capture")) === "on",
     armed: armedIntegrations(),
   });
 });

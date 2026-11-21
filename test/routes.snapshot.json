@@ -1,5 +1,5 @@
 {
-  "count": 234,
+  "count": 238,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -35,6 +35,10 @@
     "POST /api/admin/operator-lsp-caps/on",
     "POST /api/admin/operator-lsp-caps/off",
     "POST /api/admin/operator-lsp-caps/off",
+    "POST /api/admin/escrow-capture/on",
+    "POST /api/admin/escrow-capture/on",
+    "POST /api/admin/escrow-capture/off",
+    "POST /api/admin/escrow-capture/off",
     "GET /api/admin/policy",
     "GET /api/admin/policy",
     "POST /api/admin/breakglass",
@@ -254,6 +258,8 @@
     "POST /api/admin/resume :: admin",
     "POST /api/admin/operator-lsp-caps/on :: admin",
     "POST /api/admin/operator-lsp-caps/off :: admin",
+    "POST /api/admin/escrow-capture/on :: admin",
+    "POST /api/admin/escrow-capture/off :: admin",
     "GET /api/admin/policy :: admin",
     "POST /api/admin/breakglass :: admin",
     "POST /api/admin/grants/reap :: admin",
