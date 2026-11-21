@@ -50,4 +50,6 @@ const staging = run(["staging-gateway.test.js"]);
 const receipts = run(["receipts.test.js"]);
 const proof = run(["proof-oauth.test.js"]);
 const escrowSwitch = run(["escrow-switch.test.js"]);
-process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1) || (oidc.status ?? 1) || (staging.status ?? 1) || (receipts.status ?? 1) || (proof.status ?? 1) || (escrowSwitch.status ?? 1));
+const payments = run(["payments.test.js"]);
+const meshRail = run(["mesh-rail.test.js"]);
+process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1) || (oidc.status ?? 1) || (staging.status ?? 1) || (receipts.status ?? 1) || (proof.status ?? 1) || (escrowSwitch.status ?? 1) || (payments.status ?? 1) || (meshRail.status ?? 1));

@@ -28,7 +28,7 @@ export const DEFAULT_AUTONOMY = ACT;
 
 // Actions the dial governs today: the ones the ledger already treats as value —
 // spending on a deploy, and holding MESH in escrow.
-export const VALUE_ACTIONS = new Set(["deploy", "escrow.open"]);
+export const VALUE_ACTIONS = new Set(["deploy", "escrow.open", "payment.meshmarket"]);
 // Actions that ask a human at EVERY level. Money leaving the closed loop is refused
 // outright elsewhere (escrow is MESH-only); it is listed so any future path that
 // reaches it is floored by construction.
