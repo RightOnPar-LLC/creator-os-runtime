@@ -121,19 +121,23 @@ export function serializeJob(row) {
   };
 }
 
+// payment_jobs also carries MeshMarket jobs (src/meshmarket.js, requirement.rail = "meshmarket").
+// The x402 paths never touch one: to them it does not exist (404), same as another tenant's job.
+export const isMarketJob = (job) => parseJson(job?.requirement ?? null)?.rail === "meshmarket";
+
 export async function getPaymentJob(id, tenantId) {
   const rows = await sql`SELECT * FROM payment_jobs WHERE id = ${String(id)} AND tenant = ${tenantId}`;
   return serializeJob(rows[0]);
 }
 
-async function loadJobForUpdate(tx, id, tenantId) {
+export async function loadJobForUpdate(tx, id, tenantId) {
   const rows = await tx`SELECT * FROM payment_jobs WHERE id = ${String(id)} AND tenant = ${tenantId} FOR UPDATE`;
   return rows[0] || null;
 }
 
 // The grant's reservation: up at start, down at settle (converted to
 // settled) or at failure (given back). The escrow capture/refund pattern.
-async function reserveOnGrant(tx, grantId, amountUsdCents) {
+export async function reserveOnGrant(tx, grantId, amountUsdCents) {
   const g = (await tx`SELECT * FROM grants WHERE id = ${grantId} FOR UPDATE`)[0];
   if (!g || g.status !== "active") throw new HttpError(403, "grant_not_active");
   const need = { usd_cents: amountUsdCents, calls: 0, deploys: 0 };
@@ -143,16 +147,16 @@ async function reserveOnGrant(tx, grantId, amountUsdCents) {
   return g;
 }
 
-async function releaseReservation(tx, grantId, amountUsdCents, ref) {
+export async function releaseReservation(tx, grantId, amountUsdCents, ref, note = "x402 payment job released") {
   const g = (await tx`SELECT * FROM grants WHERE id = ${grantId} FOR UPDATE`)[0];
   if (!g) return;
   const rem = subtractUsage(normalizeUsage(parseJson(g.reserved)), { usd_cents: amountUsdCents, calls: 0, deploys: 0 });
   await tx`UPDATE grants SET reserved = ${{ usd_cents: Math.max(0, rem.usd_cents), calls: 0, deploys: 0 }}::jsonb WHERE id = ${grantId}`;
   await tx`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
-    VALUES (${g.tenant}, ${g.id}, ${g.parent}, 'release', ${-amountUsdCents}, 0, 0, ${ref}, 'x402 payment job released')`;
+    VALUES (${g.tenant}, ${g.id}, ${g.parent}, 'release', ${-amountUsdCents}, 0, 0, ${ref}, ${note})`;
 }
 
-async function convertReservation(tx, grantId, amountUsdCents, ref) {
+export async function convertReservation(tx, grantId, amountUsdCents, ref, kind = "x402-settle", note = "x402 payment settled") {
   const p = (await tx`SELECT * FROM grants WHERE id = ${grantId} FOR UPDATE`)[0];
   if (!p) return;
   const d = { usd_cents: amountUsdCents, calls: 0, deploys: 0 };
@@ -160,7 +164,7 @@ async function convertReservation(tx, grantId, amountUsdCents, ref) {
   const set = addUsage(normalizeUsage(parseJson(p.settled)), d);
   await tx`UPDATE grants SET reserved = ${{ usd_cents: Math.max(0, rem.usd_cents), calls: 0, deploys: 0 }}::jsonb, settled = ${set}::jsonb WHERE id = ${grantId}`;
   await tx`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
-    VALUES (${p.tenant}, ${p.id}, ${p.parent}, 'x402-settle', ${amountUsdCents}, 0, 0, ${ref}, 'x402 payment settled')`;
+    VALUES (${p.tenant}, ${p.id}, ${p.parent}, ${kind}, ${amountUsdCents}, 0, 0, ${ref}, ${note})`;
 }
 
 function isEvmTxHash(tx) {
@@ -229,7 +233,7 @@ export async function submitPaymentSignature({ jobId, tenantId, paymentPayload }
   if (!cfg.payrailUrl) throw new HttpError(503, "payrail_unconfigured");
   const prepared = await sql.begin(async (tx) => {
     const row = await loadJobForUpdate(tx, jobId, tenantId);
-    if (!row) throw new HttpError(404, "payment_job_not_found");
+    if (!row || isMarketJob(row)) throw new HttpError(404, "payment_job_not_found");
     if (row.status === "settled") return { job: serializeJob(row), already: true };
     if (row.status === "settling") return { job: serializeJob(row), already: true };
     if (row.status !== "offered") throw new HttpError(409, "payment_job_not_offered", { status: row.status });
@@ -316,7 +320,7 @@ export async function reconcilePaymentJob({ jobId, tenantId }, deps = {}) {
   const cfg = { ...paymentsConfig(), ...(deps.cfg || {}) };
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
   let job = await getPaymentJob(jobId, tenantId);
-  if (!job) throw new HttpError(404, "payment_job_not_found");
+  if (!job || isMarketJob(job)) throw new HttpError(404, "payment_job_not_found");
   if (job.status === "settled" || job.status === "failed" || job.status === "offered") return job;
   // Settling: did the original transaction land?
   if (job.tx) {

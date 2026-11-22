@@ -9,6 +9,7 @@ import { loadOidcSigningKey } from "./oidc.js";
 import { loadReceiptSigningKey } from "./receipts.js";
 import { reapExpiredGrants } from "./grants.js";
 import { sweepTours } from "./tours.js";
+import { sweepMarketJobs } from "./meshmarket.js";
 import { attenuationViolations, CAPS, gatehouseEvaluate, TIERS } from "./policy.js";
 import { TEMPLATES } from "./railway.js";
 import { app, recordSource } from "./http.js";
@@ -64,6 +65,17 @@ if (REAP_INTERVAL_MS > 0) {
   reapTimer.unref?.();
   console.log(`[${SERVICE_NAME}] reaper: every ${REAP_INTERVAL_MS}ms`);
 } else console.log(`[${SERVICE_NAME}] reaper: disabled (REAP_INTERVAL_MS=0)`);
+// The MeshMarket sweep: every open market payment job is reconciled against MeshMarket
+// (meshmarket.js) — a held call settles when MeshMarket releases it, its budget comes back
+// when MeshMarket refunds it, an unanswered call is re-sent with the same idempotency key.
+// Does nothing until the buyer account is enrolled, and nothing while the kill switch is on.
+// Default-on; "0" disables; the manual trigger is POST /api/admin/meshmarket/sweep.
+var MARKET_SWEEP_MS = Number(env.MESHMARKET_SWEEP_MS ?? 60000);
+if (MARKET_SWEEP_MS > 0) {
+  var marketTimer = setInterval(() => sweepMarketJobs().catch((e) => console.error("[meshmarket]", e?.message || e)), MARKET_SWEEP_MS);
+  marketTimer.unref?.();
+  console.log(`[${SERVICE_NAME}] meshmarket sweep: every ${MARKET_SWEEP_MS}ms`);
+} else console.log(`[${SERVICE_NAME}] meshmarket sweep: disabled (MESHMARKET_SWEEP_MS=0)`);
 var LISTEN_PORT = Number(env.PORT || 3000);
 var serverConfig = {
   port: LISTEN_PORT,

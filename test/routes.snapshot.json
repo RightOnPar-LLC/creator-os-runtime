@@ -1,5 +1,5 @@
 {
-  "count": 238,
+  "count": 252,
   "appRoutes": [
     "ALL /api/*",
     "ALL /auth/*",
@@ -237,6 +237,20 @@
     "POST /api/payments/x402/jobs/:id/sign",
     "POST /api/payments/x402/jobs/:id/reconcile",
     "POST /api/payments/x402/jobs/:id/reconcile",
+    "POST /api/payments/meshmarket/jobs",
+    "POST /api/payments/meshmarket/jobs",
+    "GET /api/payments/meshmarket/jobs/:id",
+    "GET /api/payments/meshmarket/jobs/:id",
+    "POST /api/payments/meshmarket/jobs/:id/reconcile",
+    "POST /api/payments/meshmarket/jobs/:id/reconcile",
+    "POST /api/payments/meshmarket/jobs/:id/accept",
+    "POST /api/payments/meshmarket/jobs/:id/accept",
+    "POST /api/admin/meshmarket/enroll",
+    "POST /api/admin/meshmarket/enroll",
+    "GET /api/admin/meshmarket",
+    "GET /api/admin/meshmarket",
+    "POST /api/admin/meshmarket/sweep",
+    "POST /api/admin/meshmarket/sweep",
     "GET /routes",
     "GET /selftest"
   ],
@@ -377,6 +391,13 @@
     "GET /api/payments/x402/jobs/:id :: grant:payments.x402",
     "POST /api/payments/x402/jobs/:id/sign :: grant:payments.x402",
     "POST /api/payments/x402/jobs/:id/reconcile :: grant:payments.x402",
+    "POST /api/payments/meshmarket/jobs :: grant:payments.meshmarket",
+    "GET /api/payments/meshmarket/jobs/:id :: grant:payments.meshmarket",
+    "POST /api/payments/meshmarket/jobs/:id/reconcile :: grant:payments.meshmarket",
+    "POST /api/payments/meshmarket/jobs/:id/accept :: grant:payments.meshmarket",
+    "POST /api/admin/meshmarket/enroll :: admin",
+    "GET /api/admin/meshmarket :: admin",
+    "POST /api/admin/meshmarket/sweep :: admin",
     "GET /routes :: public",
     "GET /selftest :: public"
   ]
