@@ -24,10 +24,24 @@
 // There is no payee row on this side, so nothing here can ever pay a provider twice.
 // An answer this side cannot read never moves budget: the job stays open, and after
 // MAX_ATTEMPTS it stops in `review` (reservation kept, event raised) for a person.
+//
+// Units. MeshMarket prices in MESH; a grant budget is real US cents. One MESH is worth at most
+// what the smallest pack charges for it (Starter: $5 = 600 MESH, 1.2 MESH per cent), so every
+// MESH amount is turned into cents at that rate, ROUNDED UP: an agent's budget never counts a
+// MESH as cheaper than it can cost. The rate is MESHMARKET_MESH_PER_USD_CENT (MeshMarket's own
+// PAYRAIL_MESH_PER_USD_CENT); each job keeps the rate it started with, so a rate change never
+// moves a job already open. A rate that cannot be read refuses every purchase.
+//
+// Daily cap. One buyer account serves every tenant, so the whole runtime gets one ceiling:
+// MESHMARKET_DAILY_CAP_MESH (default 300 MESH, about $2.50 a UTC day). Open jobs count at their
+// full ceiling, settled ones at what MeshMarket kept. A purchase that would pass it is refused
+// before any budget is reserved. The check and the reservation share one lock, so two agents
+// at once cannot both slip under it.
 import { HttpError, newId, parseJson, sha256Hex } from "./util.js";
 import { env } from "./config.js";
 import { getSetting, isKillSwitchOn, recordEvent, setSetting, sql } from "./db.js";
 import { vaultDecrypt, vaultEncrypt } from "./tokens.js";
+import { addUsage, normalizeUsage } from "./policy.js";
 import { convertReservation, loadJobForUpdate, releaseReservation, reserveOnGrant, serializeJob } from "./payments.js";
 
 export const MARKET_JOB_CAP = "payments.meshmarket";
@@ -41,6 +55,40 @@ const HANDLE = /^[a-z0-9][a-z0-9-]{2,39}$/;
 
 export function marketConfig(envObj = env) {
   return { url: String(envObj.MESHMARKET_URL || "https://market.meshtool.ai").replace(/\/$/, "") };
+}
+
+export const DEFAULT_MESH_PER_CENT = 1.2; // Starter pack: $5 = 600 MESH
+export const DEFAULT_DAILY_CAP_MESH = 300;
+const CAP_LOCK = 7302215; // pg advisory lock: the daily-cap check and the reservation, one at a time
+
+// MESH per US cent, or null when the setting cannot be read (then nothing can be bought).
+export function meshPerCent(envObj = env) {
+  const raw = envObj.MESHMARKET_MESH_PER_USD_CENT;
+  const r = raw === undefined || raw === "" ? DEFAULT_MESH_PER_CENT : Number(raw);
+  return Number.isFinite(r) && r > 0 && r <= 1000 ? r : null;
+}
+
+// MESH -> cents, rounded UP, in integer arithmetic (no float drift: 6 MESH at 1.2 is exactly 5).
+export function meshToCents(mesh, rate) {
+  const micro = Math.round(rate * 1e6);
+  return Math.floor((Math.max(0, Math.floor(Number(mesh) || 0)) * 1e6 + micro - 1) / micro);
+}
+
+// The runtime-wide daily ceiling in MESH. Unreadable = 0: nothing can be bought (fail closed).
+export function dailyCapMesh(envObj = env) {
+  const raw = envObj.MESHMARKET_DAILY_CAP_MESH;
+  const n = raw === undefined || raw === "" ? DEFAULT_DAILY_CAP_MESH : Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : 0;
+}
+
+// MESH committed today (UTC) across every tenant: open jobs at their ceiling, settled at what was kept.
+async function committedTodayMesh(q) {
+  const [r] = await q`SELECT COALESCE(SUM(CASE
+      WHEN status IN ('calling', 'held', 'review') THEN (requirement->>'max_price')::int
+      WHEN status = 'settled' THEN COALESCE((receipt->>'spent_mesh')::int, (requirement->>'max_price')::int)
+      ELSE 0 END), 0)::int AS n
+    FROM payment_jobs WHERE requirement->>'rail' = 'meshmarket' AND created_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')`;
+  return r.n;
 }
 
 async function marketKey() {
@@ -99,9 +147,10 @@ export async function marketStatus(deps = {}) {
   const key = await marketKey();
   const rows = await sql`SELECT status, count(*)::int AS n FROM payment_jobs WHERE requirement->>'rail' = 'meshmarket' GROUP BY status`;
   const jobs = Object.fromEntries(rows.map((r) => [r.status, r.n]));
-  if (!key) return { enrolled: false, url, jobs };
+  const money = { mesh_per_cent: meshPerCent(), daily: { cap_mesh: dailyCapMesh(), used_mesh: await committedTodayMesh(sql) } };
+  if (!key) return { enrolled: false, url, jobs, ...money };
   const r = await marketFetch("/api/account", { key }, deps);
-  return { enrolled: true, handle: await getSetting(HANDLE_SETTING), url, reachable: r.status === 200, credits: r.status === 200 ? (r.body.credits ?? null) : null, jobs };
+  return { enrolled: true, handle: await getSetting(HANDLE_SETTING), url, reachable: r.status === 200, credits: r.status === 200 ? (r.body.credits ?? null) : null, jobs, ...money };
 }
 
 // ---- jobs -----------------------------------------------------------------------------
@@ -131,19 +180,31 @@ export async function startMarketJob({ grant, ...request }, deps = {}) {
   const { slug, maxPrice, input } = marketIntent(request);
   const key = await marketKey();
   if (!key) throw new HttpError(503, "meshmarket_unenrolled");
+  const rate = meshPerCent();
+  if (!rate) throw new HttpError(503, "meshmarket_rate_invalid", { needs: "MESHMARKET_MESH_PER_USD_CENT" });
+  const cents = meshToCents(maxPrice, rate); // the ceiling, in real cents, rounded up
+  const cap = dailyCapMesh();
   const id = newId("pay");
-  const requirement = { rail: "meshmarket", slug, max_price: maxPrice, input };
+  const requirement = { rail: "meshmarket", slug, max_price: maxPrice, mesh_per_cent: rate, input };
   const hash = sha256Hex(JSON.stringify({ rail: "meshmarket", slug, max_price: maxPrice, input }));
-  const job = await sql.begin(async (tx) => {
-    const g = await reserveOnGrant(tx, grant.id, maxPrice);
+  const done = await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(${CAP_LOCK})`;
+    const used = await committedTodayMesh(tx);
+    if (used + maxPrice > cap) return { capped: { cap_mesh: cap, used_mesh: used, asked_mesh: maxPrice } };
+    const g = await reserveOnGrant(tx, grant.id, cents);
     await tx`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
-      VALUES (${g.tenant}, ${g.id}, ${g.parent}, 'reserve', ${maxPrice}, 0, 0, ${id}, 'reserved for MeshMarket job')`;
+      VALUES (${g.tenant}, ${g.id}, ${g.parent}, 'reserve', ${cents}, 0, 0, ${id}, ${`reserved for MeshMarket job (ceiling ${maxPrice} MESH at ${rate} MESH/cent)`})`;
     const [row] = await tx`INSERT INTO payment_jobs (id, tenant, grant_id, status, order_id, amount_usd_cents, intent_hash, requirement, receipt)
-      VALUES (${id}, ${g.tenant}, ${g.id}, 'calling', ${slug}, ${maxPrice}, ${hash}, ${requirement}::jsonb, ${{ attempts: 0 }}::jsonb)
+      VALUES (${id}, ${g.tenant}, ${g.id}, 'calling', ${slug}, ${cents}, ${hash}, ${requirement}::jsonb, ${{ attempts: 0 }}::jsonb)
       RETURNING *`;
-    return serializeJob(row);
+    return { job: serializeJob(row) };
   });
-  await recordEvent("payment.meshmarket.started", { id, slug, max_price: maxPrice }, job.tenant, grant.sub);
+  if (done.capped) {
+    await recordEvent("payment.meshmarket.daily_cap", { slug, ...done.capped }, grant.tenant, grant.sub);
+    throw new HttpError(429, "meshmarket_daily_cap", done.capped);
+  }
+  const job = done.job;
+  await recordEvent("payment.meshmarket.started", { id, slug, max_price: maxPrice, reserved_cents: cents }, job.tenant, grant.sub);
   return dispatch(job, key, deps);
 }
 
@@ -188,24 +249,41 @@ async function moveJob(job, from, to, receipt) {
   return out;
 }
 
-// The end of a job: `spent` of the reservation becomes settled, the rest goes back. Under
+// The end of a job: what MeshMarket kept (MESH) is turned into cents at the job's own rate
+// (rounded up); that much of the reservation becomes settled, the rest goes back. Under
 // FOR UPDATE and only from an open state, so a sweep racing a reconcile settles once.
-async function finishJob(job, from, spent, receipt) {
+// Spend above the reservation (only a forfeited dispute stake can cause it) is never hidden:
+// it is settled on the grant as `meshmarket-overage`, and an event is raised.
+async function finishJob(job, from, spentMesh, receipt) {
   const out = await sql.begin(async (tx) => {
     const row = await loadJobForUpdate(tx, job.id, job.tenant);
     if (!row) throw new HttpError(404, "payment_job_not_found");
     if (!from.includes(row.status)) return { job: serializeJob(row), moved: false };
-    const s = Math.max(0, Math.floor(spent) || 0);
+    const req = parseJson(row.requirement) || {};
+    const mesh = Math.max(0, Math.floor(Number(spentMesh) || 0));
+    // jobs from before the rate existed were reserved one MESH to one cent: they finish that way
+    const s = meshToCents(mesh, Number(req.mesh_per_cent) || 1);
+    const fromReserve = Math.min(s, row.amount_usd_cents);
+    const over = s - fromReserve;
     const ref = receipt.call_id || row.id;
-    if (s > 0) await convertReservation(tx, row.grant_id, s, ref, "meshmarket-settle", "MeshMarket call settled");
-    const back = row.amount_usd_cents - s;
+    if (fromReserve > 0) await convertReservation(tx, row.grant_id, fromReserve, ref, "meshmarket-settle", `MeshMarket call settled (${mesh} MESH)`);
+    if (over > 0) {
+      const g = (await tx`SELECT * FROM grants WHERE id = ${row.grant_id} FOR UPDATE`)[0];
+      const set = addUsage(normalizeUsage(parseJson(g.settled)), { usd_cents: over, calls: 0, deploys: 0 });
+      await tx`UPDATE grants SET settled = ${set}::jsonb WHERE id = ${g.id}`;
+      await tx`INSERT INTO ledger (tenant, grant_id, parent, kind, usd_cents, calls, deploys, ref, note)
+        VALUES (${g.tenant}, ${g.id}, ${g.parent}, 'meshmarket-overage', ${over}, 0, 0, ${ref}, 'MeshMarket kept more than was reserved')`;
+    }
+    const back = row.amount_usd_cents - fromReserve;
     if (back > 0) await releaseReservation(tx, row.grant_id, back, row.id, "MeshMarket job: unspent reservation returned");
     const status = s > 0 ? "settled" : receipt.outcome === "failed" ? "failed" : "refunded";
-    const [u] = await tx`UPDATE payment_jobs SET status = ${status}, tx = ${receipt.call_id ?? row.tx}, receipt = ${{ ...(parseJson(row.receipt) || {}), ...receipt, spent: s }}::jsonb,
+    const [u] = await tx`UPDATE payment_jobs SET status = ${status}, tx = ${receipt.call_id ?? row.tx},
+      receipt = ${{ ...(parseJson(row.receipt) || {}), ...receipt, spent: s, spent_mesh: mesh, ...(over > 0 ? { over_reservation: over } : {}) }}::jsonb,
       error = ${status === "failed" ? receipt.error || "failed" : null}, updated_at = now() WHERE id = ${row.id} RETURNING *`;
-    return { job: serializeJob(u), moved: true };
+    return { job: serializeJob(u), moved: true, over };
   });
-  if (out.moved) await recordEvent(`payment.meshmarket.${out.job.status}`, { id: out.job.id, slug: out.job.order_id, spent: out.job.receipt?.spent ?? 0, call_id: out.job.tx }, out.job.tenant, null);
+  if (out.moved) await recordEvent(`payment.meshmarket.${out.job.status}`, { id: out.job.id, slug: out.job.order_id, spent: out.job.receipt?.spent ?? 0, spent_mesh: out.job.receipt?.spent_mesh ?? 0, call_id: out.job.tx }, out.job.tenant, null);
+  if (out.moved && out.over > 0) await recordEvent("payment.meshmarket.overage", { id: out.job.id, slug: out.job.order_id, over_cents: out.over }, out.job.tenant, null);
   return out.job;
 }
 
