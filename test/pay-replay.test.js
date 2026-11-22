@@ -43,7 +43,8 @@ describe("PAY daily replay", () => {
       "root grant minted",
       "agent grant minted",
       "job settled",
-      "spent equals what MeshMarket charged, within the ceiling",
+      "MESH kept equals what MeshMarket charged, within the ceiling",
+      "cents = MESH at the job's rate, rounded up",
       "agent budget dropped by exactly the spend",
       "ledger reads reserve / settle / release",
       "MeshMarket charged once, the same amount",
@@ -51,6 +52,14 @@ describe("PAY daily replay", () => {
     expect(await liveReplayRoots()).toBe(0);
     expect(JSON.stringify(r)).not.toContain(ADMIN_KEY);
     expect(JSON.stringify(r)).not.toContain(meshmarket.key);
+  });
+
+  test("green at a price that does not divide evenly: 2 MESH = 1.67 cents, paid as 2", async () => {
+    meshmarket.price = 2;
+    const r = await run();
+    expect(failed(r)).toEqual([]);
+    expect(r).toMatchObject({ ok: true, spent_mesh: 2, spent: 2 });
+    meshmarket.price = 1;
   });
 
   test("CONTROL: the price rose above the ceiling: red, nothing charged", async () => {

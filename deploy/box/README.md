@@ -20,4 +20,8 @@ new `master` commits get there without anyone building by hand.
   `pay-proof-rail` tenant and checks the job, the agent budget, the ledger and MeshMarket's balance all agree.
   Green is silent; red pages the owner (ntfy, high); a buyer balance under 30 MESH sends a top-up notice.
   Receipts: `/opt/runtime/deploy/pay-replay.jsonl`. Pause: `touch /opt/runtime/deploy/PAY_REPLAY_PAUSED`.
+- MeshMarket money settings (in `/opt/runtime/prod.env`; unset = the default): `MESHMARKET_MESH_PER_USD_CENT`
+  (default 1.2, the Starter pack's $5 = 600 MESH; budgets are real cents, MESH is converted at this rate rounded up)
+  and `MESHMARKET_DAILY_CAP_MESH` (default 300 MESH a UTC day across the whole runtime). An unreadable value
+  stops purchases rather than guessing.
 - Setup: `deploy/box/install.sh` as root (prints the public key the first time).

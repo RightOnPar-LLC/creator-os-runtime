@@ -3,8 +3,9 @@
 // One real purchase through the rail, the way an agent makes it, and every number checked:
 //   a fresh root grant on the proof tenant -> an agent grant with a small budget ->
 //   buy SLUG with ceiling MAX -> the job settles -> the agent's budget dropped by exactly what was
-//   spent -> the ledger reads reserve MAX / settle spent / release the rest -> MeshMarket's balance
-//   dropped by exactly the same amount (one charge, never two). Then the day's grants are revoked.
+//   spent -> the ledger reads reserve / settle / release in cents (MESH at the job's own rate,
+//   rounded up) -> MeshMarket's balance dropped by exactly the MESH kept (one charge, never two).
+//   Then the day's grants are revoked.
 //
 // Green is silent. Red (any check fails) pages the owner. A low buyer balance is its own notice.
 // Prints statuses and amounts only: never the admin key, the MeshMarket key, or a grant token.
@@ -59,20 +60,28 @@ export async function replay({ base, adminKey, fetchImpl = globalThis.fetch, ...
     const job = b.json?.job || null;
     out.job = job ? { id: job.id, status: job.status, call_id: job.tx, error: job.error } : { http: b.status, error: b.json?.error };
     if (!check("job settled", b.status === 201 && job?.status === "settled", out.job)) return out;
+    // MESH is what MeshMarket kept; cents is what the agent's budget paid (MESH at the job's rate, rounded up)
+    const mesh = job.receipt?.spent_mesh;
     const spent = job.receipt?.spent;
+    const reserved = job.amount_usd_cents;
+    const rate = job.requirement?.mesh_per_cent;
     out.spent = spent;
-    check("spent equals what MeshMarket charged, within the ceiling", Number.isInteger(spent) && spent === job.receipt?.charged && spent >= 1 && spent <= o.maxPrice, { spent, charged: job.receipt?.charged, max: o.maxPrice });
+    out.spent_mesh = mesh;
+    check("MESH kept equals what MeshMarket charged, within the ceiling", Number.isInteger(mesh) && mesh === job.receipt?.charged && mesh >= 1 && mesh <= o.maxPrice, { mesh, charged: job.receipt?.charged, max: o.maxPrice });
+    const centsFor = (m) => (rate > 0 ? Math.floor((m * 1e6 + Math.round(rate * 1e6) - 1) / Math.round(rate * 1e6)) : NaN);
+    check("cents = MESH at the job's rate, rounded up", spent === centsFor(mesh) && reserved === centsFor(o.maxPrice), { rate, mesh, spent, ceiling: o.maxPrice, reserved });
 
     // 3. the budget, the ledger, and MeshMarket's own balance agree
     const after = await left();
     check("agent budget dropped by exactly the spend", before - after === spent, { before, after, spent });
     const led = await call("GET", "/api/ledger", { token: root.json.token });
     const rows = (led.json?.ledger || []).filter((r) => r.ref === job.id || r.ref === job.tx).map((r) => `${r.kind}:${r.usd_cents}`).sort();
-    const want = [`reserve:${o.maxPrice}`, `meshmarket-settle:${spent}`, ...(o.maxPrice - spent > 0 ? [`release:${-(o.maxPrice - spent)}`] : [])].sort();
+    const want = [`reserve:${reserved}`, `meshmarket-settle:${spent}`, ...(reserved - spent > 0 ? [`release:${-(reserved - spent)}`] : [])].sort();
     check("ledger reads reserve / settle / release", JSON.stringify(rows) === JSON.stringify(want), { rows, want });
     const st1 = await call("GET", "/api/admin/meshmarket");
     out.credits = st1.json?.credits ?? null;
-    check("MeshMarket charged once, the same amount", Number.isInteger(credits0) && credits0 - out.credits === spent, { before: credits0, after: out.credits, spent });
+    out.daily = st1.json?.daily ?? null;
+    check("MeshMarket charged once, the same amount", Number.isInteger(credits0) && credits0 - out.credits === mesh, { before: credits0, after: out.credits, mesh });
     if (Number.isInteger(out.credits) && out.credits < o.lowBalance) out.notices.push(`buyer balance low: ${out.credits} MESH left`);
     out.ok = checks.every((c) => c.pass);
     return out;
