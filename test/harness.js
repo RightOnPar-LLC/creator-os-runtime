@@ -355,7 +355,7 @@ for (const k of [
   "BRAIN_URL", "GRANT_SIGNING_KEY", "OAUTH_REDIRECT_HOSTS", "POSTGRES_URL", "PORT", "RUNTIME_MODE", "COG_MODEL",
   "LSP_MCP_URL", "LSP_MCP_TIMEOUT_MS", "REAP_INTERVAL_MS", "BUS_EVENTS_URL", "BUS_EVENTS_KEY", "NTFY_URL", "NTFY_TOKEN",
   "PAYRAIL_URL", "X402_RPC_URL", "X402_PAYMENT_NETWORK", "X402_PAYMENT_ASSET", "X402_PAYMENT_RECIPIENT",
-  "MESHMARKET_URL", "MESHMARKET_SWEEP_MS",
+  "MESHMARKET_URL", "MESHMARKET_SWEEP_MS", "MESHMARKET_MESH_PER_USD_CENT", "MESHMARKET_DAILY_CAP_MESH",
 ]) delete process.env[k];
 Object.assign(process.env, {
   LSP_MCP_URL: LSP_URL,
@@ -382,6 +382,9 @@ Object.assign(process.env, {
   // reaper's (tests drive it with POST /api/admin/meshmarket/sweep).
   MESHMARKET_URL,
   MESHMARKET_SWEEP_MS: "0",
+  // the runtime-wide daily cap is tested on its own (mesh-rail.test.js); the rest of the suite
+  // buys far more than one day's 300 MESH, so it runs with the cap out of the way
+  MESHMARKET_DAILY_CAP_MESH: "100000",
 });
 
 export const mod = await import(pathToFileURL(entryPath).href);
