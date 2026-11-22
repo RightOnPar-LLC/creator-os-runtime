@@ -15,4 +15,9 @@ new `master` commits get there without anyone building by hand.
 - Manual rollback: `docker images own-rails-runtime` shows the previous `<sha>-prod`
   image; stop the container and start that image with the same flags `deploy.sh` uses for prod.
 - Access: a read-only deploy key (`/root/.ssh/runtime_deploy`) that never leaves the box.
+- PAY daily replay (DevDesk #202): `pay-replay.timer` runs `pay-replay.sh` once a day (17:23 UTC). It makes one real
+  MeshMarket purchase through the rail (Safety Scrub, ceiling 3 MESH, about a cent) from a fresh grant on the
+  `pay-proof-rail` tenant and checks the job, the agent budget, the ledger and MeshMarket's balance all agree.
+  Green is silent; red pages the owner (ntfy, high); a buyer balance under 30 MESH sends a top-up notice.
+  Receipts: `/opt/runtime/deploy/pay-replay.jsonl`. Pause: `touch /opt/runtime/deploy/PAY_REPLAY_PAUSED`.
 - Setup: `deploy/box/install.sh` as root (prints the public key the first time).
