@@ -1,0 +1,9 @@
+[Unit]
+Description=PAY daily replay: one real MeshMarket rail purchase, every number checked (DevDesk #202)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/runtime/deploy/pay-replay.sh
+TimeoutStartSec=300

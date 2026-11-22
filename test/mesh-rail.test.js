@@ -3,6 +3,9 @@
 // idempotency key, then settle exactly what MeshMarket kept and give the rest back — for an
 // instant listing at once, for a pay-on-proof listing when the hold resolves.
 //
+// Money: MeshMarket prices in MESH, budgets are real cents. At the default 1.2 MESH per cent
+// (Starter pack, $5 = 600 MESH), rounded UP: a 20 MESH ceiling reserves 17 cents, 30 reserves 25.
+//
 // Driven against the fake MeshMarket in harness.js, which behaves like the real exchange on these
 // paths (idempotent replay, x-max-price, holds, accept, provider_failed with refunded true/false).
 //
@@ -82,7 +85,7 @@ describe("MeshMarket rail", () => {
     expect(await left(k)).toBe(500);
   });
 
-  test("instant listing: reserve the ceiling, call once, settle what was charged, return the rest", async () => {
+  test("instant listing: reserve the ceiling in cents, call once, settle what was charged, return the rest", async () => {
     meshmarket.mode = "instant";
     meshmarket.price = 20;
     const k = await mint();
@@ -91,13 +94,15 @@ describe("MeshMarket rail", () => {
     expect(r.status).toBe(201);
     const job = r.json.job;
     expect(job.status).toBe("settled");
-    expect(job.receipt.spent).toBe(20);
+    expect(job.amount_usd_cents).toBe(25); // 30 MESH ceiling / 1.2, rounded up
+    expect(job.receipt.spent_mesh).toBe(20);
+    expect(job.receipt.spent).toBe(17); // 20 MESH / 1.2 = 16.67, rounded up
     expect(meshmarket.charges).toBe(before + 1);
     const sent = meshmarket.calls.at(-1);
     expect(sent).toEqual({ slug: "test-tool", idem: job.id, max: 30 }); // the job id IS the idempotency key
-    expect(await left(k)).toBe(480);
-    expect(await ledger(job.id)).toEqual([{ kind: "reserve", usd_cents: 30 }, { kind: "release", usd_cents: -10 }]);
-    expect(await ledger(job.tx)).toEqual([{ kind: "meshmarket-settle", usd_cents: 20 }]);
+    expect(await left(k)).toBe(483);
+    expect(await ledger(job.id)).toEqual([{ kind: "reserve", usd_cents: 25 }, { kind: "release", usd_cents: -8 }]);
+    expect(await ledger(job.tx)).toEqual([{ kind: "meshmarket-settle", usd_cents: 17 }]);
     expect((await get(k, job.id)).json.job.status).toBe("settled");
   });
 
@@ -120,18 +125,19 @@ describe("MeshMarket rail", () => {
     const job = (await buy(k)).json.job;
     expect(job.status).toBe("held");
     expect(job.receipt.hold_id).toBeTruthy();
-    expect(await left(k)).toBe(480); // reserved, not yet spent
+    expect(await left(k)).toBe(483); // 17 reserved, not yet spent
     expect((await req("POST", `${BUY}/${job.id}/reconcile`, { token: k })).json.job.status).toBe("held"); // still held on MeshMarket
     const acc = await req("POST", `${BUY}/${job.id}/accept`, { token: k });
     expect(acc.json.job.status).toBe("settled");
-    expect(acc.json.job.receipt.spent).toBe(20);
+    expect(acc.json.job.receipt.spent).toBe(17);
+    expect(acc.json.job.receipt.spent_mesh).toBe(20);
     expect(acc.json.job.receipt.outcome).toBe("released");
     expect(holdOf(job).state).toBe("released");
-    expect(await left(k)).toBe(480);
+    expect(await left(k)).toBe(483);
     // A second accept and a sweep change nothing.
     expect((await req("POST", `${BUY}/${job.id}/accept`, { token: k })).status).toBe(409);
     await sweep();
-    expect(await ledger(job.tx)).toEqual([{ kind: "meshmarket-settle", usd_cents: 20 }]);
+    expect(await ledger(job.tx)).toEqual([{ kind: "meshmarket-settle", usd_cents: 17 }]);
   });
 
   test("held, then refunded on MeshMarket: the sweep gives the whole reservation back", async () => {
@@ -146,7 +152,7 @@ describe("MeshMarket rail", () => {
     expect(await left(k)).toBe(500);
   });
 
-  test("held, then split 40/60 by a verdict: spent is MeshMarket's own gross, floor(20 x 40 / 100) = 8", async () => {
+  test("held, then split 40/60 by a verdict: MeshMarket's own gross floor(20 x 40 / 100) = 8 MESH = 7 cents", async () => {
     meshmarket.mode = "hold";
     const k = await mint();
     const job = (await buy(k)).json.job;
@@ -154,19 +160,24 @@ describe("MeshMarket rail", () => {
     await sweep();
     const now = (await get(k, job.id)).json.job;
     expect(now.status).toBe("settled");
-    expect(now.receipt.spent).toBe(8);
-    expect(await left(k)).toBe(492);
+    expect(now.receipt.spent_mesh).toBe(8);
+    expect(now.receipt.spent).toBe(7);
+    expect(await left(k)).toBe(493);
   });
 
-  test("released by a verdict against a dispute: the forfeited stake is spent too", async () => {
+  test("released by a verdict against a dispute: the forfeited stake is spent too, and spend above the reservation is never hidden", async () => {
     meshmarket.mode = "hold";
     const k = await mint();
     const job = (await buy(k)).json.job;
     Object.assign(holdOf(job), { state: "released", verdict: "release", stake: 2 });
     await sweep();
     const now = (await get(k, job.id)).json.job;
-    expect(now.receipt.spent).toBe(22);
-    expect(await left(k)).toBe(478);
+    expect(now.receipt.spent_mesh).toBe(22);
+    expect(now.receipt.spent).toBe(19); // 22 / 1.2 = 18.33, rounded up; 17 was reserved
+    expect(now.receipt.over_reservation).toBe(2);
+    expect(await left(k)).toBe(481);
+    expect(await ledger(now.tx)).toEqual([{ kind: "meshmarket-settle", usd_cents: 17 }, { kind: "meshmarket-overage", usd_cents: 2 }]);
+    expect((await dbQuery("SELECT count(*)::int AS n FROM events WHERE type = 'payment.meshmarket.overage' AND data->>'id' = $1", [job.id])).rows[0].n).toBe(1);
   });
 
   test("CONTROL: the answer is lost after MeshMarket charged — the sweep re-sends the SAME key, MeshMarket replays, one charge", async () => {
@@ -176,14 +187,14 @@ describe("MeshMarket rail", () => {
     const job = (await buy(k)).json.job;
     expect(job.status).toBe("calling"); // the runtime does not know yet: nothing settled, nothing released
     expect(meshmarket.charges).toBe(before + 1);
-    expect(await left(k)).toBe(480);
+    expect(await left(k)).toBe(483);
     meshmarket.mode = "instant";
     await sweep();
     const now = (await get(k, job.id)).json.job;
     expect(now.status).toBe("settled");
     expect(meshmarket.charges).toBe(before + 1); // replayed, never charged twice
     expect(meshmarket.calls.filter((c) => c.idem === job.id).length).toBe(2);
-    expect(await left(k)).toBe(480);
+    expect(await left(k)).toBe(483);
   });
 
   test("a provider failure that MeshMarket refunded: the job fails and the budget comes back", async () => {
@@ -201,7 +212,7 @@ describe("MeshMarket rail", () => {
     const job = (await buy(k)).json.job;
     expect(job.status).toBe("review");
     expect(job.error).toBe("meshmarket_refund_failed");
-    expect(await left(k)).toBe(480); // the money may be gone on MeshMarket's side: never guessed back
+    expect(await left(k)).toBe(483); // the money may be gone on MeshMarket's side: never guessed back
     await sweep();
     expect((await get(k, job.id)).json.job.status).toBe("review"); // the sweep leaves it for a person
     expect((await dbQuery("SELECT count(*)::int AS n FROM events WHERE type = 'payment.meshmarket.review' AND data->>'id' = $1", [job.id])).rows[0].n).toBe(1);
@@ -221,7 +232,7 @@ describe("MeshMarket rail", () => {
     expect(now.status).toBe("review");
     expect(now.error).toBe("no_answer_after_30_attempts");
     expect(meshmarket.charges).toBe(before);
-    expect(await left(k)).toBe(480);
+    expect(await left(k)).toBe(483);
     meshmarket.mode = "instant";
   });
 
@@ -275,12 +286,74 @@ describe("MeshMarket rail", () => {
     expect(ok.json.status).toBe("executed");
     expect(ok.json.result.job.status).toBe("settled");
     expect(meshmarket.charges).toBe(before + 1);
-    expect(await left(k)).toBe(480);
+    expect(await left(k)).toBe(483);
   });
 
-  test("status counts the jobs by state", async () => {
+  test("a job keeps the rate it started with: a rate change never moves a job already open", async () => {
+    meshmarket.mode = "hold";
+    meshmarket.price = 20;
+    const k = await mint();
+    const job = (await buy(k)).json.job;
+    expect(job.amount_usd_cents).toBe(17);
+    process.env.MESHMARKET_MESH_PER_USD_CENT = "2";
+    try {
+      const acc = (await req("POST", `${BUY}/${job.id}/accept`, { token: k })).json.job;
+      expect(acc.receipt.spent).toBe(17); // settled at 1.2, the job's own rate, not the new 2
+      expect(await left(k)).toBe(483);
+      const k2 = await mint();
+      expect((await buy(k2, { maxPrice: 20, slug: "test-tool" })).json.job.amount_usd_cents).toBe(10); // new jobs: the new rate
+    } finally {
+      delete process.env.MESHMARKET_MESH_PER_USD_CENT;
+    }
+  });
+
+  test("CONTROL: a rate that cannot be read refuses every purchase, nothing reserved", async () => {
+    meshmarket.mode = "instant";
+    const k = await mint();
+    for (const bad of ["abc", "0", "-1"]) {
+      process.env.MESHMARKET_MESH_PER_USD_CENT = bad;
+      try {
+        const r = await buy(k);
+        expect(r.status).toBe(503);
+        expect(r.json.error).toBe("meshmarket_rate_invalid");
+      } finally {
+        delete process.env.MESHMARKET_MESH_PER_USD_CENT;
+      }
+    }
+    expect(await left(k)).toBe(500);
+  });
+
+  test("CONTROL: the runtime-wide daily cap refuses a purchase that would pass it, before any budget is reserved", async () => {
+    meshmarket.mode = "instant";
+    meshmarket.price = 20;
+    const used = (await admin("GET", "/api/admin/meshmarket")).json.daily.used_mesh;
+    expect(used).toBeGreaterThan(0);
+    process.env.MESHMARKET_DAILY_CAP_MESH = String(used + 25);
+    try {
+      const k = await mint();
+      const before = meshmarket.charges;
+      expect((await buy(k, { maxPrice: 20 })).json.job.status).toBe("settled"); // used + 20 <= cap
+      const r = await buy(k, { maxPrice: 20 }); // used + 40 > cap
+      expect(r.status).toBe(429);
+      expect(r.json.error).toBe("meshmarket_daily_cap");
+      expect(meshmarket.charges).toBe(before + 1);
+      expect(await left(k)).toBe(483); // only the first purchase moved the budget
+      const st = (await admin("GET", "/api/admin/meshmarket")).json;
+      expect(st.daily).toEqual({ cap_mesh: used + 25, used_mesh: used + 20 });
+      expect((await dbQuery("SELECT count(*)::int AS n FROM events WHERE type = 'payment.meshmarket.daily_cap'")).rows[0].n).toBe(1);
+      process.env.MESHMARKET_DAILY_CAP_MESH = "x"; // unreadable: nothing can be bought
+      expect((await buy(k, { maxPrice: 1 })).status).toBe(429);
+    } finally {
+      process.env.MESHMARKET_DAILY_CAP_MESH = "100000";
+    }
+  });
+
+  test("status counts the jobs by state and shows the rate and today's spend against the cap", async () => {
     const st = (await admin("GET", "/api/admin/meshmarket")).json;
     expect(st.jobs.settled).toBeGreaterThanOrEqual(6);
     expect(st.jobs.review).toBe(2);
+    expect(st.mesh_per_cent).toBe(1.2);
+    expect(st.daily.cap_mesh).toBe(100000);
+    expect(st.daily.used_mesh).toBeGreaterThan(0);
   });
 });
