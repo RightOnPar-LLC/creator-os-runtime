@@ -7,7 +7,7 @@ import { getSetting, migrateSchema, setSetting } from "./db.js";
 import { loadGrantSigningKey } from "./tokens.js";
 import { loadOidcSigningKey } from "./oidc.js";
 import { loadReceiptSigningKey } from "./receipts.js";
-import { reapExpiredGrants } from "./grants.js";
+import { expireDeadApprovals, reapExpiredGrants } from "./grants.js";
 import { sweepTours } from "./tours.js";
 import { sweepMarketJobs } from "./meshmarket.js";
 import { attenuationViolations, CAPS, gatehouseEvaluate, TIERS } from "./policy.js";
@@ -59,6 +59,8 @@ if (REAP_INTERVAL_MS > 0) {
     () =>
       reapExpiredGrants()
         .then(() => sweepTours())
+        // then the asks that can never run (their agent, tenant or cheque has ended) stop waiting on the owner
+        .then(() => expireDeadApprovals())
         .catch((e) => console.error("[reaper]", e?.message || e)),
     REAP_INTERVAL_MS,
   );

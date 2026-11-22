@@ -699,6 +699,34 @@ export async function reapExpiredGrants({ limit = 500, failed = [] } = {}) {
   if (ids.length) await recordEvent("grant.reaped", { ids }, null, "reaper");
   return ids;
 }
+// An ask that can never run is never left waiting on the owner. A pending approval whose requesting
+// grant has ended (revoked, expired, gone), whose tenant is no longer active, or whose plan cheque is
+// past its date could only fail if approved, and could not even be declined once the tenant's root
+// key is gone: so the reaper closes it as `expired`, with the reason, and says so in an event.
+// Runs with the reaper (index.js) and on POST /api/admin/grants/reap. A live ask is never touched.
+export async function expireDeadApprovals({ limit = 200 } = {}) {
+  let now = nowSec(),
+    rows = await sql`SELECT a.id, a.tenant, a.action,
+        CASE WHEN g.id IS NULL THEN 'requesting_grant_missing'
+             WHEN t.status IS DISTINCT FROM 'active' THEN 'tenant_not_active'
+             WHEN g.status <> 'active' THEN 'requesting_grant_' || g.status
+             WHEN g.exp <= ${now} THEN 'requesting_grant_expired'
+             ELSE 'cheque_expired' END AS reason
+      FROM approvals a LEFT JOIN grants g ON g.id = a.grant_id LEFT JOIN tenants t ON t.id = a.tenant
+      WHERE a.status = 'pending' AND (g.id IS NULL OR t.status IS DISTINCT FROM 'active' OR g.status <> 'active'
+        OR g.exp <= ${now} OR (a.expires_at IS NOT NULL AND a.expires_at <= now()))
+      ORDER BY a.created_at LIMIT ${limit}`,
+    out = [];
+  for (let r of rows) {
+    // Only a row still pending moves: an owner deciding at the same moment wins, and nothing is decided twice.
+    let [u] = await sql`UPDATE approvals SET status = 'expired', decided_at = now(), result = ${{ reason: r.reason }}::jsonb
+      WHERE id = ${r.id} AND status = 'pending' RETURNING id`;
+    if (!u) continue;
+    out.push({ id: r.id, reason: r.reason });
+    await recordEvent("autonomy.expired", { approval: r.id, action: r.action, reason: r.reason }, r.tenant, "reaper");
+  }
+  return out;
+}
 // Postgres-backed (fixed 60s window keyed by grant id), not a process-local
 // Map: the runtime scales to multiple replicas and a replica-local bucket let
 // each replica give the same grant its own fresh budget (2026-09-25 fix).

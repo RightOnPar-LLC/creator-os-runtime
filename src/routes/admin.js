@@ -5,7 +5,7 @@ import { PROOF_ROOT_SUB, validateRootGrantBody } from "../proof-oauth.js";
 import { getGrant, getSetting, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
-import { endedAbove, grantsLeftUnderEnded, mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
+import { endedAbove, expireDeadApprovals, grantsLeftUnderEnded, mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
 import { readGuestPool, guestPoolStatus } from "../guest.js";
 import { notATourReason, sweepTours } from "../tours.js";
 import { TEMPLATES } from "../railway.js";
@@ -257,7 +257,7 @@ app.post("/api/admin/breakglass", requireAdmin, async (e) => {
 // `failed`: candidates this pass could not release (id and why); they are left for the next pass.
 app.post("/api/admin/grants/reap", requireAdmin, async (e) => {
   let failed = [];
-  return e.json({ reaped: await reapExpiredGrants({ failed }), failed, tours_ended: await sweepTours() });
+  return e.json({ reaped: await reapExpiredGrants({ failed }), failed, tours_ended: await sweepTours(), approvals_expired: await expireDeadApprovals() });
 });
 // READ ONLY. Grants still active under a grant that has ended, and budget still held above an ended grant for a
 // key that let go after it had (grantsLeftUnderEnded in grants.js). The whole table, not one page of
