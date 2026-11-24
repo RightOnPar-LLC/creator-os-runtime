@@ -41,6 +41,7 @@ const main = run(["runtime.test.js", "bridgewire.test.js", "autonomy.test.js", "
 // Each file that imports harness.js boots its own runtime and database when it is imported, and
 // shuts them down when it ends. runtime.test.js holds that boot, so any other such file runs in its
 // own bun process, after it, and the run fails if either failed.
+const mesh = run(["mesh-call.test.js"]);
 const market = run(["market.test.js"]);
 const identity = run(["identity.test.js"]);
 const access = run(["access-view.test.js"]);
@@ -54,4 +55,4 @@ const payments = run(["payments.test.js"]);
 const meshRail = run(["mesh-rail.test.js"]);
 const payReplay = run(["pay-replay.test.js"]);
 const approvalExpiry = run(["approval-expiry.test.js"]);
-process.exit((main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1) || (oidc.status ?? 1) || (staging.status ?? 1) || (receipts.status ?? 1) || (proof.status ?? 1) || (escrowSwitch.status ?? 1) || (payments.status ?? 1) || (meshRail.status ?? 1) || (payReplay.status ?? 1) || (approvalExpiry.status ?? 1));
+process.exit((mesh.status ?? 1) || (main.status ?? 1) || (market.status ?? 1) || (identity.status ?? 1) || (access.status ?? 1) || (seats.status ?? 1) || (oidc.status ?? 1) || (staging.status ?? 1) || (receipts.status ?? 1) || (proof.status ?? 1) || (escrowSwitch.status ?? 1) || (payments.status ?? 1) || (meshRail.status ?? 1) || (payReplay.status ?? 1) || (approvalExpiry.status ?? 1));

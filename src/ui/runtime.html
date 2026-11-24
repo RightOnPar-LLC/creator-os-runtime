@@ -737,10 +737,19 @@ async function toolReceiptView(id) {
     const { receipts } = await api("/api/admin/tool-receipts?id=" + encodeURIComponent(id));
     if (new URLSearchParams(parseRoute().qs).get("toolReceipt") !== id || !S.signed) return;
     const r = receipts[0];
+    let mesh = null;
+    if (r?.tool === 'POST /api/mesh/call') {
+      try { mesh = await api('/api/admin/mesh/receipts/' + encodeURIComponent(id)); } catch {}
+    }
+    if (new URLSearchParams(parseRoute().qs).get('toolReceipt') !== id || !S.signed) return;
+    const marketLink = mesh?.state === 'settled' && /^call_[a-f0-9]{32,64}$/.test(mesh.market_call_id || '')
+      ? 'https://market.meshtool.ai/receipts/' + mesh.market_call_id : null;
     view.innerHTML = `<a href="#/grants">Back to access</a>${r ? `<article class="card access-card"><h2>Tool receipt</h2>
       <dl class="access-facts"><dt>Receipt</dt><dd>${esc(r.id)}</dd><dt>Workspace</dt><dd>${esc(tname(r.tenant))}</dd>
       <dt>Operation</dt><dd>${esc(r.tool)}</dd><dt>Started</dt><dd>${esc(when(r.started_at))}</dd>
-      <dt>Outcome</dt><dd>${esc(humanType(r.outcome))}</dd></dl></article>` : '<p class="empty">Receipt unavailable.</p>'}`;
+      <dt>Outcome</dt><dd>${esc(humanType(r.outcome))}</dd></dl>
+      ${mesh ? `<p>Runtime checked permission and recorded this attempt before forwarding it to ${esc(mesh.capability)}.</p><p>Market result: ${esc(mesh.state)}. ${marketLink ? `<a href="${esc(marketLink)}" target="_blank" rel="noopener noreferrer">Open Market settlement receipt</a>` : "Settlement is not confirmed. Do not automatically retry."}</p>` : ""}
+      </article>` : '<p class="empty">Receipt unavailable.</p>'}`;
   } catch {
     if (new URLSearchParams(parseRoute().qs).get("toolReceipt") !== id) return;
     if (!S.signed) { chrome(); return signin(); }

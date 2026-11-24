@@ -60,6 +60,12 @@ CREATE TABLE IF NOT EXISTS tool_receipts (
   auth_decision TEXT NOT NULL DEFAULT 'unverified', outcome TEXT NOT NULL DEFAULT 'started',
   http_status INT, reason TEXT);
 CREATE INDEX IF NOT EXISTS tool_receipts_grant_started ON tool_receipts(grant_id, started_at DESC);
+CREATE TABLE IF NOT EXISTS mesh_invocations (
+  receipt_id TEXT PRIMARY KEY REFERENCES tool_receipts(id), tenant TEXT NOT NULL, grant_id TEXT NOT NULL,
+  request_id TEXT NOT NULL, request_hash TEXT NOT NULL, capability TEXT NOT NULL, max_mesh INT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'started', market_call_id TEXT, charged INT,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ,
+  UNIQUE(grant_id, request_id));
 CREATE TABLE IF NOT EXISTS vault (
   id TEXT PRIMARY KEY, tenant TEXT NOT NULL, provider TEXT NOT NULL, ciphertext TEXT NOT NULL, iv TEXT NOT NULL,
   tag TEXT NOT NULL, meta JSONB, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(tenant, provider));

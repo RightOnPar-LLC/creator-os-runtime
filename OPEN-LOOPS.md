@@ -171,3 +171,10 @@ Next: review the helper's read-only plan, activate only the existing isolated st
 ## Wallet onboarding and Runtime card
 
 The public Runtime wallet card depends on the paired MeshMarket wallet Worker. After both releases, verify a signed-out visitor and a designated wallet returning to the card, then verify the direct DevDesk board link. The cross-repository check lives in Meshtool/meshmarket at wallet/tests/runtime-handoff.mjs.
+
+## 2026-11-19 — Runtime to Market permission and linked receipts
+
+**State:** DONE — approved isolated VM adapter launch and real paid proof verified; production Runtime rollout is a separate READY FOR REVIEW unit.
+**Owner:** codex-runtime-market-receipts. **Destination:** isolated Runtime on meshtool-vm; Market PR136 deployed; Runtime implementation and durable proof filed in PR94.
+**Evidence:** docs/specs/mesh-call-adapter.md and mesh-call-verification.json; source437/0, artifact437/0, twelve controls, two independent implementation and operational reviews. Live wrong-tool403/no debit; scrub exactly1MESH; both receipt clicks; signed summary valid; grants revoked and401 verified.
+**Next step:** preserve the VM proof and its receipts. For a separately authorized production rollout, review PR94 against current master and its deployment target first; then connect public /call grant onboarding explicitly. Direct clients remain outside this adapter. No paid budget remains.

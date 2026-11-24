@@ -10,6 +10,7 @@ const DENIALS = new Set(["missing_grant", "bad_grant", "grant_expired", "grant_r
   "staging_grant_required", "staging_tool_denied", "budget_exhausted", "verification_error", "gatehouse_denied", "autonomy_observe", "owner_approval_required"]);
 // Persist only a closed vocabulary: an upstream error string can contain a secret.
 export function receiptOutcome(status, body, toolErrorStatus = status) {
+  if (body?.error === 'receipt_completion_unavailable') return {outcome:'unknown',reason:null};
   let failure = body?.error != null || body?.result?.isError === true || status >= 400;
   let code = typeof body?.error === "string" ? body.error : null;
   if (body?.result?.isError) {
@@ -18,6 +19,9 @@ export function receiptOutcome(status, body, toolErrorStatus = status) {
   if (failure) return { outcome: [401, 402, 403, 429].includes(toolErrorStatus) || DENIALS.has(code) ? "denied" : "failed",
     reason: DENIALS.has(code) ? code : "tool_error" };
   const result = body?.result?.structuredContent ?? body;
+  if (result?.execution === 'not_run' || result?.replayed === true) return {outcome:'not_run',reason:null};
+  if (result?.execution === 'unknown' || result?.execution === 'started') return {outcome:'unknown',reason:null};
+  if (result?.execution === 'held') return {outcome:'pending_settlement',reason:null};
   if (result?.pendingApproval || result?.approval || result?.status === "pending")
     return { outcome: "pending_approval", reason: null };
   if (result?.executed === false || result?.status === "approved_not_run" || result?.result?.executed === false) return { outcome: "not_run", reason: null };
