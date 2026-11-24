@@ -1,0 +1,59 @@
+{
+  "kind": "runtime-staging-readonly-oom-lifecycle-observation/v1",
+  "dateUtc": "2026-11-19",
+  "target": "meshtool-prod",
+  "receiptPath": "/opt/staging/proof-reconnect-receipts/20261119T120121155433Z-196ac48db4a3.json",
+  "sourceSha": "196ac48db4a313420d56e8679039cdcfb74b5a6f",
+  "phase": "refused_before_activation",
+  "reason": "candidate_host_config_mismatch",
+  "bundleMatchesTested": true,
+  "candidateId": "4b8093f5cee8491da4fbe2440fb58beb169db157aee3ec240f33b7c892db81df",
+  "candidateName": "/staging-runtime-candidate-20261119T120121878749Z-196ac48db4a3",
+  "candidateUnstarted": true,
+  "originalStagingRunning": true,
+  "originalStagingUnchangedFromReceipt": true,
+  "productionUnchangedFromReceipt": true,
+  "baselinePassed": true,
+  "onlyHostConfigDifference": {"OomKillDisable": {"original": null, "candidate": false}},
+  "engineEvidence": {
+    "version": "29.1.3",
+    "apiVersion": "1.52",
+    "reportedGitCommit": "29.1.3-0ubuntu3~24.04.2",
+    "engineId": "e982df3c-d2fd-4dec-bace-1b3831fb421c",
+    "cgroupVersion": "2",
+    "cgroupDriver": "systemd",
+    "oomKillDisableSupported": false
+  },
+  "originalKernelEvidence": {
+    "pid": 700394,
+    "cgroupUnifiedAndContainerIdMatched": true,
+    "ociMemoryResourceKeys": [],
+    "ociDisableOomKillerPresent": false,
+    "memoryOomGroup": "0",
+    "memoryMax": "max",
+    "memorySwapMax": "max",
+    "allObservedMemoryEventCountersZero": true,
+    "hostConfigOomScoreAdj": 0,
+    "processOomScoreAdj": "0",
+    "idImagePidStartHostConfigStableAcrossObservation": true
+  },
+  "documentaryPackageEvidenceNotExecutableGuard": {
+    "binaryPath": "/usr/bin/dockerd",
+    "binarySha256": "237b0603cc24496c74433aeb32d70a16931ae7e015f183b8f3c7c7db83c72a5f",
+    "package": "docker.io",
+    "sourcePackage": "docker.io-app",
+    "version": "29.1.3-0ubuntu3~24.04.2"
+  },
+  "upstreamLifecycleRationaleNotInstalledCommitProof": {
+    "tag": "docker-v29.1.3",
+    "commit": "fbf3ed25f893e6ce21336f1101590e40a13934f4",
+    "create": "https://github.com/moby/moby/blob/docker-v29.1.3/daemon/create.go",
+    "adaptAndValidate": "https://github.com/moby/moby/blob/docker-v29.1.3/daemon/daemon_unix.go",
+    "start": "https://github.com/moby/moby/blob/docker-v29.1.3/daemon/start.go"
+  },
+  "limits": [
+    "No remote mutation in this lane; both refused candidates remain unstarted",
+    "No secret environment, URL or request-body values emitted",
+    "The phase-aware helper still requires full HostConfig equality including null immediately after start and after health; live execution pending"
+  ]
+}

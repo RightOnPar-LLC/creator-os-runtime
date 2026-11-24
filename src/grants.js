@@ -1,6 +1,7 @@
 // Grant lifecycle: mint root, issue child, revoke tree, settle usage, rate limit, verify.
 import { randomBytes } from "crypto";
-import { POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN, SERVICE_NAME } from "./config.js";
+import { env, POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN, SERVICE_NAME } from "./config.js";
+import { PROOF_ROOT_SUB, validateProofRootLimits } from "./proof-oauth.js";
 import { HttpError, newId, nowSec, parseJson } from "./util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "./db.js";
 import { parseGrantToken, signGrantToken } from "./tokens.js";
@@ -25,10 +26,13 @@ import {
   zeroUsage,
 } from "./policy.js";
 
-export async function mintRootGrant(e, t = "tenant:root") {
+export async function mintRootGrant(e, t = "tenant:root", proofLimits = undefined) {
+  const proof = proofLimits !== undefined ? validateProofRootLimits(proofLimits, e, TIERS[e.tier], env) : null;
+  if ((proof && t !== PROOF_ROOT_SUB) || (!proof && t === PROOF_ROOT_SUB))
+    throw new HttpError(400, "proof_limits_required");
   let a = TIERS[e.tier],
     n = nowSec(),
-    r = n + a.maxTtlSec * 4,
+    r = n + (proof ? proof.ttlSec : a.maxTtlSec * 4),
     s = newId("gr"),
     i = parseJson(e.allowed_targets || {}),
     o = {
@@ -41,25 +45,26 @@ export async function mintRootGrant(e, t = "tenant:root") {
       iss: SERVICE_NAME,
       iat: n,
       exp: r,
-      caps: [...CAPS],
+      caps: proof ? proof.caps : [...CAPS],
       scope: {
         railway: {
-          projects: i.railway?.projects || [],
-          environments: i.railway?.environments || ["production"],
+          projects: proof ? [] : i.railway?.projects || [],
+          environments: proof ? [] : i.railway?.environments || ["production"],
         },
         workers: {
           namePrefix: tenantWorkerPrefix(e.id),
         },
-        memory: {
+        memory: proof ? proof.memory : {
           partitions: [""],
         },
+        ...(proof ? { proof: proof.marker } : {}),
       },
-      budget: {
+      budget: proof ? proof.budget : {
         usd_cents: a.usdCents,
         calls: a.deploysPerPeriod * 50,
         deploys: a.deploysPerPeriod,
       },
-      constraints: {
+      constraints: proof ? proof.constraints : {
         maxWorkers: a.maxWorkers,
         maxReplicas: a.maxReplicas,
         allowDelete: !0,
@@ -694,6 +699,34 @@ export async function reapExpiredGrants({ limit = 500, failed = [] } = {}) {
   if (failed.length) console.error(`[reaper] ${failed.length} of ${candidates.length} left for the next pass; the first: ${failed[0].id} (${failed[0].error})`);
   if (ids.length) await recordEvent("grant.reaped", { ids }, null, "reaper");
   return ids;
+}
+// An ask that can never run is never left waiting on the owner. A pending approval whose requesting
+// grant has ended (revoked, expired, gone), whose tenant is no longer active, or whose plan cheque is
+// past its date could only fail if approved, and could not even be declined once the tenant's root
+// key is gone: so the reaper closes it as `expired`, with the reason, and says so in an event.
+// Runs with the reaper (index.js) and on POST /api/admin/grants/reap. A live ask is never touched.
+export async function expireDeadApprovals({ limit = 200 } = {}) {
+  let now = nowSec(),
+    rows = await sql`SELECT a.id, a.tenant, a.action,
+        CASE WHEN g.id IS NULL THEN 'requesting_grant_missing'
+             WHEN t.status IS DISTINCT FROM 'active' THEN 'tenant_not_active'
+             WHEN g.status <> 'active' THEN 'requesting_grant_' || g.status
+             WHEN g.exp <= ${now} THEN 'requesting_grant_expired'
+             ELSE 'cheque_expired' END AS reason
+      FROM approvals a LEFT JOIN grants g ON g.id = a.grant_id LEFT JOIN tenants t ON t.id = a.tenant
+      WHERE a.status = 'pending' AND (g.id IS NULL OR t.status IS DISTINCT FROM 'active' OR g.status <> 'active'
+        OR g.exp <= ${now} OR (a.expires_at IS NOT NULL AND a.expires_at <= now()))
+      ORDER BY a.created_at LIMIT ${limit}`,
+    out = [];
+  for (let r of rows) {
+    // Only a row still pending moves: an owner deciding at the same moment wins, and nothing is decided twice.
+    let [u] = await sql`UPDATE approvals SET status = 'expired', decided_at = now(), result = ${{ reason: r.reason }}::jsonb
+      WHERE id = ${r.id} AND status = 'pending' RETURNING id`;
+    if (!u) continue;
+    out.push({ id: r.id, reason: r.reason });
+    await recordEvent("autonomy.expired", { approval: r.id, action: r.action, reason: r.reason }, r.tenant, "reaper");
+  }
+  return out;
 }
 // Postgres-backed (fixed 60s window keyed by grant id), not a process-local
 // Map: the runtime scales to multiple replicas and a replica-local bucket let

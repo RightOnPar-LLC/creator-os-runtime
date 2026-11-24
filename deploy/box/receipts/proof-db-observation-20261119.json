@@ -1,0 +1,64 @@
+{
+  "kind": "runtime-staging-readonly-db-observation/v1",
+  "dateUtc": "2026-11-19",
+  "target": "meshtool-prod",
+  "hostPinMatched": true,
+  "productionContainerId": "5146ed5cf72447487286ba4ab485060cc593af62e217cfa2e53e3bd1177109e0",
+  "stagingContainerId": "090fc51c6884d1dbdc09b39cf6321ef40d42237fba25f2291d1f382ff0b11fa5",
+  "runtimeImageId": "sha256:a6b89fcfad50fa125c3870253acef39e40ad98d742ecff82fb8c09ead8fc805f",
+  "productionHealthSourceHash": "59107df04578198aef024dae1a8cf7882f3ef2573e89bfb24429156a0d8b9525",
+  "productionHealthOkAndDb": true,
+  "productionHostPid": 700646,
+  "productionProcessStartedAt": "2026-11-14T08:51:34.616308668Z",
+  "productionRestartCount": 0,
+  "productionDatabaseEvidence": "owned_established_sockets",
+  "postgres5432EstablishedSocketCount": 10,
+  "socketsOwnedByPinnedProcess": 10,
+  "distinctOwnedPostgresPeers": 1,
+  "observedProductionDbContainerId": "15cec49a81ca655e5931420942587810a41570aab5a0e6dcd6c4052474600075",
+  "stagingDbContainerId": "8dc791d2cd40a6024a718b9e55d01fecd600ede1eb965662fe29e2bde28847fd",
+  "observedDatabaseContainersDistinct": true,
+  "observedWritableStoragePathsDisjoint": true,
+  "productionIdImagePidAndFullEnvArrayStableAcrossObservation": true,
+  "stagingEnvShape": {"entries": 11, "uniqueKeys": 11, "malformed": 0},
+  "productionEnvShape": {"entries": 29, "uniqueKeys": 28, "malformed": 0},
+  "productionDatabaseUrlEntries": [
+    {"index": 0, "status": "unresolved_in_docker_network_or_link_metadata", "distinctFromStaging": null},
+    {"index": 1, "status": "matches_observed_production_socket_target", "distinctFromStaging": true}
+  ],
+  "duplicateValuesIdentical": false,
+  "databasePins": {
+    "production": {
+      "imageId": "sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42",
+      "network": "bridge",
+      "networkId": "cc32d3153b73425fbad4b7166296af5e0f00f7d70b50e66d263b6f741d45550a",
+      "address": "172.17.0.3",
+      "writableVolumeName": "pg-runtime",
+      "writableVolumeSource": "/var/lib/docker/volumes/pg-runtime/_data",
+      "mountDestination": "/var/lib/postgresql",
+      "volumeDriver": "local",
+      "volumeScope": "local",
+      "volumeOptionsEmpty": true
+    },
+    "staging": {
+      "imageId": "sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81",
+      "network": "staging-net",
+      "networkId": "60b98edbb630a5f50d6b2adc53209b54811cb45c2a5de53446afbf5b3153e75c",
+      "address": "172.18.0.2",
+      "writableVolumeName": "staging-pg-data",
+      "writableVolumeSource": "/var/lib/docker/volumes/staging-pg-data/_data",
+      "mountDestination": "/var/lib/postgresql",
+      "volumeDriver": "local",
+      "volumeScope": "local",
+      "volumeOptionsEmpty": true
+    }
+  },
+  "method": "Pinned inspect identities; local production health GET; nsenter into pinned network namespace and ss established TCP5432 sockets with matching process owner; Docker network/link and writable mount-source comparison",
+  "limits": [
+    "No secret, URL value, raw environment, or raw socket listing emitted",
+    "No database query beyond the existing health endpoint, and no mutation performed",
+    "This is a bounded running-process observation, not a selection of conflicting environment values",
+    "A later production restart's selection of the conflicting URLs remains unresolved",
+    "Root approved the narrow socket boundary; scratch implementation received independent review PASS and 42 mocked tests pass; live read-only plan and rollout remain pending"
+  ]
+}

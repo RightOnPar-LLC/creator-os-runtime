@@ -1,10 +1,11 @@
 // Routes: admin: tenants, kill switch, policy, breakglass, grants, read-only tables. Registration order is significant.
 import { armedIntegrations, POLICY_VERSION, RATE_LIMIT_MAX_PER_MIN } from "../config.js";
-import { HttpError, newId } from "../util.js";
-import { getGrant, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
+import { HttpError, newId, parseJson } from "../util.js";
+import { PROOF_ROOT_SUB, validateRootGrantBody } from "../proof-oauth.js";
+import { getGrant, getSetting, getTenant, isKillSwitchOn, isOperatorLspCapsEnabled, recordEvent, setSetting, sql } from "../db.js";
 import { reissueGrantToken } from "../tokens.js";
 import { CAPS, remainingBudget, TIERS } from "../policy.js";
-import { endedAbove, grantsLeftUnderEnded, mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
+import { endedAbove, expireDeadApprovals, grantsLeftUnderEnded, mintRootGrant, reapExpiredGrants, revokeGrantTree } from "../grants.js";
 import { readGuestPool, guestPoolStatus } from "../guest.js";
 import { notATourReason, sweepTours } from "../tours.js";
 import { TEMPLATES } from "../railway.js";
@@ -143,12 +144,19 @@ app.post("/api/tenants/:id/targets", requireAdmin, async (e) => {
 app.post("/api/tenants/:id/root-grant", requireAdmin, async (e) => {
   let t = await getTenant(e.req.param("id"));
   if (!t) throw new HttpError(404, "tenant_not_found");
-  let a = await mintRootGrant(t, String((await readJsonBody(e)).sub || "tenant:root"));
+  const body = await readJsonBody(e);
+  validateRootGrantBody(body);
+  const proof = Object.hasOwn(body, "proof_limits");
+  let a = await mintRootGrant(t, proof ? PROOF_ROOT_SUB : String(body.sub || "tenant:root"), proof ? body.proof_limits : undefined);
   return e.json(
     {
       id: a.row.id,
       token: a.token,
       exp: Number(a.row.exp),
+      ...(proof ? {
+        sub: a.row.sub, caps: parseJson(a.row.caps), scope: parseJson(a.row.scope),
+        budget: parseJson(a.row.budget), constraints: parseJson(a.row.constraints),
+      } : {}),
     },
     201,
   );
@@ -189,6 +197,29 @@ app.post("/api/admin/operator-lsp-caps/off", requireAdmin, async (e) => {
     })
   );
 });
+// The capture switch. POST /webhooks/mesh resolves a held escrow to its payee only while the
+// `escrow_capture` setting is "on" and the kill switch is off. That is real value movement, so it is
+// OFF by default. Before these two routes the only way to arm it was a raw write to the settings
+// table; now it is one operator tap each way, and every flip leaves an event. Off stops new captures
+// at once: it changes no hold, refunds nothing, and needs no key rotation (MESH_RECEIPT_SECRET stays).
+app.post("/api/admin/escrow-capture/on", requireAdmin, async (e) => {
+  return (
+    await setSetting("escrow_capture", "on"),
+    await recordEvent("escrow.capture_enabled", {}, null, "admin"),
+    e.json({
+      escrowCapture: !0,
+    })
+  );
+});
+app.post("/api/admin/escrow-capture/off", requireAdmin, async (e) => {
+  return (
+    await setSetting("escrow_capture", "off"),
+    await recordEvent("escrow.capture_disabled", {}, null, "admin"),
+    e.json({
+      escrowCapture: !1,
+    })
+  );
+});
 app.get("/api/admin/policy", requireAdmin, (e) =>
   e.json({
     policy: POLICY_VERSION,
@@ -226,7 +257,7 @@ app.post("/api/admin/breakglass", requireAdmin, async (e) => {
 // `failed`: candidates this pass could not release (id and why); they are left for the next pass.
 app.post("/api/admin/grants/reap", requireAdmin, async (e) => {
   let failed = [];
-  return e.json({ reaped: await reapExpiredGrants({ failed }), failed, tours_ended: await sweepTours() });
+  return e.json({ reaped: await reapExpiredGrants({ failed }), failed, tours_ended: await sweepTours(), approvals_expired: await expireDeadApprovals() });
 });
 // READ ONLY. Grants still active under a grant that has ended, and budget still held above an ended grant for a
 // key that let go after it had (grantsLeftUnderEnded in grants.js). The whole table, not one page of
@@ -269,6 +300,7 @@ app.get("/api/admin/overview", requireAdmin, async (e) => {
     guest_pool: gp ? guestPoolStatus(gp) : { open: true, remaining_slots: null, note: "not initialized" },
     killSwitch: await isKillSwitchOn(),
     operatorLspCaps: await isOperatorLspCapsEnabled(),
+    escrowCapture: (await getSetting("escrow_capture")) === "on",
     armed: armedIntegrations(),
   });
 });

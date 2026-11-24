@@ -1,4 +1,5 @@
 import { readToolReceipts } from "../tool-receipts.js";
+import { MARKET_ACTION, startMarketJob } from "../meshmarket.js";
 // Routes: grant-holder API: grants, cog, deploys, ledger, events, tenant. Registration order is significant.
 import { HttpError, nowSec, parseJson, withRedactedIntent } from "../util.js";
 import { getGrant, getTenant, isKillSwitchOn, recordEvent, sql } from "../db.js";
@@ -274,6 +275,10 @@ app.post("/api/approvals/:id", requireGrant(null), async (e) => {
       let r = await openEscrow(g, intent, ap.requested_by);
       await recordAutonomyRow(g, "autonomy-approved", ap.id, "escrow open approved by the owner", { autonomy: ap.autonomy, decision: "approved", approver: t.row.id });
       result = { escrow: serializeEscrow(r.row), token: r.token };
+    } else if (ap.action === MARKET_ACTION) {
+      let job = await startMarketJob({ grant: g, ...intent });
+      await recordAutonomyRow(g, "autonomy-approved", ap.id, "MeshMarket purchase approved by the owner", { autonomy: ap.autonomy, decision: "approved", approver: t.row.id });
+      result = { job };
     } else await fail("unknown_action");
   } catch (err) {
     await sql`UPDATE approvals SET status = 'failed', result = ${{ reason: String(err?.message || err).slice(0, 200) }}::jsonb WHERE id = ${ap.id} AND status = 'approved'`;
@@ -281,7 +286,7 @@ app.post("/api/approvals/:id", requireGrant(null), async (e) => {
   }
   // A deploy can be approved yet not run (e.g. Railway unarmed): say so, never "executed".
   let status = ap.action === "deploy" && !result?.executed ? "approved_not_run" : "executed";
-  await sql`UPDATE approvals SET status = ${status}, result = ${{ id: result?.id ?? result?.escrow?.id ?? null, reason: result?.reason ?? null }}::jsonb WHERE id = ${ap.id}`;
+  await sql`UPDATE approvals SET status = ${status}, result = ${{ id: result?.id ?? result?.escrow?.id ?? result?.job?.id ?? null, reason: result?.reason ?? null }}::jsonb WHERE id = ${ap.id}`;
   await recordEvent("autonomy.approved", { approval: ap.id, action: ap.action, status }, t.tenant.id, t.row.sub);
   return e.json({ id: ap.id, status, result });
 });

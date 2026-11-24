@@ -7,6 +7,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p /opt/runtime/deploy
 install -m 0755 "$HERE/deploy.sh" /opt/runtime/deploy/deploy.sh
 install -m 0644 "$HERE/runtime-deploy.service" "$HERE/runtime-deploy.timer" /etc/systemd/system/
+# PAY daily replay (DevDesk #202): one real MeshMarket rail purchase a day, every number checked
+install -m 0755 "$HERE/pay-replay.sh" /opt/runtime/deploy/pay-replay.sh
+install -m 0644 "$HERE/pay-replay.mjs" /opt/runtime/deploy/pay-replay.mjs
+install -m 0644 "$HERE/pay-replay.service" "$HERE/pay-replay.timer" /etc/systemd/system/
 if [ ! -f "$KEY" ]; then
   ssh-keygen -q -t ed25519 -N "" -C "meshtool-prod runtime deploy (read-only)" -f "$KEY"
 fi
@@ -17,5 +21,5 @@ if ! git ls-remote -q "$REPO" HEAD >/dev/null 2>&1; then
 fi
 [ -d /opt/runtime/src/.git ] || git clone -q --no-checkout "$REPO" /opt/runtime/src
 systemctl daemon-reload
-systemctl enable --now runtime-deploy.timer
-echo "installed; timer: $(systemctl is-active runtime-deploy.timer)"
+systemctl enable --now runtime-deploy.timer pay-replay.timer
+echo "installed; timers: deploy $(systemctl is-active runtime-deploy.timer), pay-replay $(systemctl is-active pay-replay.timer)"

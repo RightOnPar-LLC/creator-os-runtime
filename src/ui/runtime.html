@@ -168,6 +168,27 @@ table.t tr:last-child td{border-bottom:0}
 @media (max-width:1180px){.body{grid-template-columns:220px minmax(0,1fr)}.cog{grid-column:1/-1;border-left:0;border-top:1px solid var(--line2)}.marks{max-height:340px}}
 @media (max-width:860px){.three{grid-template-columns:1fr}.three .card{min-height:0}.inbox{grid-template-columns:1fr}.inbox .list{border-right:0;border-bottom:1px solid var(--line2)}.signin{grid-template-columns:1fr}}
 @media (max-width:760px){.body{grid-template-columns:1fr}.rail{order:3;border-right:0;border-top:1px solid var(--line2)}.loupe{order:1;padding:16px}.cog{order:2}.lhead h1{font-size:24px}.omni{order:5;flex-basis:100%}.hist{display:none}.omni .cell{display:none}}
+.wallet-card[hidden]{display:none}
+.wallet-card{background:linear-gradient(120deg,var(--panel),var(--win));border-color:var(--line3)}
+.wallet-card iframe{display:block;width:100%;height:200px;border:0;color-scheme:dark}
+.wallet-links{display:flex;align-items:center;flex-wrap:wrap;gap:4px 18px}
+.wallet-links a{display:inline-flex;align-items:center;min-height:44px;color:var(--accent)}
+.respill{display:flex;align-items:center;gap:7px;height:34px;padding:0 12px;border-radius:999px;border:1px solid rgba(233,185,73,.45);background:var(--gold-bg);color:var(--gold);font:500 11px var(--mono);letter-spacing:.06em;text-decoration:none;white-space:nowrap}
+.respill:hover{border-color:var(--gold)}.respill b{min-width:18px;height:18px;border-radius:9px;background:var(--gold);color:var(--accent-ink);display:grid;place-items:center;font:600 10px var(--mono);padding:0 5px}.respill b:empty{display:none}
+.rloop{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;padding:14px}
+.rstep{position:relative;display:flex;flex-direction:column;gap:4px;padding:0 18px 0 12px}
+.rstep+.rstep{border-left:1px dashed var(--line2)}
+.rstep i{font:600 10px var(--mono);color:var(--accent);letter-spacing:.1em}.rstep b{font-size:14px;font-weight:600}.rstep span{font-size:12px;color:var(--muted)}
+.rlanes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:start}
+.rlane{display:flex;flex-direction:column;gap:8px}.rlane>h3{margin:0;display:flex;align-items:center;gap:8px;font:600 11px var(--mono);letter-spacing:.1em;color:var(--muted);text-transform:uppercase}
+.rlane>h3 .sw{width:9px;height:9px;border-radius:50%}
+.rcard{display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-left:3px solid var(--line3)}
+.rcard.wait{border-left-color:var(--gold)}.rcard.open{border-left-color:var(--accent)}.rcard.done{border-left-color:#7fe0a8;opacity:.8}
+.rcard h4{margin:0;font-size:14px;font-weight:600;line-height:1.3;overflow-wrap:anywhere}.rcard .why{margin:0;font-size:12px;color:var(--muted);line-height:1.45}
+.rnext{overflow-wrap:anywhere;padding:8px 10px;border-radius:8px;background:var(--sunk);font-size:12px;line-height:1.45}.rnext em{display:block;font:500 10px var(--mono);font-style:normal;color:var(--accent);letter-spacing:.08em;margin-bottom:2px}
+.rnext.miss{border:1px dashed var(--bad);background:transparent;color:var(--muted)}.rnext.miss em{color:var(--bad)}
+.rmeta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font:400 10px var(--mono);color:var(--dim)}.rmeta .act{margin-left:auto;display:flex;gap:6px}
+@media (max-width:860px){.rloop{grid-template-columns:1fr 1fr;row-gap:12px}.rlanes{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -197,6 +218,7 @@ table.t tr:last-child td{border-bottom:0}
           <button type="button" data-mode="find" aria-pressed="false">Find</button>
         </span>
       </form>
+      <a class="respill" id="resPill" href="#/resume" title="Pick up where each agent left off"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>RESUME <b id="resN"></b></a>
       <span class="on-pill" id="onPill"><span class="dot" id="onDot"></span><span id="onTxt">RUNTIME</span></span>
       <button class="crownb" type="button" id="crown" aria-label="Emergency stop all agents" title="Emergency stop all agents"><svg class="turn" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="7"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg></button>
       <button class="who out" type="button" id="who">Sign in</button>
@@ -229,6 +251,11 @@ table.t tr:last-child td{border-bottom:0}
           <div class="act" id="headAct"></div>
         </div>
         <nav class="secnav" aria-label="Sections" id="secnav"></nav>
+        <section id="walletCard" class="card wallet-card" aria-labelledby="walletTitle" hidden>
+          <div class="ch"><h2 id="walletTitle">Mesh wallet</h2><span class="kick">MESH credits</span></div>
+          <iframe title="Your Mesh wallet balance" data-src="https://wallet.meshtool.ai/runtime-card" referrerpolicy="no-referrer" sandbox="allow-same-origin allow-top-navigation-by-user-activation"></iframe>
+          <div class="wallet-links"><a href="https://wallet.meshtool.ai/?view=details">Full ledger and wallet settings</a><a href="https://market.meshtool.ai/check">Check a receipt</a></div>
+        </section>
         <div id="view" style="display:flex;flex-direction:column;gap:14px;min-width:0"></div>
       </main>
 
@@ -308,6 +335,7 @@ const evTone = (t) => { t = String(t); return /fail|crash|denied|revok|paused/.t
 // ---- views -----------------------------------------------------------------------------------
 const VIEWS = {
   "": { title: "Everyone and everything on your Mesh", nav: "Overview", lex: "The Loupe" },
+  wallet: { title: "Your wallet", nav: "Wallet", lex: "MeshMarket credits" },
   grants: { title: "Who has access?", nav: "Access", lex: "Permissions" },
   worlds: { title: "Workspaces", nav: "Workspaces", lex: "Workspaces", one: "See the workspaces on this Runtime and their current status.", api: "/api/tenants", key: "tenants", cols: ["name", "tier", "status", "deploys_period", "created_at", "id"] },
   receipts: { title: "Receipts", nav: "Receipts", lex: "Hallmarks", one: "Every action the runtime, COG and the agents took, newest first.", api: "/api/admin/events", key: "events", cols: ["ts", "type", "actor", "tenant", "data"] },
@@ -315,6 +343,7 @@ const VIEWS = {
   workers: { title: "Workers", nav: "Workers", lex: "Escapement", one: "What is deployed, planned, or failed.", api: "/api/admin/deploys", key: "deploys", cols: ["name", "template", "status", "executed", "tenant", "created_at"] },
   intake: { title: "Intake", nav: "Intake", lex: "Threshold", one: "What arrived from Stripe, Railway, GitHub, the Brain and the Mesh.", api: "/api/admin/webhooks", key: "webhooks", cols: ["source", "type", "received_at", "handled", "result"] },
   outbox: { title: "Outbox", nav: "Outbox", lex: "Patina", one: "What is on its way to the Brain and the memory bridge.", api: "/api/admin/outbox", key: "outbox", cols: ["kind", "attempts", "next_at", "done", "last_error", "created_at"] },
+  resume: { title: "Pick up where you left off", nav: "Resume", lex: "The Mainspring", one: "Each agent's last run, where it stopped, and the exact next step. Copy a hand-back brief and give it to the agent." },
   memory: { title: "Memory", nav: "Memory", lex: "Patina", one: "What the runtime remembers, in the order it happened." },
   guardrails: { title: "Guardrails", nav: "Guardrails", lex: "The Bezel", one: "The floors that never move, the Crown, and what is armed." },
 };
@@ -343,12 +372,25 @@ async function route() {
   const { k, qs } = parseRoute();
   S.view = k;
   setHead(k);
+  const card = $("walletCard");
+  card.hidden = k !== "" && k !== "wallet";
+  const frame = card.querySelector("iframe");
+  if (!card.hidden && !frame.hasAttribute("src")) frame.src = frame.dataset.src;
+  if (k === "wallet") {
+    $("view").innerHTML = `<section class="card"><h2>Continue from here</h2><div class="wallet-links">
+      <a href="https://devdesk.meshtool.ai/board">Build in DevDesk</a>
+      <a href="https://market.meshtool.ai/exchange">Explore MeshMarket</a>
+      <a href="https://deck.meshtool.ai/">Open Mesh Deck</a>
+    </div></section>`;
+    return;
+  }
   if (k === "connect") return connect(qs);
   if (!S.signed) return signin();
   if (k === "") { const ch = new URLSearchParams(qs).get("cheque"); if (ch) S.sel = ch; return overview(); }
   if (k === "grants") return accessView();
   if (k === "receipts" && new URLSearchParams(qs).has("toolReceipt")) return toolReceiptView(new URLSearchParams(qs).get("toolReceipt"));
   if (k === "memory") return memory();
+  if (k === "resume") return resume();
   if (k === "guardrails") return guardrails();
   return table(k);
 }
@@ -904,7 +946,7 @@ function chrome() {
   const dot = (n) => (B[n] ? `<span class="dot ${B[n].up ? "" : "bad"}"></span>` : "");
   const T = [["RT", "Runtime status", "/status", "runtime.meshtool.ai", (S.status ? (S.status.ok ? '<span class="dot"></span>' : '<span class="dot gold"></span>') : "")],
     ["DK", "Mesh Deck", "https://deck.meshtool.ai/", "deck.meshtool.ai", ""],
-    ["DD", "DevDesk", "https://devdesk.meshtool.ai/", st("DevDesk") || "devdesk.meshtool.ai", dot("DevDesk")],
+    ["DD", "DevDesk", "https://devdesk.meshtool.ai/board", st("DevDesk") || "devdesk.meshtool.ai", dot("DevDesk")],
     ["MK", "MeshMarket", "https://market.meshtool.ai/", st("MeshMarket") || "market.meshtool.ai", dot("MeshMarket")],
     ["GT", "MCP gate", "", st("MCP gate (Claude sign-in)") || "Claude sign-in", dot("MCP gate (Claude sign-in)")]];
   $("tabs").innerHTML = T.map(([i, n, href, sub, d]) => href ? `<a class="tab" href="${href}" ${href.startsWith("http") ? 'target="_blank" rel="noopener"' : ""}><span class="ini ${i === "MK" ? "gold" : ""}">${i}</span><span class="t"><b>${esc(n)}</b><span>${esc(sub)}</span></span>${d}</a>` : `<div class="tab"><span class="ini">${i}</span><span class="t"><b>${esc(n)}</b><span>${esc(sub)}</span></span>${d}</div>`).join("");
@@ -931,6 +973,71 @@ async function crown() {
 }
 
 const byTime = (ev) => ev.slice().sort((a, b) => new Date(b.ts) - new Date(a.ts) || b.id - a.id);
+// ---- resume: each agent's last run and its next step -------------------------------------------
+// Pure: newest live estate.job per key, sorted into wait / open / done. No writes anywhere.
+function resumeJobs(memories) {
+  const latest = {};
+  (memories || []).forEach((r) => {
+    let j; try { j = JSON.parse(r.content); } catch { return; }
+    if (!j || j.kind !== "estate.job") return;
+    const k = r.tenant + "|" + r.key;
+    if (!latest[k] || r.version > latest[k].version) latest[k] = { version: r.version, deleted: r.deleted, j };
+  });
+  return Object.values(latest).filter((x) => !x.deleted).map(({ version, j }) => {
+    const status = String(j.status || "open");
+    const lane = status === "done" || status === "closed" ? "done" : status === "needs_you" || j.agent === "you" ? "wait" : "open";
+    const next = String(j.nextStep || "").trim();
+    return { id: String(j.id || ""), title: String(j.title || j.id || "Untitled"), why: String(j.why || ""), agent: String(j.agent || "unassigned"),
+      lane, sev: String(j.sev || ""), next, task: String(j.task || ""), open: String(j.nextUrl || j.open || ""), openLabel: String(j.openLabel || "Open"),
+      at: j.updatedAt || version };
+  }).sort((a, b) => ({ wait: 0, open: 1, done: 2 })[a.lane] - ({ wait: 0, open: 1, done: 2 })[b.lane] || new Date(b.at) - new Date(a.at));
+}
+function resumeBrief(x) {
+  const first = x.task.split(/(?<=\.)\s/)[0] || "";
+  return ["Resume DevDesk job " + x.id + ": " + x.title + ".", "Read its latest handoff and receipts first; do not redo finished steps.",
+    "Next step: " + (x.next || "none written. Work out the next step from the task and write it back before you start."),
+    first ? "Task: " + first : "", "Hand off when you stop: what changed, evidence, blockers, exact next step."].filter(Boolean).join("\n");
+}
+const R = { agent: "all", jobs: null, at: 0 };
+async function resumeLoad(force) {
+  if (!force && R.jobs && now() - R.at < 60000) return R.jobs;
+  const m = await api("/api/admin/memory"); R.jobs = resumeJobs(m.memories); R.at = now();
+  const n = R.jobs.filter((x) => x.lane === "wait").length; const b = $("resN"); if (b) b.textContent = n ? String(n) : "";
+  return R.jobs;
+}
+async function resume() {
+  $("view").innerHTML = `<p class="note" style="margin:0">${esc(VIEWS.resume.one)}</p><div class="empty">loading…</div>`;
+  let jobs; try { jobs = await resumeLoad(true); } catch (e) { if (!S.signed) return signin(); $("view").innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
+  if (S.view !== "resume") return;
+  const loop = `<div class="card rloop" role="img" aria-label="The resume loop: last run, stopped at, next step, hand back">
+    <div class="rstep"><i>1 · LAST RUN</i><b>What the agent did</b><span>the job and its receipts</span></div>
+    <div class="rstep"><i>2 · STOPPED AT</i><b>Why it stopped</b><span>waiting on you, or open</span></div>
+    <div class="rstep"><i>3 · NEXT STEP</i><b>The exact next move</b><span>written at hand-off</span></div>
+    <div class="rstep"><i>4 · HAND BACK</i><b>Copy the brief</b><span>agent starts there, fast</span></div></div>`;
+  const draw = () => {
+    const agents = [...new Set(jobs.map((x) => x.agent))].sort();
+    const rows = jobs.filter((x) => (R.agent === "all" || x.agent === R.agent) && (!S.q || (x.title + " " + x.why + " " + x.next).toLowerCase().includes(S.q.toLowerCase())));
+    const chips = ["all", ...agents].map((a) => `<button type="button" class="chip ${R.agent === a ? "" : "off"}" data-a="${esc(a)}" aria-pressed="${R.agent === a}">${esc(a === "all" ? "every agent" : a)} · ${a === "all" ? jobs.length : jobs.filter((x) => x.agent === a).length}</button>`).join("");
+    const card = (x) => `<div class="card rcard ${x.lane}">
+      <h4>${esc(x.title)}</h4>${x.why ? `<p class="why">${esc(x.why)}</p>` : ""}
+      ${x.next ? `<div class="rnext"><em>NEXT STEP</em>${esc(x.next)}</div>` : x.lane === "done" ? "" : `<div class="rnext miss"><em>NO NEXT STEP WRITTEN</em>The last agent left no next move. The brief asks the next one to write it first.</div>`}
+      <div class="rmeta"><span>${esc(x.agent)}</span><span>${x.at ? esc(ago(x.at)) + " ago" : ""}</span><span class="act">
+        ${x.open ? `<a class="btn sm" href="${esc(x.open)}" target="_blank" rel="noopener">${esc(x.openLabel)}</a>` : ""}
+        ${x.lane === "done" ? "" : `<button class="btn sm go" type="button" data-copy="${esc(x.id)}">Copy brief</button>`}</span></div></div>`;
+    const lane = (k, label, c) => { const L = rows.filter((x) => x.lane === k); return `<section class="rlane"><h3><span class="sw" style="background:${c}"></span>${label} · ${L.length}</h3>${L.length ? L.map(card).join("") : `<div class="card empty">Nothing here.</div>`}</section>`; };
+    $("view").innerHTML = `<p class="note" style="margin:0">${esc(VIEWS.resume.one)}</p>${loop}
+      <div class="card" style="display:flex;gap:6px;flex-wrap:wrap;padding:10px 12px">${chips}</div>
+      <div class="rlanes">${lane("wait", "Waiting on you", "var(--gold)")}${lane("open", "Open, agent can pick up", "var(--accent)")}${lane("done", "Done", "#7fe0a8")}</div>
+      <div class="hood">${jobs.length} jobs from runtime memory (estate.job) · nothing here writes or sends · DevDesk handoffs and the brain's resume card join this view when #191 Phase 3 lands</div>`;
+    document.querySelectorAll("[data-a]").forEach((b) => (b.onclick = () => { R.agent = b.dataset.a; draw(); }));
+    document.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = async () => {
+      const x = jobs.find((j) => j.id === b.dataset.copy); if (!x) return;
+      try { await navigator.clipboard.writeText(resumeBrief(x)); b.textContent = "Copied"; } catch { b.textContent = "Copy failed"; }
+      setTimeout(() => (b.textContent = "Copy brief"), 1600);
+    }));
+  };
+  draw();
+}
 // ---- data --------------------------------------------------------------------------------------
 async function loadPublic() {
   [S.health, S.status] = await Promise.all([pub("/health"), pub("/status.json")]);
@@ -942,6 +1049,7 @@ async function loadPrivate() {
     api("/api/tenants").catch(() => ({})), api("/api/admin/grants?status=active&limit=1000").catch(() => ({})),
     api("/api/admin/approvals").catch(() => ({})), api("/api/admin/events").catch(() => ({}))]);
   S.tenants = t.tenants || []; S.grants = g.grants || []; S.approvals = a.approvals || []; S.events = byTime(e.events || []);
+  resumeLoad().catch(() => {});
 }
 async function refresh() { await loadPublic(); await loadPrivate(); chrome(); route(); }
 async function boot() { await refresh(); }
@@ -961,7 +1069,11 @@ async function tick() {
 // ---- wiring ------------------------------------------------------------------------------------
 $("back").onclick = () => history.back();
 $("fwd").onclick = () => history.forward();
-$("reload").onclick = () => refresh();
+$("reload").onclick = () => {
+  const frame = $("walletCard").querySelector("iframe");
+  if (!$("walletCard").hidden && frame.hasAttribute("src")) frame.src = frame.dataset.src;
+  return refresh();
+};
 $("crown").onclick = crown;
 $("crown2").onclick = crown;
 $("who").onclick = async () => {
